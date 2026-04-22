@@ -1,0 +1,651 @@
+                    # ── Equipped Armor ──
+                    Write-CL "  ╔══════════════════════════════════════════════╗" "DarkCyan"
+                    Write-CL "  ║  A R M O R                    DEF: +$("$armorDEF".PadRight(8))║" "Cyan"
+                    Write-CL "  ╠══════════════════════════════════════════════╣" "DarkCyan"
+                    $slots = @("Helmet","Chest","Shield","Amulet","Boots")
+                    foreach($slot in $slots){
+                        $piece = $script:EquippedArmor[$slot]
+                        $slotLabel = "$($slot):".PadRight(9)
+                        Write-C "  ║  " "DarkCyan"
+                        Write-C $slotLabel "White"
+                        if($piece){
+                            $pName = "$($piece.Name) (DEF+$($piece.DEF))"
+                            Write-C $pName "Cyan"
+                            $aPad = 33 - $slotLabel.Length - $pName.Length + 9
+                            if($aPad -lt 0){$aPad = 0}
+                            Write-CL "$(' ' * $aPad)║" "DarkCyan"
+                        } else {
+                            Write-C "(empty)" "DarkGray"
+                            $aPad = 33 - $slotLabel.Length - 7 + 9
+                            if($aPad -lt 0){$aPad = 0}
+                            Write-CL "$(' ' * $aPad)║" "DarkCyan"
+                        }
+                    }
+                    Write-CL "  ╚══════════════════════════════════════════════╝" "DarkCyan"
+                    Write-Host ""
+
+                    # ── Potions ──
+                    Write-CL "  ╔══════════════════════════════════════════════╗" "DarkGreen"
+                    Write-CL "  ║  P O T I O N S  ($($script:Potions.Count) / 10)                       ║" "Green"
+                    Write-CL "  ╠══════════════════════════════════════════════╣" "DarkGreen"
+                    if($script:Potions.Count -eq 0){
+                        Write-CL "  ║  (empty)                                     ║" "DarkGray"
+                    } else {
+                        $potionGroups = @{}
+                        foreach($pt in $script:Potions){
+                            if($potionGroups.ContainsKey($pt.Name)){
+                                $potionGroups[$pt.Name].Count++
+                            } else {
+                                $potionGroups[$pt.Name] = @{Count=1;Desc=$pt.Desc;Type=$pt.Type}
+                            }
+                        }
+                        foreach($key in $potionGroups.Keys){
+                            $pg = $potionGroups[$key]
+                            $typeIcon = switch($pg.Type){
+                                "Heal"{"[HP]"} "Mana"{"[MP]"} "ATKBuff"{"[AT]"} "DEFBuff"{"[DF]"} default{"[??]"}
+                            }
+                            $typeColor = switch($pg.Type){
+                                "Heal"{"Green"} "Mana"{"Cyan"} "ATKBuff"{"Yellow"} "DEFBuff"{"Yellow"} default{"White"}
+                            }
+                            Write-C "  ║  " "DarkGreen"
+                            Write-C $typeIcon $typeColor
+                            Write-C " $key" "White"
+                            Write-C " x$($pg.Count)" "DarkGray"
+                            $ppad = 38 - $key.Length - $typeIcon.Length - " x$($pg.Count)".Length
+                            if($ppad -lt 0){$ppad=0}
+                            Write-CL "$(' ' * $ppad)║" "DarkGreen"
+                        }
+                    }
+                    Write-CL "  ╚══════════════════════════════════════════════╝" "DarkGreen"
+                    Write-Host ""
+
+                    # ── Throwables ──
+                    Write-CL "  ╔══════════════════════════════════════════════╗" "DarkYellow"
+                    Write-CL "  ║  T H R O W A B L E S  ($($script:ThrowablePotions.Count) / 5)                  ║" "DarkYellow"
+                    Write-CL "  ╠══════════════════════════════════════════════╣" "DarkYellow"
+                    if($script:ThrowablePotions.Count -eq 0){
+                        Write-CL "  ║  (empty)                                     ║" "DarkGray"
+                    } else {
+                        $throwGroups = @{}
+                        foreach($tp in $script:ThrowablePotions){
+                            if($throwGroups.ContainsKey($tp.Name)){
+                                $throwGroups[$tp.Name].Count++
+                            } else {
+                                $throwGroups[$tp.Name] = @{Count=1;Desc=$tp.Desc;Type=$tp.Type}
+                            }
+                        }
+                        foreach($key in $throwGroups.Keys){
+                            $tg = $throwGroups[$key]
+                            $tIcon = switch($tg.Type){
+                                "Throw"{"[DMG]"} "ThrowPoison"{"[PSN]"} "ThrowSlow"{"[SLW]"} default{"[??]"}
+                            }
+                            $tColor = switch($tg.Type){
+                                "Throw"{"Red"} "ThrowPoison"{"DarkGreen"} "ThrowSlow"{"DarkCyan"} default{"White"}
+                            }
+                            Write-C "  ║  " "DarkYellow"
+                            Write-C $tIcon $tColor
+                            Write-C " $key" "White"
+                            Write-C " x$($tg.Count)" "DarkGray"
+                            $tpad = 37 - $key.Length - $tIcon.Length - " x$($tg.Count)".Length
+                            if($tpad -lt 0){$tpad=0}
+                            Write-CL "$(' ' * $tpad)║" "DarkYellow"
+                        }
+                    }
+                    Write-CL "  ╚══════════════════════════════════════════════╝" "DarkYellow"
+                    Write-Host ""
+
+                    # ── Loot ──
+                    Write-CL "  ╔══════════════════════════════════════════════╗" "DarkMagenta"
+                    Write-CL "  ║  L O O T  ($($script:Inventory.Count) items)                          ║" "Magenta"
+                    Write-CL "  ╠══════════════════════════════════════════════╣" "DarkMagenta"
+                    if($script:Inventory.Count -eq 0){
+                        Write-CL "  ║  (empty)                                     ║" "DarkGray"
+                    } else {
+                        $totalVal = 0
+                        for($i=0;$i -lt $script:Inventory.Count;$i++){
+                            $it=$script:Inventory[$i]
+                            $totalVal += $it.Value
+                            $iName = "$($i+1). $($it.Name)"
+                            $iVal  = "$($it.Value)g"
+                            Write-C "  ║  " "DarkMagenta"
+                            Write-C $iName.PadRight(32) "Magenta"
+                            Write-C $iVal "Yellow"
+                            $lPad = 8 - $iVal.Length
+                            if($lPad -lt 0){$lPad=0}
+                            Write-CL "$(' ' * $lPad)║" "DarkMagenta"
+                        }
+                        Write-CL "  ╠══════════════════════════════════════════════╣" "DarkMagenta"
+                        Write-C "  ║  Total Sell Value: " "DarkMagenta"
+                        Write-C "${totalVal}g" "Yellow"
+                        $tvPad = 24 - "${totalVal}g".Length
+                        if($tvPad -lt 0){$tvPad=0}
+                        Write-CL "$(' ' * $tvPad)║" "DarkMagenta"
+                    }
+                    Write-CL "  ╚══════════════════════════════════════════════╝" "DarkMagenta"
+                    Write-Host ""
+
+                    # ── Options ──
+                    Write-CL "  ┌─────────────────────────────────────────┐" "DarkGray"
+                    Write-C  "  │  " "DarkGray"; Write-C "[U]" "Red"; Write-CL " Unequip Gear (20% refund)          │" "DarkGray"
+                    Write-C  "  │  " "DarkGray"; Write-C "[0]" "White"; Write-CL " Back                               │" "DarkGray"
+                    Write-CL "  └─────────────────────────────────────────┘" "DarkGray"
+                    Write-Host ""
+                    Write-C "  > " "Yellow"; $invCh = Read-Host
+
+                    switch($invCh.ToUpper()){
+                        "U" {
+                            clr
+                            Write-CL "  ── Unequip Gear ──" "Red"
+                            Write-CL "  You will receive 20% of the item price back." "DarkGray"
+                            Write-Host ""
+                            $unequipOptions = [System.Collections.ArrayList]@()
+                            if($script:EquippedWeapon){
+                                [void]$unequipOptions.Add(@{Label="Weapon: $($script:EquippedWeapon.Name)";Slot="Weapon"})
+                            }
+                            foreach($slot in $slots){
+                                if($script:EquippedArmor[$slot]){
+                                    [void]$unequipOptions.Add(@{Label="$($slot): $($script:EquippedArmor[$slot].Name)";Slot=$slot})
+                                }
+                            }
+                            if($unequipOptions.Count -eq 0){
+                                Write-CL "  Nothing equipped to remove." "DarkGray"
+                                Wait-Key
+                            } else {
+                                for($ui=0;$ui -lt $unequipOptions.Count;$ui++){
+                                    Write-CL "  [$($ui+1)] $($unequipOptions[$ui].Label)" "White"
+                                }
+                                Write-CL "  [0] Cancel" "DarkGray"
+                                Write-Host ""
+                                Write-C "  > " "Yellow"; $uPick = Read-Host
+                                $uIdx = [int]$uPick - 1
+                                if($uIdx -ge 0 -and $uIdx -lt $unequipOptions.Count){
+                                    $uSlot = $unequipOptions[$uIdx].Slot
+                                    if($uSlot -eq "Weapon"){
+                                        $refund = [math]::Floor($script:EquippedWeapon.Price * 0.2)
+                                        Write-CL "  Unequipped $($script:EquippedWeapon.Name). Refund: ${refund}g" "Yellow"
+                                        $script:Gold += $refund
+                                        $script:EquippedWeapon = $null
+                                    } else {
+                                        $piece = $script:EquippedArmor[$uSlot]
+                                        $refund = [math]::Floor($piece.Price * 0.2)
+                                        Write-CL "  Unequipped $($piece.Name). Refund: ${refund}g" "Yellow"
+                                        $script:Gold += $refund
+                                        $script:EquippedArmor[$uSlot] = $null
+                                    }
+                                    Wait-Key
+                                }
+                            }
+                        }
+                        "0" { $invLoop = $false }
+                        default { $invLoop = $false }
+                    }
+                }
+            }
+
+
+
+                        "4" {
+                clr
+                Write-CL "" "White"
+                Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkYellow"
+                Write-CL "  ║           T H E   W E A R Y   L A N T E R N       ║" "Yellow"
+                Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkYellow"
+                Write-Host ""
+                Write-CL "              _.._" "DarkYellow"
+                Write-CL "            .' .-'``." "Yellow"
+                Write-CL "           /  /      \" "Yellow"
+                Write-CL "           |  |  0  ||" "DarkYellow"
+                Write-CL "           \  \     /" "Yellow"
+                Write-CL "            '._'-._'" "DarkYellow"
+                Write-CL "               |  |" "DarkGray"
+                Write-CL "             __|__|__" "DarkGray"
+                Write-CL "            |________|" "DarkGray"
+                Write-Host ""
+
+                $p = $script:Player
+                $hpMissing = $p.MaxHP - $p.HP
+                $mpMissing = $p.MaxMP - $p.MP
+
+                Write-CL "  ┌────────────────────────────────────────────┐" "DarkGray"
+                Write-C  "  │  " "DarkGray"; Write-C "Current HP: $($p.HP)/$($p.MaxHP)" "Green"
+                $hp1 = 40 - "Current HP: $($p.HP)/$($p.MaxHP)".Length
+                Write-CL "$(' ' * $hp1)│" "DarkGray"
+                Write-C  "  │  " "DarkGray"; Write-C "Current MP: $($p.MP)/$($p.MaxMP)" "Cyan"
+                $mp1 = 40 - "Current MP: $($p.MP)/$($p.MaxMP)".Length
+                Write-CL "$(' ' * $mp1)│" "DarkGray"
+                Write-C  "  │  " "DarkGray"; Write-C "Gold: $($script:Gold)g" "Yellow"
+                $g1 = 40 - "Gold: $($script:Gold)g".Length
+                Write-CL "$(' ' * $g1)│" "DarkGray"
+                Write-CL "  └────────────────────────────────────────────┘" "DarkGray"
+                Write-Host ""
+
+                if($p.HP -eq $p.MaxHP -and $p.MP -eq $p.MaxMP){
+                    Write-CL "  The innkeeper looks at you:" "DarkGray"
+                    Write-CL "  'You look well rested already, friend!'" "Yellow"
+                    Write-Host ""
+                    Wait-Key
+                } else {
+                    Write-CL "  The innkeeper greets you warmly:" "DarkGray"
+                    Write-CL "  'Welcome, weary traveler! What'll it be?'" "Yellow"
+                    Write-Host ""
+                    Write-CL "  ┌─────────────────────────────────────────────┐" "DarkGray"
+                    Write-CL "  │                                             │" "DarkGray"
+                    Write-C  "  │  " "DarkGray"; Write-C "[1]" "White"; Write-C " Quick Nap" "Green"
+                    Write-CL "          -  15g  (50% HP/MP)    │" "DarkGray"
+                    Write-C  "  │  " "DarkGray"; Write-C "[2]" "White"; Write-C " Full Rest" "Cyan"
+                    Write-CL "          -  30g  (100% HP/MP)   │" "DarkGray"
+                    Write-C  "  │  " "DarkGray"; Write-C "[3]" "White"; Write-C " Royal Suite" "Magenta"
+                    Write-CL "        -  60g  (Full + ATK/DEF) │" "DarkGray"
+                    Write-C  "  │  " "DarkGray"; Write-C "[0]" "DarkGray"
+                    Write-CL " Leave                                     │" "DarkGray"
+                    Write-CL "  │                                             │" "DarkGray"
+                    Write-CL "  └─────────────────────────────────────────────┘" "DarkGray"
+                    Write-Host ""
+                    Write-C "  > " "Yellow"; $restChoice = Read-Host
+
+                    switch($restChoice){
+                        "1" {
+                            if($script:Gold -ge 15){
+                                $script:Gold -= 15
+                                $healAmt = [math]::Floor($p.MaxHP * 0.5)
+                                $manaAmt = [math]::Floor($p.MaxMP * 0.5)
+                                $p.HP = [math]::Min($p.HP + $healAmt, $p.MaxHP)
+                                $p.MP = [math]::Min($p.MP + $manaAmt, $p.MaxMP)
+                                Write-Host ""
+                                Write-CL "  You take a quick nap on a straw bed..." "DarkGray"
+                                Write-CL "  zzz..." "DarkCyan"
+                                Start-Sleep -Milliseconds 800
+                                Write-CL "  zzzZZZ..." "Cyan"
+                                Start-Sleep -Milliseconds 800
+                                Write-Host ""
+                                Write-CL "  Recovered $healAmt HP and $manaAmt MP!" "Green"
+                                Write-CL "  HP: $($p.HP)/$($p.MaxHP)  MP: $($p.MP)/$($p.MaxMP)" "White"
+                            } else {
+                                Write-CL "  'Sorry friend, no coin, no pillow.'" "Red"
+                            }
+                            Wait-Key
+                        }
+                        "2" {
+                            if($script:Gold -ge 30){
+                                $script:Gold -= 30
+                                $p.HP = $p.MaxHP
+                                $p.MP = $p.MaxMP
+                                Write-Host ""
+                                Write-CL "  You settle into a comfortable bed..." "DarkGray"
+                                Write-CL "  zzz..." "DarkCyan"
+                                Start-Sleep -Milliseconds 600
+                                Write-CL "  zzzZZZ..." "Cyan"
+                                Start-Sleep -Milliseconds 600
+                                Write-CL "  ZZZZZZ..." "White"
+                                Start-Sleep -Milliseconds 600
+                                Write-Host ""
+                                Write-CL "  Fully restored! HP: $($p.MaxHP)/$($p.MaxHP)  MP: $($p.MaxMP)/$($p.MaxMP)" "Green"
+                            } else {
+                                Write-CL "  'Sorry friend, no coin, no pillow.'" "Red"
+                            }
+                            Wait-Key
+                        }
+                        "3" {
+                            if($script:RoyalSuiteUses -ge 3){
+                                Write-CL "  'You've enjoyed our finest rooms before...'" "DarkGray"
+                                Write-CL "  'The enchantments no longer affect you, friend.'" "DarkGray"
+                                Write-CL "  (Royal Suite stat boost capped at 3 uses)" "DarkYellow"
+                                Wait-Key
+                            }
+                            elseif($script:Gold -ge 60){
+                                $script:Gold -= 60
+                                $p.HP = $p.MaxHP
+                                $p.MP = $p.MaxMP
+                                Write-Host ""
+                                Write-CL "  You sink into a luxurious feather bed..." "DarkGray"
+                                Write-CL "  A warm bath, fine wine, enchanted candles..." "DarkMagenta"
+                                Start-Sleep -Milliseconds 600
+                                Write-CL "  zzz..." "DarkCyan"
+                                Start-Sleep -Milliseconds 600
+                                Write-CL "  zzzZZZ..." "Cyan"
+                                Start-Sleep -Milliseconds 600
+                                Write-CL "  ZZZZZZ..." "White"
+                                Start-Sleep -Milliseconds 800
+                                Write-Host ""
+                                Write-CL "  You awaken feeling POWERFUL!" "Yellow"
+                                Write-Host ""
+
+                                $p.ATK += 3
+                                $p.DEF += 3
+                                $script:RoyalSuiteUses++
+                                Write-CL "  Fully restored! HP: $($p.MaxHP)/$($p.MaxHP)  MP: $($p.MaxMP)/$($p.MaxMP)" "Green"
+                                Write-CL "  ATK +3 and DEF +3 from the enchanted rest!" "Magenta"
+                                Write-CL "  (Permanent stat boost!)" "DarkMagenta"
+                            } else {
+                                Write-CL "  'The royal suite requires deeper pockets, friend.'" "Red"
+                            }
+                            Wait-Key
+                        }
+                        "0" { }
+                        default { }
+                    }
+                }
+            }
+
+            "5" {
+                clr
+                $p2 = $script:Player
+                $wAtk = Get-TotalWeaponATK
+                $aDef = Get-TotalArmorDEF
+                $mBonus = Get-WeaponMAGBonus
+                $cb = Get-WeaponClassBonus
+
+                Write-CL "  ╔══════════════════════════════════════════════════╗" "Cyan"
+                Write-CL "  ║  $($p2.Name) - $($script:PlayerClass) - Level $($script:PlayerLevel)" "Cyan"
+                Write-CL "  ╚══════════════════════════════════════════════════╝" "Cyan"
+                Write-Host ""
+
+                # ── Core Stats ──
+                Write-CL "  ── STATS ──" "Yellow"
+                Write-C "  HP:  $($p2.HP) / $($p2.MaxHP)" "Green"
+                Write-CL "     MP:  $($p2.MP) / $($p2.MaxMP)" "Cyan"
+                Write-Host ""
+
+                $atkTotal = $p2.ATK + $wAtk
+                $defTotal = $p2.DEF + $aDef
+                $magTotal = $p2.MAG + $mBonus
+
+                Write-C "  ATK: $($p2.ATK)" "White"
+                if($wAtk -gt 0){
+                    Write-C " + $wAtk wpn" "DarkCyan"
+                    if($cb -gt 0){ Write-C " ($cb class)" "Green" }
+                }
+                Write-CL "  = $atkTotal total" "Yellow"
+
+                Write-C "  DEF: $($p2.DEF)" "White"
+                if($aDef -gt 0){ Write-C " + $aDef armor" "DarkCyan" }
+                Write-CL "  = $defTotal total" "Yellow"
+
+                Write-CL "  SPD: $($p2.SPD)" "White"
+
+                Write-C "  MAG: $($p2.MAG)" "White"
+                if($mBonus -gt 0){ Write-C " + $mBonus staff" "DarkCyan" }
+                Write-CL "  = $magTotal total" "Yellow"
+
+                Write-Host ""
+                Write-CL "  XP:  $($script:XP) / $($script:XPToNext)" "DarkCyan"
+                Write-CL "  Kills: $($script:KillCount)" "DarkGray"
+                Write-Host ""
+
+                # ── Equipment ──
+                Write-CL "  ── EQUIPMENT ──" "Yellow"
+                if($script:EquippedWeapon){
+                    $w = $script:EquippedWeapon
+                    $perkStr = if($w.Perk){" | Perk: $($w.Perk) ($($w.PerkChance)%)"}else{""}
+                    $magStr = if($w.MAGBonus){" | MAG+$($w.MAGBonus)"}else{""}
+                    $affStr = if($w.ClassAffinity -eq $script:PlayerClass){"MATCH"}else{$w.ClassAffinity}
+                    Write-CL "  Weapon: $($w.Name)  ATK+$($w.ATK)  [$affStr]$perkStr$magStr" "Cyan"
+                } else {
+                    Write-CL "  Weapon: Bare Hands" "DarkGray"
+                }
+                Write-Host ""
+
+                $slots = @("Helmet","Chest","Shield","Amulet","Boots")
+                foreach($slot in $slots){
+                    $piece = $script:EquippedArmor[$slot]
+                    $slotLabel = "$($slot):".PadRight(9)
+                    if($piece){
+                        Write-CL "  $slotLabel $($piece.Name) (DEF+$($piece.DEF))" "Cyan"
+                    } else {
+                        Write-CL "  $slotLabel (empty)" "DarkGray"
+                    }
+                }
+                Write-Host ""
+
+                # ── Weapon Affinity Tip ──
+                Write-CL "  ┌──────────────────────────────────────────────────┐" "DarkGray"
+                Write-CL "  │  Your class affinity: $($script:PlayerClass)" "DarkGray"
+                Write-CL "  │  Weapons matching your class give bonus ATK.     │" "DarkGray"
+                Write-CL "  └──────────────────────────────────────────────────┘" "DarkGray"
+                Write-Host ""
+
+                # ── Abilities ──
+                Write-CL "  ── ABILITIES ──" "Yellow"
+                foreach($ab in $p2.Abilities){
+                    $costStr = if($ab.Type -eq "Sacrifice"){"HP:15%"}else{"MP:$($ab.Cost)"}
+                    $effStr = if($ab.Effect -and $ab.Effect -ne "None" -and $ab.Effect -ne "SacrificeHP"){" [$($ab.Effect)]"}else{""}
+                    Write-CL "    $($ab.Name)  |  $costStr  |  $($ab.Type)  |  Pwr:$($ab.Power)$effStr" "Cyan"
+                }
+                Wait-Key
+            }
+
+            "6" { Show-QuestBoard }
+            "7" { Show-GuildHall }
+
+            "8" {
+                Write-C "  Really quit? (y/n): " "Red"; $confirm = Read-Host
+                if($confirm -eq 'y'){
+                    $script:GameRunning = $false
+                    clr
+                    Write-CL "" "White"
+                    Write-CL "  Thanks for playing DEPTHS OF POWERSHELL!" "Yellow"
+                    Write-CL "  Final Stats: Level $($script:PlayerLevel) $($p.Name) | Gold: $($script:Gold) | Dungeons: $($script:DungeonLevel)" "Gray"
+                    Write-Host ""
+                }
+            }
+
+            "9" {
+                clr
+                Write-CL "" "White"
+                Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkYellow"
+                Write-CL "  ║            S A V E   G A M E                       ║" "Yellow"
+                Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkYellow"
+                Write-Host ""
+                Write-CL "  Preparing save code..." "DarkGray"
+                Write-Host ""
+
+                # Convert loot to gold and tell the player
+                $lootVal = 0
+                foreach($item in $script:Inventory){ $lootVal += $item.Value }
+                if($lootVal -gt 0){
+                    Write-CL "  Loot inventory converted to gold: +${lootVal}g" "Yellow"
+                }
+                if($script:Quests.Count -gt 0){
+                    Write-CL "  Active quests will not be saved." "DarkGray"
+                }
+                Write-Host ""
+
+                $code = Save-Game
+                Write-CL "  ┌──────────────────────────────────────────────────────┐" "Green"
+                Write-CL "  │  YOUR SAVE CODE (copy this entire string):           │" "Green"
+                Write-CL "  └──────────────────────────────────────────────────────┘" "Green"
+                Write-Host ""
+                Write-CL "  $code" "Cyan"
+                Write-Host ""
+                Write-CL "  Write down or copy this code. You can use it" "DarkGray"
+                Write-CL "  to continue your game next time you play." "DarkGray"
+                Write-Host ""
+                Write-CL "  NOTE: Loot was converted to gold. Quests were reset." "DarkYellow"
+                Write-CL "  TIP: Use Ctrl+C to copy your code, and Ctrl+V to paste it in later." "DarkCyan"
+                Write-Host ""
+                Read-Host "  Press Enter to continue"
+            }
+        }
+    }
+}
+
+
+
+# ─── ENTRY POINT ─────────────────────────────────────────────────
+function Start-Game {
+    $script:GameRunning = $true
+    clr
+
+    # Title screen
+    Write-Host ""
+    Write-CL "     ____  _____ ____ _____ _   _ ____" "DarkCyan"
+    Write-CL "    |  _ \| ____|  _ \_   _| | | / ___|" "Cyan"
+    Write-CL "    | | | |  _| | |_) || | | |_| \___ \" "Cyan"
+    Write-CL "    | |_| | |___|  __/ | | |  _  |___) |" "Cyan"
+    Write-CL "    |____/|_____|_|    |_| |_| |_|____/" "DarkCyan"
+    Write-Host ""
+    Write-CL "          O F   P O W E R S H E L L" "DarkYellow"
+    Write-Host ""
+    Write-CL "    A first-person dungeon crawler" "DarkGray"
+    Write-CL "    with turn-based RPG combat" "DarkGray"
+    Write-Host ""
+    Write-CL "    ─────────────────────────────────" "DarkGray"
+    Write-CL "    CONTROLS (in dungeon):" "Gray"
+    Write-CL "      W = Move Forward    S = Move Back" "Gray"
+    Write-CL "      A = Turn Left       D = Turn Right" "Gray"
+    Write-CL "    ─────────────────────────────────" "DarkGray"
+    Write-CL "    SYMBOLS (on minimap):" "Gray"
+    Write-CL "      ! = Enemy   M = Mini-Boss" "Gray"
+    Write-CL "      B = Boss    > = Exit   $ = Treasure" "Gray"
+    Write-CL "    ─────────────────────────────────" "DarkGray"
+    Write-Host ""
+    Wait-Key
+
+    # ═══════════════════════════════════════════════════
+    #  NEW / LOAD PROMPT  (this is the new part)
+    # ═══════════════════════════════════════════════════
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
+    Write-CL "  ║         DEPTHS OF POWERSHELL                     ║" "Yellow"
+    Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
+    Write-Host ""
+    Write-CL "  ┌─────────────────────────────────────────┐" "DarkGray"
+    Write-C  "  │  " "DarkGray"; Write-C "[1]" "Green";  Write-CL " New Game                          │" "White"
+    Write-C  "  │  " "DarkGray"; Write-C "[2]" "Cyan";   Write-CL " Load Save Code                    │" "White"
+    Write-CL "  └─────────────────────────────────────────┘" "DarkGray"
+    Write-Host ""
+    Write-C "  > " "Yellow"; $startChoice = Read-Host
+
+    if($startChoice -eq "2"){
+        # ── LOAD PATH ──
+        clr
+        Write-Host ""
+        Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkCyan"
+        Write-CL "  ║         L O A D   G A M E                        ║" "Cyan"
+        Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkCyan"
+        Write-Host ""
+        Write-CL "  Paste or type your save code below." "DarkGray"
+        Write-CL "  (It's the Base64 string you copied last time)" "DarkGray"
+        Write-Host ""
+        Write-C "  Code: " "Yellow"
+        $code = Read-Host
+
+        # Trim whitespace in case they accidentally copied spaces
+        $code = $code.Trim()
+
+        $result = Load-Game $code
+
+        if($result.Success){
+            Write-Host ""
+            Write-CL "  ╔══════════════════════════════════════╗" "Green"
+            Write-CL "  ║       SAVE LOADED SUCCESSFULLY!       ║" "Green"
+            Write-CL "  ╚══════════════════════════════════════╝" "Green"
+            Write-Host ""
+            $p = $script:Player
+            Write-CL "  Welcome back, $($p.Name)!" "Yellow"
+            Write-CL "  Class: $($script:PlayerClass)  Level: $($script:PlayerLevel)" "DarkGray"
+            Write-CL "  HP: $($p.HP)/$($p.MaxHP)  MP: $($p.MP)/$($p.MaxMP)" "DarkGray"
+            Write-CL "  Gold: $($script:Gold)g" "Yellow"
+            Write-CL "  Dungeon Level: $($script:DungeonLevel)" "DarkGray"
+            if($script:EquippedWeapon){
+                Write-CL "  Weapon: $($script:EquippedWeapon.Name)" "Cyan"
+            }
+            if($script:Partner){
+                Write-CL "  Ally: $($script:Partner.Name) ($($script:Partner.Class))" "Green"
+            }
+            Write-Host ""
+            Write-CL "  Your loot was converted to gold." "DarkYellow"
+            Write-CL "  Quests have been reset - visit the Quest Board!" "DarkYellow"
+            Write-Host ""
+            Wait-Key
+            # Skip lore and character select, go straight to town
+            Show-MainMenu
+            return
+        } else {
+            # Load failed — tell them why and fall through to new game
+            Write-Host ""
+            Write-CL "  ╔══════════════════════════════════════╗" "Red"
+            Write-CL "  ║         LOAD FAILED                   ║" "Red"
+            Write-CL "  ╚══════════════════════════════════════╝" "Red"
+            Write-CL "  $($result.Error)" "DarkRed"
+            Write-Host ""
+            Write-CL "  Starting a new game instead..." "DarkGray"
+            Wait-Key
+        }
+    }
+
+    # ── NEW GAME PATH (lore + character select, same as before) ──
+
+    # ── Story Intro ──
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════════════╗" "DarkCyan"
+    Write-CL "  ║                 T H E   L O R E                          ║" "Cyan"
+    Write-CL "  ╚══════════════════════════════════════════════════════════╝" "DarkCyan"
+    Write-Host ""
+    Write-CL "  In the age before automation, the realm was at peace." "Gray"
+    Write-CL "  Scripts ran on time. Logs were clean. Cron jobs never failed." "Gray"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1200
+    Write-CL "  Then came the Great Deprecated Update." "DarkYellow"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1200
+    Write-CL "  A careless wizard cast an untested script upon the kingdom's" "Gray"
+    Write-CL "  core infrastructure. No -WhatIf. No -Confirm. Just..." "Gray"
+    Write-Host ""
+    Start-Sleep -Milliseconds 800
+    Write-CL "    Invoke-Catastrophe -Force -NoRollback" "Red"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1500
+    Write-CL "  The earth split open. Beneath the Server Halls of the old" "Gray"
+    Write-CL "  kingdom, a vast dungeon materialized — twisting corridors" "Gray"
+    Write-CL "  of corrupted memory, haunted by rogue processes and daemon" "Gray"
+    Write-CL "  threads that refused to terminate." "Gray"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1200
+    Write-CL "  They call it... the Depths of PowerShell." "Cyan"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1500
+    Wait-Key
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════════════╗" "DarkCyan"
+    Write-CL "  ║                 T H E   L O R E                          ║" "Cyan"
+    Write-CL "  ╚══════════════════════════════════════════════════════════╝" "DarkCyan"
+    Write-Host ""
+    Write-CL "  The Guild of SysAdmins posted a bounty:" "DarkYellow"
+    Write-Host ""
+    Write-CL "  ┌──────────────────────────────────────────────────────┐" "Yellow"
+    Write-CL "  │                                                      │" "Yellow"
+    Write-CL "  │   WANTED: Brave soul to descend into the Depths.     │" "Yellow"
+    Write-CL "  │                                                      │" "Yellow"
+    Write-CL "  │   Objective: Reach the bottom. Find the root shell.  │" "Yellow"
+    Write-CL "  │   Terminate the runaway process known only as...     │" "Yellow"
+    Write-CL "  │                                                      │" "Yellow"
+    Write-C  "  │           " "Yellow"
+    Write-C "the Lich King of Legacy Code" "Red"
+    Write-CL "             │" "Yellow"
+    Write-CL "  │                                                      │" "Yellow"
+    Write-CL "  │   WARNING: This task cannot be run as a background   │" "Yellow"
+    Write-CL "  │   job. You must go in person.                        │" "Yellow"
+    Write-CL "  │                                                      │" "Yellow"
+    Write-CL "  │   Payment: All the gold your pipeline can carry.     │" "Yellow"
+    Write-CL "  │                                                      │" "Yellow"
+    Write-CL "  └──────────────────────────────────────────────────────┘" "Yellow"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1000
+    Write-CL "  You step forward. You have no -ErrorAction SilentlyContinue." "Gray"
+    Write-CL "  If you fail, the exception will not be caught." "Gray"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1200
+    Write-CL "  There is only one way out: through." "White"
+    Write-Host ""
+    Wait-Key
+
+    Show-CharacterSelect
+    Show-MainMenu
+}
+
+# Launch the game
+Start-Game
