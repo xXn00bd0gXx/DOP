@@ -1,0 +1,998 @@
+                                        $script:StatusMsg = "Used $($pot.Name)! Restored $healed HP! ($($p.HP)/$($p.MaxHP))"
+                                        $script:Potions.Remove($pot)
+                                    }
+                                }
+                                "Mana" {
+                                    if($p.MP -eq $p.MaxMP){
+                                        $script:StatusMsg = "MP already full!"
+                                    } else {
+                                        $restored = [math]::Min($pot.Power, $p.MaxMP - $p.MP)
+                                        $p.MP += $restored
+                                        $script:StatusMsg = "Used $($pot.Name)! Restored $restored MP! ($($p.MP)/$($p.MaxMP))"
+                                        $script:Potions.Remove($pot)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            "Q" {
+                Write-C "  Abandon dungeon? (y/n): " "Red"
+                $confirm = Read-Host
+                if($confirm -eq 'y'){
+                    clr
+                    Write-CL "" "Red"
+                    Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkRed"
+                    Write-CL "  ║                                                    ║" "DarkRed"
+                    Write-CL "  ║       You fumble in fear as you flee the            ║" "Red"
+                    Write-CL "  ║       dungeon, dropping loot behind you...          ║" "Red"
+                    Write-CL "  ║                                                    ║" "DarkRed"
+                    Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkRed"
+                    Write-Host ""
+
+                    if($script:Inventory.Count -gt 0){
+                        $lossPct = (Get-Random -Min 15 -Max 51) / 100.0
+                        $loseCount = [math]::Max([math]::Ceiling($script:Inventory.Count * $lossPct), 1)
+
+                        # Shuffle and remove random items
+                        $lostItems = [System.Collections.ArrayList]@()
+                        for($li=0;$li -lt $loseCount;$li++){
+                            if($script:Inventory.Count -eq 0){ break }
+                            $removeIdx = Get-Random -Min 0 -Max $script:Inventory.Count
+                            $lostItem = $script:Inventory[$removeIdx]
+                            [void]$lostItems.Add($lostItem)
+                            $script:Inventory.RemoveAt($removeIdx)
+                        }
+
+                        $lostValue = 0
+                        Write-CL "  Lost items:" "DarkRed"
+                        foreach($lost in $lostItems){
+                            Write-CL "    - $($lost.Name) ($($lost.Value)g)" "Red"
+                            $lostValue += $lost.Value
+                        }
+                        Write-Host ""
+                        $pctDisplay = [math]::Floor($lossPct * 100)
+                        Write-CL "  You lost $($lostItems.Count) item(s) worth ${lostValue}g! (${pctDisplay}% of your loot)" "DarkRed"
+                    } else {
+                        Write-CL "  You had nothing to lose... but your dignity." "DarkGray"
+                    }
+
+                    # Also lose a small percentage of gold
+                    $goldLossPct = (Get-Random -Min 5 -Max 16) / 100.0
+                    $goldLost = [math]::Floor($script:Gold * $goldLossPct)
+                    if($goldLost -gt 0){
+                        $script:Gold -= $goldLost
+                        Write-CL "  Dropped ${goldLost}g in your panic!" "DarkYellow"
+                    }
+
+                    Write-Host ""
+                    Write-CL "  Remaining Gold: $($script:Gold)g" "Yellow"
+                    Write-CL "  Remaining Loot: $($script:Inventory.Count) item(s)" "DarkGray"
+                    Write-Host ""
+                    Wait-Key
+                    $inDungeon = $false
+                    $script:DungeonLevel--
+                }
+            
+
+            }
+        }
+    }
+
+        if($script:Player.HP -le 0){
+        clr
+        Write-CL "" "Red"
+        Write-CL "  ╔══════════════════════════════════════════════════════╗" "DarkRed"
+        Write-CL "  ║                                                      ║" "DarkRed"
+        Write-CL "  ║             Y O U   H A V E   D I E D                ║" "Red"
+        Write-CL "  ║                                                      ║" "DarkRed"
+        Write-CL "  ╚══════════════════════════════════════════════════════╝" "DarkRed"
+        Write-Host ""
+        Write-CL "          _______________" "DarkGray"
+        Write-CL "         /               \" "DarkGray"
+        Write-CL "        |  R.I.P.         |" "DarkGray"
+        Write-CL "        |                 |" "DarkGray"
+        Write-CL "        |  $($script:Player.Name.PadRight(16))|" "DarkGray"
+        Write-CL "        |  Level $($script:PlayerLevel.ToString().PadRight(10))|" "DarkGray"
+        Write-CL "        |                 |" "DarkGray"
+        Write-CL "        |  Fell in the    |" "DarkGray"
+        Write-CL "        |  depths...      |" "DarkGray"
+        Write-CL "        |_________________|" "DarkGray"
+        Write-CL "        /                 \" "DarkGray"
+        Write-CL "       /___________________\" "DarkGray"
+        Write-Host ""
+        Write-CL "  ── Final Stats ──" "DarkYellow"
+        Write-CL "  Dungeon Level Reached: $($script:DungeonLevel)" "DarkGray"
+        Write-CL "  Player Level: $($script:PlayerLevel)" "DarkGray"
+        Write-CL "  Gold: $($script:Gold)" "DarkGray"
+        Write-CL "  Enemies Slain: Many." "DarkGray"
+        Write-Host ""
+        Write-CL "  ┌─────────────────────────────────────┐" "DarkGray"
+        Write-CL "  │                                     │" "DarkGray"
+        Write-C  "  │  " "DarkGray"; Write-C "[1]" "Green"; Write-CL " Play Again (New Character)    │" "White"
+        Write-C  "  │  " "DarkGray"; Write-C "[2]" "Yellow"; Write-CL " Play Again (Same Character)   │" "White"
+        Write-C  "  │  " "DarkGray"; Write-C "[3]" "Red"; Write-CL " Quit Game                     │" "White"
+        Write-CL "  │                                     │" "DarkGray"
+        Write-CL "  └─────────────────────────────────────┘" "DarkGray"
+        Write-Host ""
+        Write-C "  > " "Yellow"
+        $deathChoice = Read-Host
+
+        switch($deathChoice){
+            "1" {
+                # Full restart with new character
+                Show-CharacterSelect
+                # Reset dungeon level
+                $script:DungeonLevel = 0
+            }
+            "2" {
+                $script:Player.HP = $script:Player.MaxHP
+                $script:Player.MP = $script:Player.MaxMP
+                $script:Gold = 50
+                $script:Inventory.Clear()
+                $script:Potions.Clear()
+                $script:ThrowablePotions.Clear()
+                [void]$script:Potions.Add(@{Name="Small Health Potion";Type="Heal";Power=30;Price=25;Desc="Restore 30 HP"})
+                $script:DungeonLevel = [math]::Max($script:DungeonLevel - 1, 0)
+                $script:EquippedWeapon = $null
+                $script:EquippedArmor = @{Helmet=$null;Chest=$null;Shield=$null;Amulet=$null;Boots=$null}
+                $script:KillCount = 0
+                $script:HasBossKey = $false
+                $script:BossDefeated = $false
+                Write-Host ""
+                Write-CL "  You awaken at the town square, battered but alive..." "Yellow"
+                Write-CL "  Your gold and items are gone, but your experience remains." "DarkGray"
+                Write-CL "  Level: $($script:PlayerLevel)  |  Starting Gold: 50g" "DarkGray"
+                Wait-Key
+            }
+
+            "3" {
+                clr
+                Write-CL "" "White"
+                Write-CL "  Thanks for playing DEPTHS OF POWERSHELL!" "Yellow"
+                Write-CL "  Final Stats: Level $($script:PlayerLevel) $($script:Player.Name)" "Gray"
+                Write-Host ""
+                $script:GameRunning = $false
+                return
+            }
+            default {
+                Show-CharacterSelect
+                $script:DungeonLevel = 0
+            }
+        }
+    }
+}
+
+
+
+# ─── CHARACTER CREATION ──────────────────────────────────────────
+function Show-CharacterSelect {
+    $classes = Get-ClassTemplates
+    $classOrder = @("Knight","Mage","Brawler","Ranger","Cleric","Necromancer")
+    clr
+    Write-CL "" "White"
+    Write-CL "  ╔══════════════════════════════════════════════╗" "DarkCyan"
+    Write-CL "  ║       DEPTHS OF POWERSHELL                   ║" "Cyan"
+    Write-CL "  ║       A Dungeon Crawler                      ║" "DarkCyan"
+    Write-CL "  ╚══════════════════════════════════════════════╝" "DarkCyan"
+    Write-Host ""
+    Write-CL "  Choose your class:" "White"
+    Write-Host ""
+
+    for($i=0; $i -lt $classOrder.Count; $i++){
+        $key = $classOrder[$i]
+        $c = $classes[$key]
+        $color = switch($key){
+            "Knight"      {"Yellow"}
+            "Mage"        {"Cyan"}
+            "Brawler"     {"Red"}
+            "Ranger"      {"Green"}
+            "Cleric"      {"White"}
+            "Necromancer" {"Magenta"}
+        }
+        Write-CL "  [$($i+1)] $($c.Name)" $color
+        Write-CL "      $($c.Desc)" "DarkGray"
+        Write-CL "      HP:$($c.MaxHP) MP:$($c.MaxMP) ATK:$($c.ATK) DEF:$($c.DEF) SPD:$($c.SPD) MAG:$($c.MAG)" "Gray"
+        Write-C "      Abilities: " "DarkGray"
+        Write-CL (($c.Abilities | ForEach-Object { $_.Name }) -join ", ") "Cyan"
+        Write-C "      Weapon Affinity: " "DarkGray"
+        Write-CL $c.Affinity "DarkYellow"
+        Write-Host ""
+    }
+
+    Write-CL "  ┌──────────────────────────────────────────────────────┐" "DarkGray"
+    Write-CL "  │  TIP: Weapons have class affinities. Equipping a    │" "DarkGray"
+    Write-CL "  │  weapon matching your class grants bonus ATK!        │" "DarkGray"
+    Write-CL "  └──────────────────────────────────────────────────────┘" "DarkGray"
+    Write-Host ""
+
+    Write-C "  > " "Yellow"; $pick = Read-Host
+    $pickIdx = [int]$pick - 1
+    if($pickIdx -lt 0 -or $pickIdx -ge $classOrder.Count){ $pickIdx = 0 }
+    $className = $classOrder[$pickIdx]
+    $template = $classes[$className]
+
+    $script:PlayerClass = $className
+    $script:Player = @{
+        Name      = $template.Name
+        HP        = $template.HP
+        MaxHP     = $template.MaxHP
+        MP        = $template.MP
+        MaxMP     = $template.MaxMP
+        ATK       = $template.ATK
+        DEF       = $template.DEF
+        SPD       = $template.SPD
+        MAG       = $template.MAG
+        Abilities = $template.Abilities
+    }
+    $script:EquippedWeapon = $null
+    $script:EquippedArmor = @{
+        Helmet = $null
+        Chest  = $null
+        Shield = $null
+        Amulet = $null
+        Boots  = $null
+    }
+    $script:Gold = 50
+    $script:Inventory.Clear()
+    $script:Potions.Clear()
+    $script:ThrowablePotions.Clear()
+    [void]$script:Potions.Add(@{Name="Small Health Potion";Type="Heal";Power=30;Price=25;Desc="Restore 30 HP"})
+    $script:DungeonLevel = 0
+    $script:PlayerLevel = 1
+    $script:XP = 0
+    $script:XPToNext = 100
+    $script:KillCount = 0
+    $script:Partner = $null
+    $script:Quests.Clear()
+
+    Write-Host ""
+    Write-CL "  You are a $className. Your journey begins..." "Green"
+    Wait-Key
+}
+
+
+function Get-ClassTemplates {
+    @{
+        Knight = @{
+            Name="Knight"; MaxHP=120; HP=120; MaxMP=30; MP=30
+            ATK=14; DEF=12; SPD=8; MAG=4
+            Abilities=@(
+                @{Name="Shield Bash"; Cost=8;  Type="Physical"; Power=18; Effect="Stun"}
+                @{Name="Holy Strike"; Cost=12; Type="Physical"; Power=28; Effect="None"}
+                @{Name="Fortify";     Cost=10; Type="Buff";     Power=0;  Effect="DEF+5"}
+            )
+            Desc="High defense, strong melee attacks, sturdy."
+            Affinity="Sword"
+        }
+        Mage = @{
+            Name="Mage"; MaxHP=75; HP=75; MaxMP=80; MP=80
+            ATK=6; DEF=5; SPD=10; MAG=18
+            Abilities=@(
+                @{Name="Fireball";      Cost=15; Type="Magic"; Power=30; Effect="Burn"}
+                @{Name="Ice Shard";     Cost=12; Type="Magic"; Power=22; Effect="Slow"}
+                @{Name="Arcane Shield"; Cost=20; Type="Buff";  Power=0;  Effect="DEF+8"}
+            )
+            Desc="Devastating magic, large MP pool, fragile."
+            Affinity="Staff"
+        }
+        Brawler = @{
+            Name="Brawler"; MaxHP=100; HP=100; MaxMP=40; MP=40
+            ATK=16; DEF=8; SPD=12; MAG=3
+            Abilities=@(
+                @{Name="Fury Punch"; Cost=10; Type="Physical"; Power=24; Effect="None"}
+                @{Name="Whirlwind";  Cost=15; Type="Physical"; Power=20; Effect="Bleed"}
+                @{Name="Battle Cry"; Cost=12; Type="Buff";     Power=0;  Effect="ATK+5"}
+            )
+            Desc="Fast and aggressive, high attack, less durable."
+            Affinity="Fist"
+        }
+        Ranger = @{
+            Name="Ranger"; MaxHP=90; HP=90; MaxMP=50; MP=50
+            ATK=12; DEF=7; SPD=15; MAG=6
+            Abilities=@(
+                @{Name="Quick Shot";   Cost=8;  Type="Physical"; Power=20; Effect="None"}
+                @{Name="Poison Arrow"; Cost=14; Type="Physical"; Power=18; Effect="Poison"}
+                @{Name="Shadow Step";  Cost=10; Type="Buff";     Power=0;  Effect="DEF+4"}
+            )
+            Desc="Fast and precise, high speed, evasive fighter."
+            Affinity="Bow"
+        }
+        Cleric = @{
+            Name="Cleric"; MaxHP=95; HP=95; MaxMP=70; MP=70
+            ATK=8; DEF=10; SPD=7; MAG=14
+            Abilities=@(
+                @{Name="Smite";       Cost=12; Type="Magic"; Power=24; Effect="None"}
+                @{Name="Holy Heal";   Cost=18; Type="Heal";  Power=40; Effect="None"}
+                @{Name="Divine Ward"; Cost=15; Type="Buff";  Power=0;  Effect="DEF+7"}
+            )
+            Desc="Holy support, self-heals in combat, solid defense."
+            Affinity="Mace"
+        }
+        Necromancer = @{
+            Name="Necromancer"; MaxHP=70; HP=70; MaxMP=75; MP=75
+            ATK=7; DEF=4; SPD=9; MAG=20
+            Abilities=@(
+                @{Name="Soul Drain"; Cost=14; Type="Magic";     Power=26; Effect="Drain"}
+                @{Name="Curse";      Cost=16; Type="Magic";     Power=20; Effect="Weaken"}
+                @{Name="Dark Pact";  Cost=0;  Type="Sacrifice"; Power=35; Effect="SacrificeHP"}
+            )
+            Desc="Dark magic master, drains life, fragile but deadly."
+            Affinity="Scythe"
+        }
+    }
+}
+
+# ─── QUEST SYSTEM ─────────────────────────────────────────────────
+function Get-RandomQuests {
+    param([int]$DungeonLvl)
+    $templates = @(
+        @{Type="Kill";     DescTemplate="Slay {0} enemies in the dungeon";   TMin=3; TMax=7}
+        @{Type="Kill";     DescTemplate="Defeat {0} foes to prove your worth"; TMin=5; TMax=10}
+        @{Type="MiniBoss"; DescTemplate="Defeat the dungeon mini-boss";      TMin=1; TMax=1}
+        @{Type="Boss";     DescTemplate="Defeat the dungeon boss";           TMin=1; TMax=1}
+        @{Type="Rescue";   DescTemplate="Rescue the lost adventurer";        TMin=1; TMax=1}
+        @{Type="Treasure"; DescTemplate="Open {0} treasure chests";          TMin=2; TMax=5}
+    )
+    $picked = $templates | Get-Random -Count 3
+    $result = [System.Collections.ArrayList]@()
+    foreach($t in $picked){
+        $count = Get-Random -Min $t.TMin -Max ($t.TMax + 1)
+        $desc = if($t.DescTemplate -match '\{0\}'){$t.DescTemplate -f $count}else{$t.DescTemplate}
+        $goldReward = switch($t.Type){
+            "Kill"     { 40 + $DungeonLvl * 20 + $count * 5 }
+            "MiniBoss" { 80 + $DungeonLvl * 30 }
+            "Boss"     { 150 + $DungeonLvl * 40 }
+            "Rescue"   { 60 + $DungeonLvl * 25 }
+            "Treasure" { 50 + $DungeonLvl * 15 + $count * 5 }
+        }
+        $xpReward = switch($t.Type){
+            "Kill"     { 30 + $DungeonLvl * 15 + $count * 5 }
+            "MiniBoss" { 60 + $DungeonLvl * 25 }
+            "Boss"     { 100 + $DungeonLvl * 30 }
+            "Rescue"   { 40 + $DungeonLvl * 20 }
+            "Treasure" { 25 + $DungeonLvl * 15 }
+        }
+        [void]$result.Add(@{
+            Type=$t.Type; Desc=$desc; TargetCount=$count
+            Progress=0; RewardGold=$goldReward; RewardXP=$xpReward
+            Complete=$false; TurnedIn=$false
+        })
+    }
+    return $result
+}
+
+function Update-QuestProgress {
+    param([string]$Type, [int]$Amount = 1)
+    foreach($q in $script:Quests){
+        if($q.Type -eq $Type -and -not $q.Complete -and -not $q.TurnedIn){
+            $q.Progress = [math]::Min($q.Progress + $Amount, $q.TargetCount)
+            if($q.Progress -ge $q.TargetCount){
+                $q.Complete = $true
+                $script:StatusMsg = "Quest complete: $($q.Desc)!"
+            }
+        }
+    }
+}
+
+function Show-QuestBoard {
+    $qbLoop = $true
+    # Generate available quests if none exist yet
+if(-not $script:AvailableQuests -or $script:AvailableQuests.Count -eq 0){
+    $script:AvailableQuests = [System.Collections.ArrayList]@(Get-RandomQuests ($script:DungeonLevel + 1))
+}
+
+    while($qbLoop){
+        clr
+        Write-CL "" "White"
+        Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkYellow"
+        Write-CL "  ║          Q U E S T   B O A R D                     ║" "Yellow"
+        Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkYellow"
+        Write-Host ""
+        Write-CL "       ___________________________" "DarkGray"
+        Write-CL "      |    |            |    |    |" "DarkGray"
+        Write-CL "      |HELP| ADVENTURER |GOLD|FAME|" "DarkYellow"
+        Write-CL "      | !  |  WANTED!!  | $$ | ** |" "Yellow"
+        Write-CL "      |____|____________|____|____|" "DarkGray"
+        Write-CL "      |         QUEST              |" "DarkGray"
+        Write-CL "      |         BOARD              |" "DarkYellow"
+        Write-CL "      |___________________________|" "DarkGray"
+        Write-Host ""
+
+        # ── Active Quests ──
+        Write-CL "  ╔══════════════════════════════════════════════╗" "DarkCyan"
+        Write-CL "  ║  A C T I V E   Q U E S T S                   ║" "Cyan"
+        Write-CL "  ╠══════════════════════════════════════════════╣" "DarkCyan"
+        if($script:Quests.Count -eq 0){
+            Write-CL "  ║  No active quests. Accept one below!         ║" "DarkGray"
+        } else {
+            for($i=0;$i -lt $script:Quests.Count;$i++){
+                $q = $script:Quests[$i]
+                $statusIcon = if($q.TurnedIn){"[DONE]"}elseif($q.Complete){"[READY]"}else{"[$($q.Progress)/$($q.TargetCount)]"}
+                $statusColor = if($q.TurnedIn){"DarkGray"}elseif($q.Complete){"Green"}else{"Yellow"}
+                $desc = $q.Desc
+                if($desc.Length -gt 30){$desc = $desc.Substring(0,30)}
+                Write-C "  ║  " "DarkCyan"
+                Write-C $statusIcon $statusColor
+                Write-C " $desc" "White"
+                $qPad = 40 - $statusIcon.Length - $desc.Length
+                if($qPad -lt 0){$qPad=0}
+                Write-CL "$(' ' * $qPad)║" "DarkCyan"
+            }
+        }
+        Write-CL "  ╚══════════════════════════════════════════════╝" "DarkCyan"
+        Write-Host ""
+
+        # ── Available Quests ──
+        Write-CL "  ╔══════════════════════════════════════════════╗" "DarkGreen"
+        Write-CL "  ║  A V A I L A B L E                           ║" "Green"
+        Write-CL "  ╠══════════════════════════════════════════════╣" "DarkGreen"
+        $avail = @($script:AvailableQuests | Where-Object { -not $_.TurnedIn })
+        if($avail.Count -eq 0){
+            Write-CL "  ║  No quests available. Enter a dungeon and     ║" "DarkGray"
+            Write-CL "  ║  come back later!                              ║" "DarkGray"
+        } else {
+            for($i=0;$i -lt $avail.Count;$i++){
+                $q = $avail[$i]
+                Write-C "  ║  " "DarkGreen"
+                Write-C "[$($i+1)] " "White"
+                Write-C "$($q.Desc)" "Green"
+                $dPad = 37 - $q.Desc.Length
+                if($dPad -lt 0){$dPad=0}
+                Write-CL "$(' ' * $dPad)║" "DarkGreen"
+                Write-C "  ║      " "DarkGreen"
+                Write-C "Reward: $($q.RewardGold)g + $($q.RewardXP) XP" "Yellow"
+                $rStr = "Reward: $($q.RewardGold)g + $($q.RewardXP) XP"
+                $rPad = 37 - $rStr.Length
+                if($rPad -lt 0){$rPad=0}
+                Write-CL "$(' ' * $rPad)║" "DarkGreen"
+            }
+        }
+        Write-CL "  ╚══════════════════════════════════════════════╝" "DarkGreen"
+        Write-Host ""
+
+        # ── Options ──
+        Write-CL "  ┌───────────────────────────────────────────┐" "DarkGray"
+        Write-C  "  │  " "DarkGray"; Write-C "[A]" "Green";   Write-CL " Accept a quest                      │" "DarkGray"
+        Write-C  "  │  " "DarkGray"; Write-C "[T]" "Yellow";  Write-CL " Turn in completed quest             │" "DarkGray"
+        Write-C  "  │  " "DarkGray"; Write-C "[R]" "DarkCyan";Write-CL " Refresh available quests (free)     │" "DarkGray"
+        Write-C  "  │  " "DarkGray"; Write-C "[0]" "White";   Write-CL " Back                                │" "DarkGray"
+        Write-CL "  └───────────────────────────────────────────┘" "DarkGray"
+        Write-Host ""
+        Write-C "  > " "Yellow"; $qCh = Read-Host
+
+        switch($qCh.ToUpper()){
+            "A" {
+                if($script:Quests.Count -ge 3){
+                    Write-CL "  You can only hold 3 quests at a time!" "Red"
+                    Wait-Key
+                } elseif($avail.Count -eq 0){
+                    Write-CL "  No quests to accept!" "Red"
+                    Wait-Key
+                } else {
+                    Write-C "  Accept quest #: " "Yellow"; $qPick = Read-Host
+                    $qIdx = [int]$qPick - 1
+                    if($qIdx -ge 0 -and $qIdx -lt $avail.Count){
+                        $accepted = $avail[$qIdx]
+                        [void]$script:Quests.Add($accepted)
+                        $script:AvailableQuests.Remove($accepted)
+                        Write-CL "  Quest accepted: $($accepted.Desc)" "Green"
+                        Wait-Key
+                    }
+                }
+            }
+            "T" {
+                $ready = @($script:Quests | Where-Object { $_.Complete -and -not $_.TurnedIn })
+                if($ready.Count -eq 0){
+                    Write-CL "  No completed quests to turn in!" "Red"
+                    Wait-Key
+                } else {
+                    Write-CL "  ── Completed Quests ──" "Yellow"
+                    for($ti=0;$ti -lt $ready.Count;$ti++){
+                        $rq = $ready[$ti]
+                        Write-CL "  [$($ti+1)] $($rq.Desc) - $($rq.RewardGold)g + $($rq.RewardXP) XP" "Green"
+                    }
+                    Write-C "  Turn in #: " "Yellow"; $tPick = Read-Host
+                    $tIdx = [int]$tPick - 1
+                    if($tIdx -ge 0 -and $tIdx -lt $ready.Count){
+                        $rq = $ready[$tIdx]
+                        $rq.TurnedIn = $true
+                        $script:Gold += $rq.RewardGold
+                        $questXP = $rq.RewardXP
+                        if($script:Partner -and $script:Partner.Class -eq "Bard"){
+                            $questXPBonus = [math]::Floor($rq.RewardXP * 0.25)
+                            $questXP += $questXPBonus
+                        }
+                        $script:XP += $questXP
+
+                        Write-Host ""
+                        Write-CL "  ╔══════════════════════════════════════╗" "Yellow"
+                        Write-CL "  ║     QUEST COMPLETE!                  ║" "Yellow"
+                        Write-CL "  ╚══════════════════════════════════════╝" "Yellow"
+                        Write-CL "  + $($rq.RewardGold) Gold" "Yellow"
+                        Write-CL "  + $questXP XP" "Cyan"
+                        if($script:Partner -and $script:Partner.Class -eq "Bard"){
+                            Write-CL "    ($($script:Partner.Name): +$questXPBonus bonus XP)" "DarkCyan"
+                        }
+
+
+                        # Check level up
+                        $p = $script:Player
+                        while($script:XP -ge $script:XPToNext){
+                            $script:XP -= $script:XPToNext
+                            $script:PlayerLevel++
+                            $script:XPToNext = [math]::Floor($script:XPToNext * 1.5)
+                            $p.MaxHP+=10; $p.HP=$p.MaxHP; $p.MaxMP+=5; $p.MP=$p.MaxMP
+                            $p.ATK+=2; $p.DEF+=2; $p.SPD+=1; $p.MAG+=2
+                            Write-Host ""
+                            Write-CL "  *** LEVEL UP! Now Level $($script:PlayerLevel)! ***" "Yellow"
+                        }
+                        # Remove turned-in quest from active list
+                        $script:Quests.Remove($rq)
+                        Wait-Key
+                    }
+                }
+            }
+            "R" {
+                $script:AvailableQuests = [System.Collections.ArrayList]@(Get-RandomQuests ($script:DungeonLevel + 1))
+                Write-CL "  New quests posted!" "Green"
+                Wait-Key
+            }
+            "0" { $qbLoop = $false }
+        }
+    }
+}
+
+
+# ─── SHOP DATA ────────────────────────────────────────────────────
+function Get-WeaponShop {
+    @(
+        # Swords (Knight affinity) - Bleed perk on all blades
+        @{Name="Iron Sword";       ATK=4;  Price=60;  WeaponType="Sword";  ClassAffinity="Knight";     AffinityBonus=3; Perk="Bleed"; PerkChance=15}
+        @{Name="Steel Blade";      ATK=8;  Price=150; WeaponType="Sword";  ClassAffinity="Knight";     AffinityBonus=3; Perk="Bleed"; PerkChance=20}
+        @{Name="Holy Sword";       ATK=14; Price=400; WeaponType="Sword";  ClassAffinity="Knight";     AffinityBonus=4; Perk="Bleed"; PerkChance=25}
+        @{Name="Dragon Slayer";    ATK=20; Price=800; WeaponType="Sword";  ClassAffinity="Knight";     AffinityBonus=5; Perk="Bleed"; PerkChance=30}
+        # Staves (Mage affinity) - MAGBonus on all staves
+        @{Name="Wooden Staff";     ATK=3;  Price=50;  WeaponType="Staff";  ClassAffinity="Mage";       AffinityBonus=3; Perk=$null;   PerkChance=0;  MAGBonus=3}
+        @{Name="Enchanted Staff";  ATK=6;  Price=200; WeaponType="Staff";  ClassAffinity="Mage";       AffinityBonus=4; Perk="Burn";  PerkChance=20; MAGBonus=6}
+        @{Name="Arcane Staff";     ATK=10; Price=450; WeaponType="Staff";  ClassAffinity="Mage";       AffinityBonus=5; Perk="Burn";  PerkChance=30; MAGBonus=10}
+        # Fists (Brawler affinity)
+        @{Name="Iron Knuckles";    ATK=5;  Price=55;  WeaponType="Fist";   ClassAffinity="Brawler";    AffinityBonus=3; Perk=$null;   PerkChance=0}
+        @{Name="Spiked Gauntlets"; ATK=10; Price=180; WeaponType="Fist";   ClassAffinity="Brawler";    AffinityBonus=4; Perk="Bleed"; PerkChance=20}
+        @{Name="Titan Fists";      ATK=16; Price=500; WeaponType="Fist";   ClassAffinity="Brawler";    AffinityBonus=5; Perk=$null;   PerkChance=0}
+        # Bows (Ranger affinity)
+        @{Name="Short Bow";        ATK=4;  Price=55;  WeaponType="Bow";    ClassAffinity="Ranger";     AffinityBonus=3; Perk=$null;   PerkChance=0}
+        @{Name="Longbow";          ATK=9;  Price=200; WeaponType="Bow";    ClassAffinity="Ranger";     AffinityBonus=4; Perk=$null;   PerkChance=0}
+        @{Name="Elven Bow";        ATK=14; Price=450; WeaponType="Bow";    ClassAffinity="Ranger";     AffinityBonus=5; Perk="Poison";PerkChance=25}
+        # Maces (Cleric affinity)
+        @{Name="Wooden Mace";      ATK=4;  Price=50;  WeaponType="Mace";   ClassAffinity="Cleric";     AffinityBonus=3; Perk=$null;   PerkChance=0}
+        @{Name="Iron Mace";        ATK=8;  Price=170; WeaponType="Mace";   ClassAffinity="Cleric";     AffinityBonus=4; Perk=$null;   PerkChance=0}
+        @{Name="Holy Mace";        ATK=13; Price=420; WeaponType="Mace";   ClassAffinity="Cleric";     AffinityBonus=5; Perk="Stun";  PerkChance=20}
+        # Scythes (Necromancer affinity)
+        @{Name="Rusty Scythe";     ATK=5;  Price=60;  WeaponType="Scythe"; ClassAffinity="Necromancer"; AffinityBonus=3; Perk="Bleed"; PerkChance=15}
+        @{Name="Shadow Scythe";    ATK=10; Price=220; WeaponType="Scythe"; ClassAffinity="Necromancer"; AffinityBonus=4; Perk="Drain"; PerkChance=25}
+        @{Name="Death's Scythe";   ATK=16; Price=550; WeaponType="Scythe"; ClassAffinity="Necromancer"; AffinityBonus=5; Perk="Drain"; PerkChance=30}
+        # Daggers & Other
+        @{Name="Shadow Dagger";    ATK=12; Price=350; WeaponType="Dagger"; ClassAffinity="Ranger";     AffinityBonus=3; Perk="Bleed"; PerkChance=25}
+        @{Name="War Hammer";       ATK=12; Price=300; WeaponType="Hammer"; ClassAffinity="Brawler";    AffinityBonus=3; Perk=$null;   PerkChance=0}
+    )
+}
+
+# Returns all potions and throwables in a FIXED ORDER (index 0-8).
+# Save/Load uses these indices to store which potions the player has.
+# Index 0-5 = regular potions, index 6-8 = throwable potions.
+function Get-PotionShop {
+    @(
+        @{Name="Small Health Potion"; Type="Heal";        Power=30; Price=25; Desc="Restore 30 HP";   Category="Potion"}
+        @{Name="Large Health Potion"; Type="Heal";        Power=70; Price=60; Desc="Restore 70 HP";   Category="Potion"}
+        @{Name="Mana Potion";         Type="Mana";        Power=30; Price=30; Desc="Restore 30 MP";   Category="Potion"}
+        @{Name="Large Mana Potion";   Type="Mana";        Power=60; Price=55; Desc="Restore 60 MP";   Category="Potion"}
+        @{Name="Strength Elixir";     Type="ATKBuff";     Power=8;  Price=75; Desc="ATK+8 in battle"; Category="Potion"}
+        @{Name="Iron Skin Elixir";    Type="DEFBuff";     Power=8;  Price=75; Desc="DEF+8 in battle"; Category="Potion"}
+        @{Name="Acid Flask";          Type="Throw";       Power=25; Price=40; Desc="Deal 25 damage";  Category="Throwable"}
+        @{Name="Poison Flask";        Type="ThrowPoison"; Power=15; Price=50; Desc="15 dmg + Poison"; Category="Throwable"}
+        @{Name="Frost Bomb";          Type="ThrowSlow";   Power=20; Price=55; Desc="20 dmg + Slow";   Category="Throwable"}
+    )
+}
+
+# ─── SAVE / LOAD SYSTEM ──────────────────────────────────────────
+
+function Save-Game {
+    $p = $script:Player
+
+    # ── Convert inventory loot to gold ──
+    $lootGold = 0
+    foreach($item in $script:Inventory){ $lootGold += $item.Value }
+    $totalGold = $script:Gold + $lootGold
+
+    # ── Class index (0-5) ──
+    $classOrder = @("Knight","Mage","Brawler","Ranger","Cleric","Necromancer")
+    $classIdx = 0
+    for($i = 0; $i -lt $classOrder.Count; $i++){
+        if($classOrder[$i] -eq $script:PlayerClass){ $classIdx = $i; break }
+    }
+
+    # ── Weapon index: 0 = none, 1+ = position in shop ──
+    $weapIdx = 0
+    if($script:EquippedWeapon){
+        $weapons = Get-WeaponShop
+        for($i = 0; $i -lt $weapons.Count; $i++){
+            if($weapons[$i].Name -eq $script:EquippedWeapon.Name){
+                $weapIdx = $i + 1
+                break
+            }
+        }
+    }
+
+    # ── Armor indices: 0 = empty, 1+ = position in shop ──
+    $allArmor = Get-ArmorShop
+    $armorSlots = @("Helmet","Chest","Shield","Amulet","Boots")
+    $armorIndices = @(0, 0, 0, 0, 0)
+    for($s = 0; $s -lt $armorSlots.Count; $s++){
+        $piece = $script:EquippedArmor[$armorSlots[$s]]
+        if($piece){
+            for($i = 0; $i -lt $allArmor.Count; $i++){
+                if($allArmor[$i].Name -eq $piece.Name){
+                    $armorIndices[$s] = $i + 1
+                    break
+                }
+            }
+        }
+    }
+
+    # ── Potion counts (6 regular, 3 throwable) ──
+    $potShop = Get-PotionShop
+    $potCounts = @(0, 0, 0, 0, 0, 0)
+    $throwCounts = @(0, 0, 0)
+
+    foreach($pot in $script:Potions){
+        for($i = 0; $i -lt 6; $i++){
+            if($pot.Name -eq $potShop[$i].Name){
+                $potCounts[$i]++
+                break
+            }
+        }
+    }
+    foreach($tp in $script:ThrowablePotions){
+        for($i = 6; $i -lt 9; $i++){
+            if($tp.Name -eq $potShop[$i].Name){
+                $throwCounts[$i - 6]++
+                break
+            }
+        }
+    }
+
+    # ── Partner: 0=none, 1=Healer, 2=Thief, 3=Bard ──
+    $partnerIdx = 0
+    if($script:Partner){
+        switch($script:Partner.Class){
+            "Healer" { $partnerIdx = 1 }
+            "Thief"  { $partnerIdx = 2 }
+            "Bard"   { $partnerIdx = 3 }
+        }
+    }
+
+    # ── Build save string: values joined by "|" ──
+    $saveStr = @(
+        "1"                          # [0]  format version
+        $classIdx                    # [1]  class
+        $script:PlayerLevel          # [2]  level
+        $script:XP                   # [3]  current XP
+        $script:XPToNext             # [4]  XP to next level
+        $totalGold                   # [5]  gold (loot converted)
+        $p.HP                        # [6]  current HP
+        $p.MaxHP                     # [7]  max HP
+        $p.MP                        # [8]  current MP
+        $p.MaxMP                     # [9]  max MP
+        $p.ATK                       # [10] ATK
+        $p.DEF                       # [11] DEF
+        $p.SPD                       # [12] SPD
+        $p.MAG                       # [13] MAG
+        $script:DungeonLevel         # [14] dungeon level
+        $script:KillCount            # [15] kills
+        $script:RoyalSuiteUses       # [16] royal suite uses
+        $weapIdx                     # [17] weapon
+        ($armorIndices -join ",")    # [18] armor "h,c,s,a,b"
+        ($potCounts -join ",")       # [19] potion counts
+        ($throwCounts -join ",")     # [20] throwable counts
+        $partnerIdx                  # [21] partner
+    ) -join "|"
+
+    # ── Checksum ──
+    # Add up all character codes in the string. If the player makes a typo
+    # when entering the code later, this number won't match and we catch it.
+    $sum = 0
+    foreach($char in $saveStr.ToCharArray()){ $sum += [int]$char }
+    $checksum = $sum % 9999
+    $saveStr += "|$checksum"
+
+    # ── Base64 encode ──
+    # Converts the text into a safe string of letters, numbers, +, /, and =.
+    # This is what the player copies down.
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($saveStr)
+    $code = [Convert]::ToBase64String($bytes)
+
+    return $code
+}
+
+
+function Load-Game {
+    param([string]$Code)
+
+    # ── Try to decode the Base64 string back into text ──
+    # If the player typed garbage, this will fail, so we use try/catch.
+    try {
+        $bytes = [Convert]::FromBase64String($Code)
+        $saveStr = [System.Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        return @{ Success = $false; Error = "Invalid save code format." }
+    }
+
+    # ── Split into parts ──
+    # We expect 23 sections separated by "|" (22 data fields + 1 checksum).
+    $parts = $saveStr -split '\|'
+    if($parts.Count -ne 23){
+        return @{ Success = $false; Error = "Save code is corrupted (wrong length)." }
+    }
+
+    # ── Verify checksum ──
+    # Rebuild the string WITHOUT the last part (the checksum itself),
+    # calculate what the checksum should be, and compare.
+    $dataStr = ($parts[0..21]) -join "|"
+    $sum = 0
+    foreach($char in $dataStr.ToCharArray()){ $sum += [int]$char }
+    $expectedCheck = $sum % 9999
+    $actualCheck = [int]$parts[22]
+    if($expectedCheck -ne $actualCheck){
+        return @{ Success = $false; Error = "Checksum mismatch. Code may have a typo." }
+    }
+
+    # ── Verify version ──
+    if($parts[0] -ne "1"){
+        return @{ Success = $false; Error = "Unknown save format version." }
+    }
+
+    # ── Parse all the values ──
+    # [int] converts text like "5" into the number 5.
+    $classIdx       = [int]$parts[1]
+    $playerLevel    = [int]$parts[2]
+    $xp             = [int]$parts[3]
+    $xpToNext       = [int]$parts[4]
+    $gold           = [int]$parts[5]
+    $hp             = [int]$parts[6]
+    $maxHP          = [int]$parts[7]
+    $mp             = [int]$parts[8]
+    $maxMP          = [int]$parts[9]
+    $atk            = [int]$parts[10]
+    $def            = [int]$parts[11]
+    $spd            = [int]$parts[12]
+    $mag            = [int]$parts[13]
+    $dungeonLevel   = [int]$parts[14]
+    $killCount      = [int]$parts[15]
+    $royalSuiteUses = [int]$parts[16]
+    $weapIdx        = [int]$parts[17]
+
+    # Armor is stored as "h,c,s,a,b" — split by comma into 5 numbers
+    $armorParts     = $parts[18] -split ','
+    # Potions stored as "p0,p1,p2,p3,p4,p5"
+    $potParts       = $parts[19] -split ','
+    # Throwables stored as "t0,t1,t2"
+    $throwParts     = $parts[20] -split ','
+    $partnerIdx     = [int]$parts[21]
+
+    # ── Validate class index ──
+    $classOrder = @("Knight","Mage","Brawler","Ranger","Cleric","Necromancer")
+    if($classIdx -lt 0 -or $classIdx -ge $classOrder.Count){
+        return @{ Success = $false; Error = "Invalid class in save." }
+    }
+    $className = $classOrder[$classIdx]
+
+    # ── Rebuild the player ──
+    # Get the class template for abilities (abilities don't change with levels,
+    # so we always pull them fresh from the template).
+    $classes = Get-ClassTemplates
+    $template = $classes[$className]
+
+    $script:PlayerClass = $className
+    $script:Player = @{
+        Name      = $template.Name
+        HP        = $hp
+        MaxHP     = $maxHP
+        MP        = $mp
+        MaxMP     = $maxMP
+        ATK       = $atk
+        DEF       = $def
+        SPD       = $spd
+        MAG       = $mag
+        Abilities = $template.Abilities
+    }
+    $script:PlayerLevel    = $playerLevel
+    $script:XP             = $xp
+    $script:XPToNext       = $xpToNext
+    $script:Gold           = $gold
+    $script:DungeonLevel   = $dungeonLevel
+    $script:KillCount      = $killCount
+    $script:RoyalSuiteUses = $royalSuiteUses
+
+    # ── Rebuild weapon ──
+    # 0 = no weapon, 1+ = index into the weapon shop array
+    $script:EquippedWeapon = $null
+    if($weapIdx -gt 0){
+        $weapons = Get-WeaponShop
+        if($weapIdx -le $weapons.Count){
+            $script:EquippedWeapon = $weapons[$weapIdx - 1]
+        }
+    }
+
+    # ── Rebuild armor ──
+    $script:EquippedArmor = @{
+        Helmet = $null; Chest = $null; Shield = $null
+        Amulet = $null; Boots = $null
+    }
+    $allArmor = Get-ArmorShop
+    $armorSlots = @("Helmet","Chest","Shield","Amulet","Boots")
+    for($s = 0; $s -lt $armorSlots.Count; $s++){
+        $aIdx = [int]$armorParts[$s]
+        if($aIdx -gt 0 -and $aIdx -le $allArmor.Count){
+            $script:EquippedArmor[$armorSlots[$s]] = $allArmor[$aIdx - 1]
+        }
+    }
+
+    # ── Rebuild potions ──
+    $script:Potions = [System.Collections.ArrayList]@()
+    $script:ThrowablePotions = [System.Collections.ArrayList]@()
+    $potShop = Get-PotionShop
+
+    # Regular potions (indices 0-5 in the shop)
+    for($i = 0; $i -lt 6; $i++){
+        $count = [int]$potParts[$i]
+        for($c = 0; $c -lt $count; $c++){
+            [void]$script:Potions.Add($potShop[$i])
+        }
+    }
+    # Throwables (indices 6-8 in the shop)
+    for($i = 0; $i -lt 3; $i++){
+        $count = [int]$throwParts[$i]
+        for($c = 0; $c -lt $count; $c++){
+            [void]$script:ThrowablePotions.Add($potShop[$i + 6])
+        }
+    }
+
+    # ── Rebuild partner ──
+    $script:Partner = $null
+    if($partnerIdx -gt 0){
+        $partnerData = @(
+            @{ Name="Sister Maren";  Class="Healer"; Desc="Heals you when HP drops below 50%" }
+            @{ Name="Fingers McGee"; Class="Thief";  Desc="+15% gold from enemy defeats" }
+            @{ Name="Lyric the Wise"; Class="Bard";  Desc="+25% XP from all sources" }
+        )
+        if($partnerIdx -le $partnerData.Count){
+            $script:Partner = $partnerData[$partnerIdx - 1]
+        }
+    }
+
+    # ── Reset things that don't carry over ──
+    $script:Inventory = [System.Collections.ArrayList]@()
+    $script:Quests = [System.Collections.ArrayList]@()
+    $script:AvailableQuests = $null
+    $script:HasBossKey = $false
+    $script:BossDefeated = $false
+    $script:Dungeon = $null
+    $script:DungeonKills = 0
+    $script:DungeonTreasures = 0
+    $script:RescueTarget = $null
+
+    return @{ Success = $true; Error = "" }
+}
+
+
+function Get-ArmorShop {
+    @(
+        # Helmets
+        @{Name="Leather Cap";     Slot="Helmet"; DEF=2;  Price=30}
+        @{Name="Iron Helm";       Slot="Helmet"; DEF=4;  Price=80}
+        @{Name="Steel Helm";      Slot="Helmet"; DEF=7;  Price=200}
+        @{Name="Dragon Helm";     Slot="Helmet"; DEF=10; Price=450}
+        # Chest
+        @{Name="Leather Vest";    Slot="Chest";  DEF=3;  Price=40}
+        @{Name="Chain Mail";      Slot="Chest";  DEF=6;  Price=120}
+        @{Name="Plate Armor";     Slot="Chest";  DEF=10; Price=300}
+        @{Name="Dragon Plate";    Slot="Chest";  DEF=14; Price=600}
+        # Shields
+        @{Name="Wooden Shield";   Slot="Shield"; DEF=2;  Price=25}
+        @{Name="Iron Shield";     Slot="Shield"; DEF=5;  Price=100}
+        @{Name="Tower Shield";    Slot="Shield"; DEF=8;  Price=250}
+        @{Name="Enchanted Ward";  Slot="Shield"; DEF=11; Price=500}
+        # Amulets
+        @{Name="Copper Amulet";   Slot="Amulet"; DEF=1;  Price=35}
+        @{Name="Silver Amulet";   Slot="Amulet"; DEF=3;  Price=90}
+        @{Name="Gold Amulet";     Slot="Amulet"; DEF=5;  Price=220}
+        @{Name="Diamond Amulet";  Slot="Amulet"; DEF=7;  Price=480}
+        # Boots
+        @{Name="Leather Boots";   Slot="Boots";  DEF=1;  Price=25}
+        @{Name="Iron Greaves";    Slot="Boots";  DEF=3;  Price=75}
+        @{Name="Steel Greaves";   Slot="Boots";  DEF=6;  Price=180}
+        @{Name="Dragon Boots";    Slot="Boots";  DEF=9;  Price=400}
+    )
+}
+
+
+# ─── MAIN MENU / GAME LOOP ──────────────────────────────────────
+function Show-MainMenu {
+    while($script:GameRunning){
+        clr
+        $p = $script:Player
+        Write-CL "" "White"
+        Write-CL "  ╔══════════════════════════════════════════════╗" "DarkYellow"
+        Write-CL "  ║             TOWN SQUARE                      ║" "Yellow"
+        Write-CL "  ╚══════════════════════════════════════════════╝" "DarkYellow"
+        Write-Host ""
+                Write-CL "  $($p.Name) | Lv$($script:PlayerLevel) | HP:$($p.HP)/$($p.MaxHP) MP:$($p.MP)/$($p.MaxMP) | Gold:$($script:Gold) | XP:$($script:XP)/$($script:XPToNext)" "Gray"
+        Write-CL "  Weapon: $(if($script:EquippedWeapon){$script:EquippedWeapon.Name + ' (ATK+' + $script:EquippedWeapon.ATK + ')'}else{'Bare Hands'})" "DarkGray"
+        Write-CL "  Potions: $($script:Potions.Count)  |  Loot Items: $($script:Inventory.Count)" "DarkGray"
+        Write-CL "  Dungeons Cleared: $($script:DungeonLevel)" "DarkGray"
+        Write-Host ""
+        Write-CL "  [1] Enter Dungeon (Level $($script:DungeonLevel + 1))" "White"
+        Write-CL "  [2] Visit Market" "White"
+        Write-CL "  [3] View Inventory" "White"
+        Write-CL "  [4] Rest (Restore HP/MP)" "White"
+        Write-CL "  [5] View Stats & Abilities" "White"
+        Write-CL "  [6] Quest Board" "White"
+        Write-CL "  [7] Guild Hall" "White"
+        Write-CL "  [8] Quit Game" "White"
+        Write-CL "  [9] Save Game" "White"
+
+        Write-Host ""
+        Write-C "  > " "Yellow"; $ch = Read-Host
+
+        switch($ch){
+            "1" { Enter-Dungeon }
+            "2" { Show-Market }
+                                   "3" {
+                $invLoop = $true
+                while($invLoop){
+                    clr
+                    Write-CL "" "White"
+                    Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkCyan"
+                    Write-CL "  ║              I N V E N T O R Y                     ║" "Cyan"
+                    Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkCyan"
+                    Write-Host ""
+
+                    # ── Character Summary ──
+                    $p = $script:Player
+                    $wepATK = Get-TotalWeaponATK
+                    $armorDEF = Get-TotalArmorDEF
+                    $magBonus = Get-WeaponMAGBonus
+
+                    Write-C "  $($p.Name)" "Green"
+                    Write-C "  ($($script:PlayerClass))" "Cyan"
+                    Write-CL "  Lv$($script:PlayerLevel)  |  Gold: $($script:Gold)g" "DarkGray"
+                    Write-Host ""
+
+                    # ── Equipped Weapon ──
+                    Write-CL "  ╔══════════════════════════════════════════════╗" "DarkYellow"
+                    Write-CL "  ║  W E A P O N                                 ║" "Yellow"
+                    Write-CL "  ╠══════════════════════════════════════════════╣" "DarkYellow"
+                    if($script:EquippedWeapon){
+                        $w = $script:EquippedWeapon
+                        $cb = Get-WeaponClassBonus
+                        $cbStr = if($cb -gt 0){" [+$cb class bonus]"}else{""}
+                        $perkStr = if($w.Perk){" [$($w.Perk) $($w.PerkChance)%]"}else{""}
+                        $magStr = if($w.MAGBonus){" [MAG+$($w.MAGBonus)]"}else{""}
+                        Write-C "  ║  " "DarkYellow"
+                        Write-C "$($w.Name)" "Cyan"
+                        Write-C "  ATK+$($w.ATK)" "White"
+                        Write-C $cbStr "Green"
+                        Write-C $perkStr "DarkRed"
+                        Write-C $magStr "Magenta"
+                        $totalLen = $w.Name.Length + "  ATK+$($w.ATK)".Length + $cbStr.Length + $perkStr.Length + $magStr.Length
+                        $wPad = 42 - $totalLen
+                        if($wPad -lt 0){$wPad = 0}
+                        Write-CL "$(' ' * $wPad)║" "DarkYellow"
+                    } else {
+                        Write-CL "  ║  Bare Hands                                 ║" "DarkGray"
+                    }
+                    Write-CL "  ╚══════════════════════════════════════════════╝" "DarkYellow"
+                    Write-Host ""
