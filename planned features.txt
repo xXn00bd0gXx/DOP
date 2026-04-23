@@ -1,0 +1,18 @@
+Planned Features:
+random encounter (Healing Bard, Lost Merchant, Flying Dutchman) Flying Dutchman encounter gives player 'Dutchman's Blade' worth 10k gold and does 100 damage, flying dutchman encounter is very rare.
+real input, so that the player can walk around without having to hit enter each for each movement.
+Character selection UI change 1 3
+			      2 4
+Improve Town Center UI - Less Bland
+Improve Merchant UI
+Hit chance needs to start lower for AI and player. Hit chance capped at 90% - rework slow/stun mechanics to lower hitchance.
+Potion of Luck to temp increase player hitchance during combat.
+tutorial
+higher level duengons are too difficult, duengon boss fight should be adjusted. 
+More options for armor/weapons, more end-game equipment
+Some sort of training area where players can "Hone their skills" and pay to boost stats.
+improvements to gameplay loop, add things to increase player rentention. 
+upgrade 3d engine
+improve sprites/textures for enemies 
+player arms holding weapon
+combat animations
