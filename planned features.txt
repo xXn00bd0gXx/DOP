@@ -169,3 +169,21 @@ Locked Chest:
      |    '-------'    |
      |_________________|
      \________________ /
+
+Two New Classes:
+
+Berserker
+A frenzied melee fighter who trades defense for overwhelming aggression.
+
+Blood Rage — Increases attack speed and damage but reduces defense.
+Cleave — A wide horizontal swing that hits all enemies in front.
+Undying Fury — Upon receiving a killing blow, survive with 1 HP for a short time.
+War Cry — Stuns nearby enemies briefly and reduces their attack power.
+
+Warlock
+A cursed spellcaster who draws power from a dark pact with a fiendish entity.
+
+Eldritch Blast — Fires a beam of chaotic energy at a single target.
+Hex — Curses an enemy, weakening their damage and slowing their movement.
+Summon Imp — Calls a small demon that harasses enemies with fire bolts.
+Dark Bargain — Sacrifices a portion of max HP to unleash massive shadow damage in an area.
