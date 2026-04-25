@@ -71,6 +71,7 @@ $script:TotalBareKills     = 0      # lifetime kills with no weapon equipped
 $script:TotalUntouched     = 0      # times reached boss room above 75% HP
 $script:TotalStanceSwaps   = 0      # times changed stance
 $script:TotalRepairs       = 0      # times paid the blacksmith for a repair
+$script:TotalEncumbered    = 0      # times got over-encumbered while in a dungeon
 
 
 
@@ -466,9 +467,10 @@ function Pad-Cell {
 # Loot weight = ceil(value/30). Equipment in inventory has fixed slot/type weight.
 function Get-MaxCarryWeight {
     param($Player)
-    if(-not $Player){ return 100 }
-    $avgStat = ($Player.ATK + $Player.DEF) / 2
-    return [int](100 + ($avgStat * 5))
+    # Hard cap: 90. No longer scales with player stats — keeps inventory
+    # decisions meaningful at every level (you can't just train ATK/DEF
+    # to carry more loot).
+    return 90
 }
 
 # Returns the weight an inventory item contributes when carried (NOT equipped).
@@ -530,6 +532,25 @@ function Get-CurrentCarryWeight {
         $w += $script:ThrowablePotions.Count
     }
     return $w
+}
+
+# Computes a unified sell value for any inventory item.
+# - Loot:    its Value field
+# - Weapons: 50% of shop Price (rounded down)
+# - Armor:   50% of shop Price (rounded down)
+# - Other:   Value field if present, else 0
+function Get-ItemSellValue {
+    param($Item)
+    if(-not $Item){ return 0 }
+    if($Item.Kind -eq "Weapon" -or $Item.WeaponType){
+        if($Item.Price){ return [math]::Max([int][math]::Floor([int]$Item.Price * 0.5), 1) }
+    }
+    if($Item.Kind -eq "Armor" -or $Item.Slot){
+        if($Item.Price){ return [math]::Max([int][math]::Floor([int]$Item.Price * 0.5), 1) }
+    }
+    if($Item.Value){ return [int]$Item.Value }
+    if($Item.Price){ return [math]::Max([int][math]::Floor([int]$Item.Price * 0.5), 1) }
+    return 0
 }
 
 # True if the player is at or over their carry cap.
@@ -931,8 +952,7 @@ function Get-AchievementList {
         @{Id="CritLord";       Name="Crit Lord";           Desc="Land 200 critical hits";               Gold=800; XP=700; Req="crits:200"}
         @{Id="Locksmith";      Name="Locksmith";           Desc="Pick 10 locks";                        Gold=200; XP=150; Req="lockspicked:10"}
         @{Id="MasterThief";    Name="Master Thief";        Desc="Pick 30 locks";                        Gold=600; XP=500; Req="lockspicked:30"}
-        @{Id="PackRat";        Name="Pack Rat";            Desc="Carry 100 weight at once";             Gold=100; XP=100; Req="carry:100"}
-        @{Id="Hoarder";        Name="Hoarder";             Desc="Carry 200 weight at once";             Gold=300; XP=300; Req="carry:200"}
+        @{Id="Encumbered";     Name="Heavy Pockets";       Desc="Get over-encumbered while in a dungeon"; Gold=150; XP=150; Req="encumbered:1"}
         @{Id="IronFist";       Name="Iron Fist";           Desc="Defeat 10 enemies bare-handed";        Gold=400; XP=300; Req="barehands:10"}
         @{Id="UntouchedRun";   Name="Untouched";           Desc="Reach a boss room above 75% HP";       Gold=200; XP=200; Req="untouched:1"}
         @{Id="StanceShifter";  Name="Stance Shifter";      Desc="Switch combat stance 25 times";        Gold=150; XP=150; Req="stanceswaps:25"}
@@ -983,6 +1003,7 @@ function Check-Achievements {
         untouched    = $script:TotalUntouched
         stanceswaps  = $script:TotalStanceSwaps
         repairs      = $script:TotalRepairs
+        encumbered   = $script:TotalEncumbered
     }
     # Training total spent is tracked as sum of TrainingPoints * baseline (approx)
     $trSum = 0
@@ -1030,7 +1051,10 @@ function New-RandomLoot {
     $value = (Get-Random -Min (5*$Tier) -Max (25*$Tier))
     # Per-item weight overrides — gems/rings are realistically valuable but light;
     # tooth/scale/horn/idol are bulky regardless of value.
-    $weight = switch($item){
+    # NOTE: All loot items receive a +2 weight surcharge to make the
+    # 90-weight hard cap meaningful — collecting many loot items
+    # forces real bag-management choices.
+    $baseWeight = switch($item){
         "Old Ring"        { 1 }
         "Gem Shard"       { 1 }
         "Silver Pendant"  { 1 }
@@ -1048,6 +1072,7 @@ function New-RandomLoot {
         "Rusty Dagger"    { 4 }
         default           { [math]::Max(1, [math]::Ceiling($value / 30.0)) }
     }
+    $weight = $baseWeight + 2
     @{ Name=$item; Value=$value; Tier=$Tier; Kind="Loot"; Weight=[int]$weight }
 }
 
@@ -1090,15 +1115,18 @@ function New-Enemy {
     if($Type -eq "Mimic"){
         return New-MimicEnemy $Lvl
     }
+    # Base stats — slightly buffed in v1.4 so normal enemies pose a real
+    # threat (was push-overs at mid/late dungeon levels).
     $b = switch ($Type) {
-        "Goblin"   {@{HP=28;ATK=8; DEF=3; SPD=10;MAG=2; XP=20; G=Get-Random -Min 5  -Max 20}}
-        "Zombie"   {@{HP=42;ATK=10;DEF=6; SPD=3; MAG=1; XP=30; G=Get-Random -Min 8  -Max 25}}
-        "Thief"    {@{HP=22;ATK=12;DEF=4; SPD=14;MAG=3; XP=25; G=Get-Random -Min 15 -Max 40}}
-        "Wizard"   {@{HP=32;ATK=5; DEF=4; SPD=8; MAG=16;XP=35; G=Get-Random -Min 10 -Max 35}}
-        "Troll"    {@{HP=58;ATK=14;DEF=8; SPD=5; MAG=2; XP=45; G=Get-Random -Min 12 -Max 30}}
-        "Skeleton" {@{HP=36;ATK=11;DEF=5; SPD=8; MAG=3; XP=32; G=Get-Random -Min 10 -Max 30}}
+        "Goblin"   {@{HP=36;ATK=10;DEF=4; SPD=11;MAG=3; XP=22; G=Get-Random -Min 5  -Max 22}}
+        "Zombie"   {@{HP=54;ATK=12;DEF=8; SPD=4; MAG=2; XP=33; G=Get-Random -Min 8  -Max 28}}
+        "Thief"    {@{HP=30;ATK=14;DEF=5; SPD=15;MAG=4; XP=28; G=Get-Random -Min 15 -Max 45}}
+        "Wizard"   {@{HP=40;ATK=6; DEF=5; SPD=9; MAG=18;XP=38; G=Get-Random -Min 10 -Max 38}}
+        "Troll"    {@{HP=72;ATK=16;DEF=10;SPD=6; MAG=3; XP=50; G=Get-Random -Min 12 -Max 33}}
+        "Skeleton" {@{HP=46;ATK=13;DEF=7; SPD=9; MAG=4; XP=36; G=Get-Random -Min 10 -Max 33}}
     }
-    $s = 1+($Lvl-1)*0.3
+    # Per-level scale: was 0.30, bumped to 0.32 — modest mid-game ramp.
+    $s = 1+($Lvl-1)*0.32
     # Build ability list with cooldowns. Type-specific abilities now include
     # heals or self-buffs at higher levels for variety.
     $abilities = @(
@@ -1196,8 +1224,9 @@ function New-MiniBoss {
     param([int]$Lvl)
     $names=@("Shadow Knight","Dark Shaman","Iron Golem","Venom Queen","Flame Warden","Bone Colossus","Frost Wyrm","Void Sentinel")
     $n=$names|Get-Random
-    # Softer scaling: was 1+(Lvl-1)*0.4 — now 1+(Lvl-1)*0.30
-    $s = 1 + ($Lvl - 1) * 0.30
+    # Mini-boss base stats: slightly bumped in v1.4 so they remain a
+    # threat as the player gears up. Scale rate also nudged.
+    $s = 1 + ($Lvl - 1) * 0.32
     # Equipment drops: 30% weapon, 30% armor (independent rolls). Tier scales with level.
     $weaponDrop = $null; $armorDrop = $null
     if((Get-Random -Max 100) -lt 30){
@@ -1212,8 +1241,8 @@ function New-MiniBoss {
         $pool = Get-ArmorShop | Where-Object { $_.Price -ge $tierMin -and $_.Price -le $tierMax }
         if($pool.Count -gt 0){ $armorDrop = $pool | Get-Random }
     }
-    @{ Name=$n;DisplayName="$n [MINI-BOSS]";HP=[math]::Floor(130*$s);MaxHP=[math]::Floor(130*$s)
-       ATK=[math]::Floor(18*$s);DEF=[math]::Floor(12*$s);SPD=[math]::Floor(10*$s);MAG=[math]::Floor(12*$s)
+    @{ Name=$n;DisplayName="$n [MINI-BOSS]";HP=[math]::Floor(160*$s);MaxHP=[math]::Floor(160*$s)
+       ATK=[math]::Floor(20*$s);DEF=[math]::Floor(14*$s);SPD=[math]::Floor(10*$s);MAG=[math]::Floor(13*$s)
        XP=[math]::Floor(150*$s);Gold=(Get-Random -Min 50 -Max 120)
        IsBoss=$false;IsMiniBoss=$true;Loot=(New-RandomLoot ($Lvl+1));Stunned=$false;DropsKey=$true
        WeaponDrop=$weaponDrop; ArmorDrop=$armorDrop
@@ -1231,12 +1260,12 @@ function New-Boss {
     param([int]$Lvl)
     $names=@("Lich King","Dragon Wyrm","Demon Lord","Abyssal Horror","Undead Titan","Shadow Emperor","Plague Bringer","World Eater")
     $n=$names|Get-Random
-    # Much softer boss HP scaling; ATK scales slower too.
-    # Previous: 1 + (Lvl-1)*0.5 on everything. Now:
-    #   HP:  1 + (Lvl-1)*0.35   — was becoming bullet-spongy
-    #   ATK: 1 + (Lvl-1)*0.32   — player struggled to survive hits
-    $hpScale  = 1 + ($Lvl - 1) * 0.35
-    $atkScale = 1 + ($Lvl - 1) * 0.32
+    # Boss tuning v1.4: substantially toned down. Was overtuned at high
+    # player levels — combined with player-gear contribution at fight
+    # start, bosses were dealing one-shot damage and had bullet-sponge HP.
+    # Reduced base HP/ATK and softened scaling.
+    $hpScale  = 1 + ($Lvl - 1) * 0.28
+    $atkScale = 1 + ($Lvl - 1) * 0.24
     # Boss drops: 50% weapon, 50% armor — bigger tier range
     $weaponDrop = $null; $armorDrop = $null
     if((Get-Random -Max 100) -lt 50){
@@ -1251,8 +1280,8 @@ function New-Boss {
         $pool = Get-ArmorShop | Where-Object { $_.Price -ge $tierMin -and $_.Price -le $tierMax }
         if($pool.Count -gt 0){ $armorDrop = $pool | Get-Random }
     }
-    @{ Name=$n;DisplayName=">>> $n [DUNGEON BOSS] <<<";HP=[math]::Floor(260*$hpScale);MaxHP=[math]::Floor(260*$hpScale)
-       ATK=[math]::Floor(24*$atkScale);DEF=[math]::Floor(16*$hpScale);SPD=[math]::Floor(12*$atkScale);MAG=[math]::Floor(16*$atkScale)
+    @{ Name=$n;DisplayName=">>> $n [DUNGEON BOSS] <<<";HP=[math]::Floor(210*$hpScale);MaxHP=[math]::Floor(210*$hpScale)
+       ATK=[math]::Floor(20*$atkScale);DEF=[math]::Floor(14*$hpScale);SPD=[math]::Floor(11*$atkScale);MAG=[math]::Floor(14*$atkScale)
        XP=[math]::Floor(400*$hpScale);Gold=(Get-Random -Min 100 -Max 250) + $Lvl * 40
        IsBoss=$true;IsMiniBoss=$false;Loot=(New-RandomLoot ($Lvl+2));Stunned=$false;DropsKey=$false
        WeaponDrop=$weaponDrop; ArmorDrop=$armorDrop
@@ -2181,6 +2210,39 @@ function Start-Combat {
     $bonusATK  = Get-TotalWeaponATK
     $armorDEF  = Get-TotalArmorDEF
     $magBonus  = Get-WeaponMAGBonus
+
+    # ── Player-gear contribution to enemy stats ──
+    # The user's gear shouldn't trivialize content. Each enemy gets a small
+    # ATK/DEF bump based on the player's CURRENT gear bonuses, scaled by
+    # role: stronger contribution for normals/minis (they're the "filler"
+    # that needs to keep up), reduced for bosses (already powerful, just
+    # toned down). This runs ONCE per fight at the start, so swapping gear
+    # mid-dungeon doesn't make trash enemies suddenly tougher.
+    $gearAtk = $bonusATK + $magBonus
+    $gearDef = $armorDEF
+    if($e.IsBoss){
+        $bossAtkBump = [math]::Floor($gearAtk * 0.20)
+        $bossDefBump = [math]::Floor($gearDef * 0.20)
+        $e.ATK += $bossAtkBump
+        $e.DEF += $bossDefBump
+    } elseif($e.IsMiniBoss){
+        $miniAtkBump = [math]::Floor($gearAtk * 0.30)
+        $miniDefBump = [math]::Floor($gearDef * 0.30)
+        $e.ATK += $miniAtkBump
+        $e.DEF += $miniDefBump
+        # Mini-bosses get a small HP bump scaled to player's gear too
+        $e.MaxHP += [math]::Floor($gearAtk * 0.6)
+        $e.HP    += [math]::Floor($gearAtk * 0.6)
+    } else {
+        $normAtkBump = [math]::Floor($gearAtk * 0.30)
+        $normDefBump = [math]::Floor($gearDef * 0.30)
+        $e.ATK += $normAtkBump
+        $e.DEF += $normDefBump
+        # Normals get a tiny HP bump so they don't die in 1 shot to a high-ATK player
+        $e.MaxHP += [math]::Floor($gearAtk * 0.35)
+        $e.HP    += [math]::Floor($gearAtk * 0.35)
+    }
+
     $defBuff   = 0; $atkBuff = 0
     $defendCooldown = 0   # turns until Defend can be used again (0 = ready)
     # Per-ability cooldown tracker: name -> remaining turns. Cleared at the
@@ -2689,31 +2751,19 @@ function Start-Combat {
                 } else { $acted = $false }
             }
             "3" {
-                $hasESP = ($script:ExtraStrongPotions -gt 0)
-                if($script:Potions.Count -eq 0 -and -not $hasESP){
+                if($script:Potions.Count -eq 0){
                     [void]$combatLog.Add(@{Text=">> No potions!";Color="Red"}); $acted = $false
                 } else {
                     Write-Host ""
                     Write-CL "  ── Potions ──" "Green"
-                    if($hasESP){
-                        Write-CL "    [E] Extra Strong Potion x$($script:ExtraStrongPotions) - Full HP + MP restore" "Magenta"
-                    }
                     for($pi=0;$pi -lt $script:Potions.Count;$pi++){
                         $pot = $script:Potions[$pi]
-                        Write-CL "    [$($pi+1)] $($pot.Name) - $($pot.Desc)" "Green"
+                        $col = if($pot.Category -eq "Special"){"Magenta"}else{"Green"}
+                        Write-CL "    [$($pi+1)] $($pot.Name) - $($pot.Desc)" $col
                     }
                     Write-C "    > " "Yellow"; $pc = Read-Host
-                    if($pc -match '^[Ee]$' -and $hasESP){
-                        # Use Extra Strong Potion
-                        $hpRestored = $p.MaxHP - $p.HP
-                        $mpRestored = $p.MaxMP - $p.MP
-                        $p.HP = $p.MaxHP
-                        $p.MP = $p.MaxMP
-                        $script:ExtraStrongPotions--
-                        [void]$combatLog.Add(@{Text=">> EXTRA STRONG! +$hpRestored HP, +$mpRestored MP!";Color="Magenta"})
-                    } else {
-                        $pidx = (ConvertTo-SafeInt -Value $pc) - 1
-                        if($pidx -ge 0 -and $pidx -lt $script:Potions.Count){
+                    $pidx = (ConvertTo-SafeInt -Value $pc) - 1
+                    if($pidx -ge 0 -and $pidx -lt $script:Potions.Count){
                             $pot = $script:Potions[$pidx]
                             switch($pot.Type){
                                 "Heal" {
@@ -2735,16 +2785,17 @@ function Start-Combat {
                                 [void]$combatLog.Add(@{Text=">> Defense boosted by $($pot.Power)!";Color="Yellow"})
                             }
                             "Luck" {
-                                # Luck potion now boosts CRIT chance for several turns
+                                # Luck potion boosts CRIT chance for several turns.
+                                # Special-tier (Extra Strong) lasts longer.
+                                $turns = if($pot.Category -eq "Special"){5}else{3}
                                 $script:LuckBonus = $pot.Power
-                                $script:LuckTurnsLeft = 3
+                                $script:LuckTurnsLeft = $turns
                                 $playerCritChance = Get-PlayerCrit $p.SPD $script:LuckBonus
-                                [void]$combatLog.Add(@{Text=">> LUCK +$($pot.Power)% crit for 3 turns!";Color="Yellow"})
+                                [void]$combatLog.Add(@{Text=">> LUCK +$($pot.Power)% crit for $turns turns!";Color="Yellow"})
                             }
                         }
                         $script:Potions.RemoveAt($pidx)
                         } else { $acted = $false }
-                    }
                 }
             }
 
@@ -3919,9 +3970,10 @@ function Show-Market {
                         @{Name="Strength Elixir";     Type="ATKBuff"; Power=8;  Price=75;  Desc="ATK+8 in battle";   Icon="[ATK]";  Category="Potion"}
                         @{Name="Iron Skin Elixir";    Type="DEFBuff"; Power=8;  Price=75;  Desc="DEF+8 in battle";   Icon="[DEF]";  Category="Potion"}
                         @{Name="Potion of Luck";      Type="Luck";    Power=20; Price=90;  Desc="+20% crit, 3 turns"; Icon="[LCK]";  Category="Potion"}
-                        @{Name="Acid Flask";          Type="Throw";   Power=25; Price=40;  Desc="Deal 25 damage";    Icon="[DMG]";  Category="Throwable"}
-                        @{Name="Poison Flask";        Type="ThrowPoison"; Power=15; Price=50; Desc="15 dmg + Poison"; Icon="[PSN]"; Category="Throwable"}
+                        @{Name="Acid Flask";          Type="Throw";   Power=40; Price=60;  Desc="Deal 40 damage";    Icon="[DMG]";  Category="Throwable"}
+                        @{Name="Poison Flask";        Type="ThrowPoison"; Power=25; Price=70; Desc="25 dmg + Poison"; Icon="[PSN]"; Category="Throwable"}
                         @{Name="Frost Bomb";          Type="ThrowSlow";  Power=20; Price=55; Desc="20 dmg + Slow";   Icon="[SLW]"; Category="Throwable"}
+                        @{Name="Bomb";                Type="Throw";   Power=75; Price=140; Desc="Deal 75 damage";    Icon="[BMB]";  Category="Throwable"}
                     )
 
                     # Column widths — match borders exactly using Pad-Cell
@@ -4026,16 +4078,20 @@ function Show-Market {
                     $totalVal = 0
                     for($i=0;$i -lt $script:Inventory.Count;$i++){
                         $it=$script:Inventory[$i]
-                        $totalVal += $it.Value
-                        $nameStr = $it.Name.PadRight(20)
-                        $valStr  = ("$($it.Value)g").PadRight(8)
+                        $sv = Get-ItemSellValue $it
+                        $totalVal += $sv
+                        $idxStr  = (" $($i+1) ").PadRight(3)
+                        $nameStr = $it.Name
+                        if($nameStr.Length -gt 20){ $nameStr = $nameStr.Substring(0,20) }
+                        $nameStr = $nameStr.PadRight(20)
+                        $valStr  = ("${sv}g").PadRight(8)
                         Write-C "  │ " "DarkGray"
-                        Write-C " $($i+1) " "White"
-                        Write-C "│ " "DarkGray"
-                        Write-C "$nameStr" "Magenta"
-                        Write-C "│ " "DarkGray"
-                        Write-C "$valStr" "Yellow"
-                        Write-CL "│" "DarkGray"
+                        Write-C $idxStr "White"
+                        Write-C " │ " "DarkGray"
+                        Write-C $nameStr "Magenta"
+                        Write-C " │ " "DarkGray"
+                        Write-C $valStr "Yellow"
+                        Write-CL " │" "DarkGray"
                     }
                     Write-CL "  └─────┴──────────────────────┴──────────┘" "DarkGray"
                     Write-Host ""
@@ -4053,8 +4109,9 @@ function Show-Market {
                         $sidx=[int]$si - 1
                         if($sidx -ge 0 -and $sidx -lt $script:Inventory.Count){
                             $it=$script:Inventory[$sidx]
-                            $script:Gold += $it.Value
-                            Write-CL "  Sold $($it.Name) for $($it.Value)g!" "Green"
+                            $sv = Get-ItemSellValue $it
+                            $script:Gold += $sv
+                            Write-CL "  Sold $($it.Name) for ${sv}g!" "Green"
                             Write-CL "  Gold: $($script:Gold)g" "Yellow"
                             $script:Inventory.RemoveAt($sidx)
                             Wait-Key
@@ -5338,7 +5395,13 @@ function Start-Lockpicking {
     # Config - scaled difficulty
     $TC    = $Tumblers       # tumblers
     $GH    = 8               # grid rows
-    $SZ    = 2               # sweet zone rows: abs(row-center) < SZ -> 3-row window
+    # Sweet-zone width: cell counts as in-zone when (row - center) is in
+    # the half-open range [-SZ_BELOW, SZ_ABOVE). With SZ_BELOW=0 and
+    # SZ_ABOVE=2, that's a 2-row band — the center row and the row above.
+    # Slightly more forgiving than a single-row exact match without being
+    # as loose as the previous 3-row band.
+    $SZ_BELOW = 0
+    $SZ_ABOVE = 2
     $CW    = 6               # column width
     $FMS   = 50              # frame ms
     $IW    = $TC * $CW + ($TC - 1)
@@ -5360,15 +5423,14 @@ function Start-Lockpicking {
     $script:lpAnimF   = 0
     $script:lpAnimPin = 0
 
-    # Rhythm — a bit faster as more tumblers, plus per-tumbler random sweet-zone center
+    # Rhythm — a bit faster as more tumblers, plus per-tumbler random sweet center
     $script:lpRng = [System.Random]::new()
     $script:lpFrq = @()
     $script:lpPhs = @()
-    $script:lpSweet = @()  # sweet zone center row per tumbler (random per lock)
+    $script:lpSweet = @()  # one sweet center row per tumbler (random per lock)
     for($i=0;$i -lt $TC;$i++){
         $script:lpFrq += 2.0 + $i * 0.22 + ($script:lpRng.NextDouble() - 0.5) * 0.3
         $script:lpPhs += $i * 1.3 + $script:lpRng.NextDouble() * 0.5
-        # Sweet zone can be anywhere from row 0 to row GH-1 (so sometimes top, sometimes bottom, sometimes middle)
         $script:lpSweet += $script:lpRng.Next(0, $GH)
     }
 
@@ -5410,8 +5472,9 @@ function Start-Lockpicking {
     function lp-TestSweet([int]$i){
         $row = lp-GetPinRow $i
         $center = $script:lpSweet[$i]
-        # SZ=1 means single row; SZ=2 would mean center row plus one above
-        return ([math]::Abs($row - $center) -lt $SZ)
+        $delta = $row - $center
+        # In-zone: row is the center row OR up to SZ_ABOVE-1 rows above it.
+        return ($delta -ge -$SZ_BELOW -and $delta -lt $SZ_ABOVE)
     }
 
     Clear-Host
@@ -5475,8 +5538,9 @@ function Start-Lockpicking {
             Write-Host "$lp$V" -NoNewline -ForegroundColor Cyan
             for($c=0;$c -lt $TC;$c++){
                 # Per-tumbler sweet check: cell is "in sweet" if this column's
-                # sweet center is within $SZ rows of the current row.
-                $cellSweet = ([math]::Abs($r - $script:lpSweet[$c]) -lt $SZ)
+                # row is in the 2-row band relative to the sweet center.
+                $delta = $r - $script:lpSweet[$c]
+                $cellSweet = ($delta -ge -$SZ_BELOW -and $delta -lt $SZ_ABOVE)
 
                 if($c -gt 0){
                     $sepC = 'DarkGray'
@@ -5537,10 +5601,9 @@ function Start-Lockpicking {
 
         Write-Host (lp-Pad "$lp$BL$($H * $IW)$BR") -ForegroundColor Cyan
 
-        # Timing bar — now reflects the ACTIVE pin's distance from its sweet center.
-        # Closer to center = fuller bar / greener color. When in sweet zone (SZ rows of
-        # center), bar shows ">>> NOW! <<<". This makes the visual cue match the actual
-        # win condition.
+        # Timing bar — reflects the ACTIVE pin's distance from its sweet center.
+        # Closer to center = fuller bar / greener color. When in sweet zone
+        # (within SZ of center), bar shows ">>> NOW! <<<".
         $curPin = $script:lpCur
         $pinRow = lp-GetPinRow $curPin
         $sweetCenter = $script:lpSweet[$curPin]
@@ -5781,6 +5844,10 @@ function Enter-Dungeon {
     # now that the render is fast enough to make every tick count.
     $moveCooldownMs   = 130
     $lastMoveStamp    = [DateTime]::MinValue   # time of last WASD action
+    # Per-dungeon-run flag — resets each time the player enters a new
+    # dungeon. Used so the Heavy Pockets achievement only counts ONCE
+    # per run, not every step while encumbered.
+    $script:DungeonEncumberedThisRun = $false
 
     $inDungeon = $true
     while($inDungeon -and $script:Player.HP -gt 0){
@@ -5861,6 +5928,13 @@ function Enter-Dungeon {
             $cur = Get-CurrentCarryWeight
             $max = Get-MaxCarryWeight $script:Player
             $script:StatusMsg = "OVER ENCUMBERED ($cur/$max) — open inventory [I] and drop items"
+            # Track this for the Heavy Pockets achievement. Flag ensures the
+            # counter only bumps once per dungeon run (not every blocked step).
+            if(-not $script:DungeonEncumberedThisRun){
+                $script:DungeonEncumberedThisRun = $true
+                $script:TotalEncumbered++
+                Check-Achievements
+            }
             continue
         }
 
@@ -5966,19 +6040,36 @@ function Enter-Dungeon {
                             }
 
                             # ── Special items: not sold in shops, only earned here ──
-                            # Repair Kit: 25% per clear (50% on Daily)
-                            $kitChance = if($script:DailyDungeonActive){50}else{25}
+                            # Daily Dungeons drop these much more frequently than normal runs.
+                            # Repair Kit: 25% normal / 70% daily.
+                            $kitChance = if($script:DailyDungeonActive){70}else{25}
                             if((Get-Random -Max 100) -lt $kitChance){
                                 $kits = if($script:DailyDungeonActive){2}else{1}
                                 $script:RepairKits += $kits
                                 $kitWord = if($kits -eq 1){"Repair Kit"}else{"Repair Kits"}
                                 Write-CL "    * $kits $kitWord found! (use to instantly repair all gear)" "Cyan"
                             }
-                            # Extra Strong Potion: 20% per clear (40% on Daily)
-                            $espChance = if($script:DailyDungeonActive){40}else{20}
+                            # Extra Strong Potions: 20% normal / 65% daily.
+                            # Drop is one ES potion per success, randomly chosen between
+                            # Health and Mana. Goes into the regular potion bag (weight 1).
+                            # If no inventory space, automatically converts to 250-400 gold.
+                            $espChance = if($script:DailyDungeonActive){65}else{20}
                             if((Get-Random -Max 100) -lt $espChance){
-                                $script:ExtraStrongPotions++
-                                Write-CL "    * 1 Extra Strong Potion found! (full HP+MP restore in combat)" "Green"
+                                $espShop = Get-PotionShop | Where-Object { $_.Category -eq "Special" }
+                                $espTemplate = $espShop | Get-Random
+                                # Try to add to potion bag — check carry weight first
+                                $curWt = Get-CurrentCarryWeight
+                                $maxWt = Get-MaxCarryWeight
+                                if(($curWt + 1) -le $maxWt){
+                                    [void]$script:Potions.Add($espTemplate)
+                                    Write-CL "    * 1 $($espTemplate.Name) found! ($($espTemplate.Desc))" "Magenta"
+                                } else {
+                                    # No space — convert to gold (250-400)
+                                    $goldVal = Get-Random -Min 250 -Max 401
+                                    $script:Gold += $goldVal
+                                    Write-CL "    * 1 $($espTemplate.Name) found, but your bags are full." "DarkYellow"
+                                    Write-CL "      You sell it on the way back to town for $goldVal gold." "Yellow"
+                                }
                             }
 
                             # Mark daily dungeon done if applicable
@@ -6014,12 +6105,11 @@ function Enter-Dungeon {
                             $script:StatusMsg = "You need a lockpick to open this chest."
                         }
                         else {
-                            # Difficulty scales with dungeon level
-                            # Tumbler count scales with dungeon depth
-                            $tumblers = 3
-                            if($script:DungeonLevel -ge 3){  $tumblers = 4 }
-                            if($script:DungeonLevel -ge 6){  $tumblers = 5 }
-                            if($script:DungeonLevel -ge 10){ $tumblers = 6 }
+                            # Fixed difficulty: every chest has 5 tumblers with a
+                            # single sweet spot per pin. Dungeon level no longer
+                            # influences difficulty — the pure timing challenge
+                            # is consistent so the player can master it.
+                            $tumblers = 5
 
                             $result = Start-Lockpicking -Tumblers $tumblers -AvailablePicks $script:Lockpicks
 
@@ -6277,6 +6367,13 @@ function Enter-Dungeon {
             "Q" {
                 Write-C "  Abandon dungeon? (y/n): " "Red"
                 $confirm = Read-Host
+                if($confirm -ne 'y'){
+                    # User declined. The prompt was written outside the frame
+                    # buffer (below the controls bar where the cursor was), so
+                    # the diff-paint won't know to clear it. Force a full
+                    # repaint on the next frame.
+                    Reset-FrameBuffer
+                }
                 if($confirm -eq 'y'){
                     clr
                     Write-CL "" "Red"
@@ -6621,6 +6718,7 @@ function Show-CharacterSelect {
     $script:TotalUntouched = 0
     $script:TotalStanceSwaps = 0
     $script:TotalRepairs = 0
+    $script:TotalEncumbered = 0
 
     Write-Host ""
     Write-CL "  You are a $className. Your journey begins..." "Green"
@@ -6732,7 +6830,6 @@ function Get-RandomQuests {
         @{Type="MiniBoss";   DescTemplate="Defeat the dungeon mini-boss";      TMin=1; TMax=1}
         @{Type="Boss";       DescTemplate="Defeat the dungeon boss";           TMin=1; TMax=1}
         @{Type="Rescue";     DescTemplate="Rescue the lost adventurer";        TMin=1; TMax=1}
-        @{Type="Treasure";   DescTemplate="Open {0} treasure chests";          TMin=2; TMax=5}
         # New quest types added in v1.3:
         @{Type="Crit";       DescTemplate="Land {0} critical hits in combat";  TMin=3; TMax=8}
         @{Type="Lockpicker"; DescTemplate="Successfully pick {0} locks";       TMin=2; TMax=5}
@@ -7092,9 +7189,17 @@ function Get-PotionShop {
         @{Name="Strength Elixir";     Type="ATKBuff";     Power=8;  Price=75; Desc="ATK+8 in battle";   Category="Potion"}
         @{Name="Iron Skin Elixir";    Type="DEFBuff";     Power=8;  Price=75; Desc="DEF+8 in battle";   Category="Potion"}
         @{Name="Potion of Luck";      Type="Luck";        Power=20; Price=90; Desc="+20% crit, 3 turns"; Category="Potion"}
-        @{Name="Acid Flask";          Type="Throw";       Power=25; Price=40; Desc="Deal 25 damage";    Category="Throwable"}
-        @{Name="Poison Flask";        Type="ThrowPoison"; Power=15; Price=50; Desc="15 dmg + Poison";   Category="Throwable"}
+        @{Name="Acid Flask";          Type="Throw";       Power=40; Price=60; Desc="Deal 40 damage";    Category="Throwable"}
+        @{Name="Poison Flask";        Type="ThrowPoison"; Power=25; Price=70; Desc="25 dmg + Poison";   Category="Throwable"}
         @{Name="Frost Bomb";          Type="ThrowSlow";   Power=20; Price=55; Desc="20 dmg + Slow";     Category="Throwable"}
+        @{Name="Bomb";                Type="Throw";       Power=75; Price=140;Desc="Deal 75 damage";    Category="Throwable"}
+        # ── SPECIAL: dungeon-clear drops only, never sold in shops ──
+        # Filter on Category="Potion" excludes these from market/merchant
+        # listings. They sit in the regular potion bag with weight 1.
+        @{Name="Extra Strong Health Potion";   Type="Heal";    Power=200; Price=0; Desc="Restore 200 HP";        Category="Special"}
+        @{Name="Extra Strong Mana Potion";     Type="Mana";    Power=150; Price=0; Desc="Restore 150 MP";        Category="Special"}
+        @{Name="Extra Strong Strength Elixir"; Type="ATKBuff"; Power=20;  Price=0; Desc="ATK+20 in battle";      Category="Special"}
+        @{Name="Extra Strong Luck Potion";     Type="Luck";    Power=50;  Price=0; Desc="+50% crit, 5 turns";    Category="Special"}
     )
 }
 
@@ -7147,10 +7252,10 @@ function Save-Game {
         }
     }
 
-    # ── Potion counts (v2: 7 regular including Luck, 3 throwable) ──
+    # ── Potion counts (v5: 7 regular + 4 throwable; bomb added in this update) ──
     $potShop = Get-PotionShop
     $potCounts = @(0, 0, 0, 0, 0, 0, 0)
-    $throwCounts = @(0, 0, 0)
+    $throwCounts = @(0, 0, 0, 0)
 
     foreach($pot in $script:Potions){
         for($i = 0; $i -lt 7; $i++){
@@ -7161,7 +7266,7 @@ function Save-Game {
         }
     }
     foreach($tp in $script:ThrowablePotions){
-        for($i = 7; $i -lt 10; $i++){
+        for($i = 7; $i -lt 11; $i++){
             if($tp.Name -eq $potShop[$i].Name){
                 $throwCounts[$i - 7]++
                 break
@@ -7422,7 +7527,9 @@ function Load-Game {
             [void]$script:Potions.Add($potShop[$i])
         }
     }
-    for($i = 0; $i -lt 3; $i++){
+    # Throwables: v4 saves had 3; v5 may have 4 (Bomb added). The split
+    # gives whatever count the save used; iterate up to that count.
+    for($i = 0; $i -lt 4; $i++){
         if($i -ge $throwParts.Count){ break }
         $count = [int]$throwParts[$i]
         for($c = 0; $c -lt $count; $c++){
@@ -7515,13 +7622,38 @@ function Load-Game {
     }
 
     # ── Special items (field [34]): "repairKits,extraStrongPotions" ──
+    # Repair Kits remain as a counter (weightless). The legacy ESP counter
+    # is migrated to bag potions: each old ES is split between Health and
+    # Mana variants and added to the regular Potions bag. If they don't
+    # all fit, leftovers convert to gold (200g each — same scale as the
+    # new drop-overflow logic).
     $script:RepairKits = 0
-    $script:ExtraStrongPotions = 0
+    $legacyEspCount    = 0
     $specialParts = $parts[34] -split ','
     if($specialParts.Count -ge 2){
         $script:RepairKits = [int]$specialParts[0]
-        $script:ExtraStrongPotions = [int]$specialParts[1]
+        $legacyEspCount    = [int]$specialParts[1]
     }
+    # Migrate legacy ESPs into bag potions. Alternate Health/Mana so the
+    # player gets a useful mix.
+    if($legacyEspCount -gt 0){
+        $espShop = Get-PotionShop | Where-Object { $_.Category -eq "Special" }
+        for($em = 0; $em -lt $legacyEspCount; $em++){
+            $template = $espShop[$em % $espShop.Count]
+            # Bag-weight check: each potion is 1 wt
+            $curWt = Get-CurrentCarryWeight
+            $maxWt = Get-MaxCarryWeight
+            if(($curWt + 1) -le $maxWt){
+                [void]$script:Potions.Add($template)
+            } else {
+                # Bag full — give gold instead (200g each, slightly under drop range)
+                $script:Gold += 200
+            }
+        }
+    }
+    # The old ESP counter is no longer used at runtime. Keep at 0 so any
+    # stale references log nothing.
+    $script:ExtraStrongPotions = 0
 
     # ── Stance (field [35]): "Aggressive"/"Balanced"/"Defensive" ──
     # Older v4 saves predate the stance field; default to Balanced.
@@ -7641,13 +7773,20 @@ function Show-TrainingGrounds {
         Write-Host ""
 
         $p = $script:Player
+        # Inner box width: 66 chars between │ and │
         Write-CL "  ┌──────────────────────────────────────────────────────────────────┐" "DarkGray"
-        Write-C  "  │  Gold: " "DarkGray"; Write-C "$($script:Gold)g" "Yellow"
-        $goldPadNeeded = 58 - "Gold: $($script:Gold)g".Length
-        if($goldPadNeeded -lt 0){ $goldPadNeeded = 0 }
-        Write-CL ("$(' ' * $goldPadNeeded)│") "DarkGray"
-        Write-CL "  │  Training teaches your body to bear more, hit harder, move     │" "DarkGray"
-        Write-CL "  │  faster. Each bump costs more than the last. Max +10 per stat. │" "DarkGray"
+        Write-C  "  │  Gold: " "DarkGray"
+        Write-C "$($script:Gold)g" "Yellow"
+        $afterGold = "  Gold: $($script:Gold)g"
+        $padNeeded = 66 - $afterGold.Length
+        if($padNeeded -lt 0){ $padNeeded = 0 }
+        Write-C ("$(' ' * $padNeeded)") "DarkGray"
+        Write-CL "│" "DarkGray"
+        # Description rows — each must be exactly 66 chars wide between the pipes
+        $desc1 = "  Training teaches your body to bear more, hit harder, move"
+        $desc2 = "  faster. Each bump costs more than the last. Max +10 per stat."
+        Write-C  "  │" "DarkGray"; Write-C $desc1.PadRight(66) "DarkGray"; Write-CL "│" "DarkGray"
+        Write-C  "  │" "DarkGray"; Write-C $desc2.PadRight(66) "DarkGray"; Write-CL "│" "DarkGray"
         Write-CL "  └──────────────────────────────────────────────────────────────────┘" "DarkGray"
         Write-Host ""
 
@@ -8384,10 +8523,27 @@ function Show-Changelog {
             "      Kills, Repair gear at the blacksmith."
             "    * Active quest cap raised from 3 to 5."
             "    * Quest Board now offers 5 random quests at a time."
-            "    * 13 new achievements: First Crit, Crit Master, Crit Lord,"
-            "      Locksmith, Master Thief, Pack Rat, Hoarder, Iron Fist,"
+            "    * 12 new achievements: First Crit, Crit Master, Crit Lord,"
+            "      Locksmith, Master Thief, Heavy Pockets, Iron Fist,"
             "      Untouched, Stance Shifter, True Scholar, Gear Guru,"
             "      High Roller, Deepest Dive."
+            ""
+            "  CONSUMABLES & THROWABLES"
+            "    * NEW throwable: Bomb — 75 damage premium throwable (140g)."
+            "    * Acid Flask buffed: 25 -> 40 damage (60g)."
+            "    * Poison Flask buffed: 15 -> 25 damage + Poison (70g)."
+            "    * Extra Strong potion family expanded to 4 variants — all"
+            "      drop from end-of-dungeon clears (rare, never sold):"
+            "        - ES Health Potion: restore 200 HP"
+            "        - ES Mana Potion: restore 150 MP"
+            "        - ES Strength Elixir: ATK +20 in battle"
+            "        - ES Luck Potion: +50% crit for 5 turns"
+            "      Now stored in the regular potion bag (1 weight each)."
+            "      If your bag is full when one drops, it auto-converts"
+            "      to 250-400 gold with a clear in-game message."
+            "    * Repair Kits remain weightless (counter-based)."
+            "    * Daily Dungeon clear-drop rates significantly higher:"
+            "      Repair Kits 25% -> 70%, ES potions 20% -> 65%."
         )}
         @{Title="GAMEPLAY IMPROVEMENTS"; Color="Cyan"; Lines=@(
             "  GEAR ACQUISITION FLOW"
@@ -8416,6 +8572,39 @@ function Show-Changelog {
             "      since dungeons scale to your player level."
             "    * Quest line removed from in-dungeon HUD — press [J]"
             "      for the full quest journal instead."
+            ""
+            "  CARRY WEIGHT REWORK"
+            "    * Hard cap at 90 weight, no longer scales with stats."
+            "      Inventory choices stay meaningful from start to end."
+            "    * All [Loot] items receive a +2 weight surcharge."
+            "    * Removed Pack Rat / Hoarder achievements."
+            "    * NEW Heavy Pockets achievement: get over-encumbered"
+            "      while in a dungeon (unlocks once)."
+            ""
+            "  ENEMY TUNING"
+            "    * Normal enemies and mini-bosses BUFFED — base HP/ATK/DEF"
+            "      bumped, scaling rate slightly steeper. They actually"
+            "      pose a threat at mid-late dungeon levels now."
+            "    * Bosses TONED DOWN — was overtuned. Base HP 260 -> 210,"
+            "      base ATK 24 -> 20, scaling 0.35 -> 0.28 HP / 0.32 -> 0.24"
+            "      ATK. Less bullet-spongy, less one-shot-prone."
+            "    * NEW: Player-gear contribution at fight start. Each"
+            "      enemy gets a one-time stat bump based on the player's"
+            "      weapon ATK / magic / armor DEF — locked at fight start"
+            "      so swapping gear mid-dungeon doesn't matter. Normal"
+            "      and mini-boss = 30%, boss = 20%."
+            ""
+            "  CHEST & LOCKPICKING"
+            "    * All chests now have a fixed 5 tumblers regardless"
+            "      of dungeon level. Pure timing challenge, consistent"
+            "      across the game."
+            "    * Single sweet-spot row per pin (timing bar reflects"
+            "      pin proximity precisely)."
+            ""
+            "  SELL VALUES"
+            "    * Weapons and armor in your bag now show proper sell"
+            "      values (50% of shop price), both in the Sell Loot"
+            "      screen and the Inventory display. Were showing 0g."
         )}
         @{Title="BUG FIXES & QUALITY OF LIFE"; Color="Yellow"; Lines=@(
             "  LOOT SCREEN OVERHAUL"
@@ -8442,13 +8631,34 @@ function Show-Changelog {
             "  LOCKPICKING REBALANCE"
             "    * Timing bar now reflects ACTUAL sweet-spot proximity"
             "      (was previously a meaningless secondary sin wave)."
-            "    * Sweet zone widened from 1 row to 3 rows for fairer"
-            "      timing windows."
+            "    * Single sweet-spot row per pin — the timing bar shows"
+            "      exactly when to press, so a tight window is fair."
             ""
             "  TUTORIAL"
             "    * Added pages on Enemy AI, Quests, and updated existing"
             "      pages to reflect new mechanics. Removed outdated"
             "      'hold key down' note (movement is now snappy)."
+            "    * Inventory page rewritten for the 90-weight hard cap,"
+            "      ES potion family, and new Bomb throwable."
+            "    * 'Open X chests' quest type removed (redundant with"
+            "      Lockpicker). Quest tutorial says 'QUEST JOURNAL'."
+            ""
+            "  UI ALIGNMENT FIXES"
+            "    * Sell Loot table: column widths now match border"
+            "      characters exactly (was rendering 7 chars short of"
+            "      the bottom border)."
+            "    * Training Grounds description box: borders match"
+            "      content widths now (top/bottom borders no longer"
+            "      vanish in narrower terminals)."
+            ""
+            "  DUNGEON UI FIXES"
+            "    * Abandon dungeon prompt: typing 'n' now properly clears"
+            "      the prompt text from the screen on next render. The"
+            "      buffered renderer was missing the cleanup because the"
+            "      prompt wrote outside the frame buffer."
+            "    * Chest loot: now shows the same 'Loot stowed:' summary"
+            "      screen as enemy drops (was silently returning to the"
+            "      dungeon if you took anything)."
         )}
     )
 
@@ -8479,18 +8689,21 @@ function Start-Game {
 
     # Title screen
     Write-Host ""
-    Write-CL "     ____  _____ ____ _____ _   _ ____" "DarkCyan"
-    Write-CL "    |  _ \| ____|  _ \_   _| | | / ___|" "Cyan"
-    Write-CL "    | | | |  _| | |_) || | | |_| \___ \" "Cyan"
-    Write-CL "    | |_| | |___|  __/ | | |  _  |___) |" "Cyan"
-    Write-CL "    |____/|_____|_|    |_| |_| |_|____/" "DarkCyan"
     Write-Host ""
-    Write-CL "          O F   P O W E R S H E L L" "DarkYellow"
+    Write-CL "    ██████╗  ███████╗ ██████╗  ████████╗ ██╗  ██╗ ███████╗" "DarkCyan"
+    Write-CL "    ██╔══██╗ ██╔════╝ ██╔══██╗ ╚══██╔══╝ ██║  ██║ ██╔════╝" "Cyan"
+    Write-CL "    ██║  ██║ █████╗   ██████╔╝    ██║    ███████║ ███████╗" "Cyan"
+    Write-CL "    ██║  ██║ ██╔══╝   ██╔═══╝     ██║    ██╔══██║ ╚════██║" "Cyan"
+    Write-CL "    ██████╔╝ ███████╗ ██║         ██║    ██║  ██║ ███████║" "DarkCyan"
+    Write-CL "    ╚═════╝  ╚══════╝ ╚═╝         ╚═╝    ╚═╝  ╚═╝ ╚══════╝" "DarkCyan"
     Write-Host ""
-    Write-CL "                  Version 1.3" "DarkGray"
+    Write-CL "             O   F     P O W E R S H E L L" "DarkYellow"
     Write-Host ""
-    Write-CL "    A first-person dungeon crawler" "DarkGray"
-    Write-CL "    with turn-based RPG combat" "DarkGray"
+    Write-CL "                       Version 1.3" "DarkGray"
+    Write-Host ""
+    Write-CL "         A first-person dungeon crawler" "DarkGray"
+    Write-CL "         with turn-based RPG combat" "DarkGray"
+    Write-Host ""
     Write-Host ""
     Wait-Key
 
@@ -8502,8 +8715,8 @@ function Start-Game {
         clr
         Write-Host ""
         Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
-        Write-CL "  ║         DEPTHS OF POWERSHELL                     ║" "Yellow"
-        Write-CL "  ║              Version 1.3                       ║" "DarkGray"
+        Write-CL "  ║               DEPTHS OF POWERSHELL               ║" "Yellow"
+        Write-CL "  ║                   Version 1.3                    ║" "DarkGray"
         Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
         Write-Host ""
         Write-CL "  ┌─────────────────────────────────────────┐" "DarkGray"
@@ -8775,14 +8988,9 @@ function Show-InventoryScreen {
         Write-CL "   Lv$($script:PlayerLevel)  |  Gold: $($script:Gold)g  |  Lockpicks: $($script:Lockpicks)" "DarkGray"
         Write-C  "   Carry: " "DarkGray"
         Write-CL "$curW / $maxW" $weightColor
-        if($script:RepairKits -gt 0 -or $script:ExtraStrongPotions -gt 0){
+        if($script:RepairKits -gt 0){
             Write-C  "   Special items: " "DarkGray"
-            if($script:RepairKits -gt 0){
-                Write-C "Repair Kits x$($script:RepairKits)  " "Cyan"
-            }
-            if($script:ExtraStrongPotions -gt 0){
-                Write-C "Extra Strong Potions x$($script:ExtraStrongPotions)" "Magenta"
-            }
+            Write-C "Repair Kits x$($script:RepairKits)" "Cyan"
             Write-Host ""
         }
         Write-Host ""
@@ -8878,7 +9086,8 @@ function Show-InventoryScreen {
             $totalWt  = 0
             for($i=0;$i -lt $script:Inventory.Count;$i++){
                 $it=$script:Inventory[$i]
-                $totalVal += $it.Value
+                $sv = Get-ItemSellValue $it
+                $totalVal += $sv
                 $iWt = Get-ItemWeight $it
                 $totalWt += $iWt
                 $kindTag = switch($it.Kind){
@@ -8888,7 +9097,7 @@ function Show-InventoryScreen {
                     default  { "[Loot]" }
                 }
                 $iName = "$($i+1). $($it.Name) $kindTag"
-                $iVal  = "$($it.Value)g"
+                $iVal  = "${sv}g"
                 $iWtStr = "${iWt}wt"
                 $namePad = 36
                 if($iName.Length -gt $namePad){ $iName = $iName.Substring(0, $namePad - 3) + "..." }
@@ -9275,18 +9484,23 @@ function Show-Tutorial {
             "  offers a legendary blade on a coin toss."
         )}
         @{Title="6. INVENTORY & WEIGHT"; Lines=@(
-            "  Every item you carry has weight. Your bag's max capacity is"
-            "  100 + (avg of ATK,DEF) x 5."
+            "  Every item you carry has weight. Your bag has a HARD CAP of 90."
+            "  This cap doesn't grow with your stats — it's the same at every"
+            "  level, so inventory choices stay meaningful from start to end."
             ""
             "  WEIGHT-FREE ITEMS:"
             "    * Equipped weapon and armor"
-            "    * Gold, repair kits, extra strong potions"
+            "    * Gold and Repair Kits"
             ""
             "  WEIGHTED ITEMS (count toward your cap):"
-            "    * Loot items (gems, scales, idols, etc.)"
+            "    * Loot items — gems, scales, idols, etc. (varies by item;"
+            "      includes a +2 weight surcharge that makes the 90 cap bite)"
             "    * Spare weapons and armor in your bag (boss/miniboss drops)"
-            "    * Potions and throwables (1 weight each)"
-            "    * Lockpicks (1 weight each)"
+            "    * Potions and throwables — 1 weight each"
+            "    * Extra Strong potions (Health/Mana/Strength/Luck) — 1 weight"
+            "      each, found as rare end-of-dungeon drops; convert to gold"
+            "      if bag is full"
+            "    * Lockpicks — 1 weight each"
             ""
             "  WHEN YOU'RE OVER ENCUMBERED:"
             "    * In a dungeon, WASD movement is BLOCKED. Open inventory [I]"
@@ -9294,8 +9508,9 @@ function Show-Tutorial {
             "    * In town, you can't enter another dungeon. Sell at the"
             "      Market or drop items via the Inventory."
             ""
-            "  END-OF-DUNGEON loot bypasses the weight cap, but you'll need"
-            "  to clear space in town before adventuring again."
+            "  THROWABLES (combat option [4]):"
+            "    Acid Flask — 40 dmg     Poison Flask — 25 dmg + Poison"
+            "    Frost Bomb — 20 dmg + Slow     Bomb — 75 dmg (premium)"
             ""
             "  LOOT SCREEN (chest contents, enemy drops):"
             "    Up/Down — move cursor   Space — toggle take/leave"
@@ -9329,14 +9544,13 @@ function Show-Tutorial {
             "  You can hold up to 5 active quests at a time."
             ""
             "  QUEST TYPES:"
-            "    * Kill X enemies          * Defeat the dungeon mini-boss"
-            "    * Defeat the boss          * Open X chests"
-            "    * Rescue the lost adventurer"
+            "    * Kill X enemies           * Defeat the dungeon mini-boss"
+            "    * Defeat the boss          * Rescue the lost adventurer"
             "    * Land X critical hits     * Pick X locks"
             "    * Collect X loot items     * Reach boss room above 50% HP"
             "    * X kills bare-handed      * Repair gear at the Blacksmith"
             ""
-            "  Press [J] in the dungeon to view the QUEST LOG with progress"
+            "  Press [J] in the dungeon to view the QUEST JOURNAL with progress"
             "  bars. Quests don't auto-complete — return to the board to"
             "  turn in finished quests for gold and XP."
             ""
