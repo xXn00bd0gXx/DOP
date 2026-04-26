@@ -66,3 +66,66 @@ Frugal run mutation - start with 1 lockpick instead of 0
 Remove (clear-bonus loot bypasses carry weight) from dungeon cleared, but keep warning if player is now over encumbered after getting bonus loot from dungeon clear.
 Check that the lore notes are actual in the loot drop pool, haven't seen any while play testing.
 Didn't get time to play test talents, check logic to make sure all talents work and apply stat buffs properly 
+
+
+
+
+
+
+
+---
+
+# Depths of PowerShell
+
+A turn-based dungeon crawler that runs entirely in PowerShell 5.1. No installation, no dependencies, no admin rights — just a `.ps1` file and a console window.
+
+## Features
+
+**8 playable classes** with unique abilities, weapon affinities, and 9-talent skill trees each (72 talents total, all wired to combat)
+
+**Real-time dungeon exploration** — WASD movement, fog of war, minimap, chests, locked doors, lost adventurers to rescue, and a bespoke ASCII first-person 3D corridor view
+
+**Turn-based combat** with stances (Aggressive / Balanced / Defensive), throwables, weapon perks (Bleed, Burn, Poison, Drain, Stun), abilities on cooldown, and partner companions
+
+**Lockpicking minigame** — real-time tumbler challenge with adjustable difficulty per chest
+
+**12 two-handed weapons** that trade your shield slot for serious damage; 1H/2H clearly separated in the shop
+
+**Cooking system** — enemies drop ingredients (Mushroom, Herb, Meat, Bone), combine at the Inn into run-long buff foods
+
+**Pet companions** — Hound (chest radar), Raven (gold bonus), or Falcon (fog reveal)
+
+**6 dungeon mutators** — Glass Cannon, Pacifist, Cursed Loot, Speedrun, Frugal, Hardcore — each scaling your reward multiplier
+
+**Daily Dungeon** with double rewards, refreshing every real-world day
+
+**Hidden boss** — clear a Daily Dungeon at full HP with zero potions used, and something stirs
+
+**New Game Plus** — clear 25 dungeons to ascend; enemies scale, gear can roll Ascended (+30% stats), talents and training persist
+
+**Bestiary** tracking every enemy variant defeated, including procedural variants (Veteran/Dire/Cursed/Swift/Toughened/Frenzied)
+
+**15 lore notes** scattered in chests — sysadmin diary fragments, prayers in pseudocode, EULAs from a guild that does not exist
+
+**Achievements**, **quests**, **training grounds**, **inn rest tiers**, **save/load via Base64 codes** that paste cleanly into Discord
+
+**Ad-free, single-file, ~13,000 lines of pure PowerShell** — read the source, modify it, break it, fix it.
+
+---
+
+## Requirements
+
+- Windows PowerShell 5.1 (preinstalled on Windows 10/11) or PowerShell 7+
+- An 80×32 (or larger) console window for the cleanest rendering
+- A few hours of free time
+
+## How to run
+
+Right-click the `.ps1` → "Run with PowerShell", or from a terminal:
+```
+powershell -ExecutionPolicy Bypass -File DOP_2_0.ps1
+```
+
+---
+
+Tweak as you like — particularly the opening line and the requirements section, depending on what forum you're posting to and how snarky their tone runs. If the forum has a strict "no self-promotion" rule, lead with "Made this for fun, looking for feedback" and trim the bullet count to 5–6.
