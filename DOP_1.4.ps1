@@ -72,6 +72,70 @@ $script:TotalUntouched     = 0      # times reached boss room above 75% HP
 $script:TotalStanceSwaps   = 0      # times changed stance
 $script:TotalRepairs       = 0      # times paid the blacksmith for a repair
 $script:TotalEncumbered    = 0      # times got over-encumbered while in a dungeon
+$script:DungeonsCleared    = 0      # lifetime successful clears (boss kill + reach exit)
+# ── Bestiary (v1.5): tracks defeats per (Type, Variant) combo. ──
+# Key format: "Type|Variant" (e.g. "Goblin|", "Goblin|Frenzied").
+# Value: @{ Kills=<int>; FirstSeen=<bool> }.
+$script:Bestiary           = @{}
+# ── Run statistics (v1.5): reset on every dungeon entry. Reported on
+# clear/death so the player gets a per-run summary screen. ──
+$script:RunStats = @{
+    DamageDealt   = 0
+    DamageTaken   = 0
+    GoldEarned    = 0
+    XPEarned      = 0
+    KillsThisRun  = 0
+    CritsThisRun  = 0
+    PotionsUsed   = 0
+    HighestCombo  = 0   # not currently tracked combo-wise — placeholder
+    StepsTaken    = 0
+}
+# ── Hidden boss (v1.5): per-dungeon flags used to gate spawn ──
+$script:UsedPotionsThisDungeon = $false
+$script:TookDamageThisDungeon  = $false
+$script:HiddenBossDefeated     = $false   # lifetime achievement
+# ── New Game Plus (v1.5 Pass 2): incremented each time the player
+# ascends. Currently saved/loaded but not yet wired into enemy scaling
+# (that's a Pass 2 feature).
+$script:NGPlusLevel            = 0
+# ── Dungeon Mutators (v1.5 Pass 2): chosen at dungeon entry, cleared
+# on dungeon end. $script:DungeonMutator is $null (no mutator) or
+# @{Id, Name, Desc, RewardMul} where RewardMul is the gold/XP bonus
+# multiplier applied at the end-of-dungeon clear.
+$script:DungeonMutator         = $null
+# ── Talent Tree (v1.5 Pass 2): 1 talent point per player level. Spent
+# at the Stats page. Each class has 9 talents in 3 tiers of 3 (Tier 1
+# requires Lv1, Tier 2 requires Lv5, Tier 3 requires Lv10). Stored as
+# a hashtable: talent ID -> 1 (purchased). Talent points are calculated
+# as max(0, PlayerLevel - sum-of-purchased-talents). Reset on ascend
+# and on new char.
+$script:Talents = @{}            # @{ "Knight_T1_A" = 1; ... }
+# Per-dungeon one-shot talent flags. Cleared on Enter-Dungeon.
+$script:LastStandUsed    = $false   # Knight Last Stand
+$script:ResurrectionUsed = $false   # Cleric Resurrection
+$script:FinalStandUsed   = $false   # Berserker Final Stand
+$script:LayOnHandsUsed   = $false   # Cleric Lay on Hands
+# Berserker Final Stand: stores the delta applied at proc time so
+# Reset-MutatorOnEnd can revert it at dungeon end. Without this, the
+# +50% stats would compound across dungeons.
+$script:FinalStandBuffs  = $null    # @{ATK; DEF; SPD; MAG} or $null
+# Permanent shop discount granted by defeating the Orphaned Process.
+# Applied multiplicatively to all shop purchase prices.
+function Get-ShopDiscount {
+    if($script:HiddenBossDefeated){ return 0.85 }   # 15% off
+    return 1.0
+}
+# ── Pet (v1.5): one of "Hound", "Raven", "Falcon" or $null. ──
+# Pets are bought at the Guild Hall and provide a single passive perk:
+#   Hound  — chests show on minimap regardless of fog of war
+#   Raven  — +5% gold from all sources
+#   Falcon — minimap window radius 5 -> 8
+$script:Pet = $null
+# ── Cooking (v1.5): ingredients drop from enemies; combine at the Inn
+# into buff foods that last the entire dungeon run. Active buff cleared
+# on dungeon end (clear or death).
+$script:Ingredients     = @{}      # e.g. @{Mushroom=2; Herb=0; Meat=1; Bone=3}
+$script:ActiveFoodBuff  = $null    # @{Name; Effect; Value} or $null
 
 
 
@@ -531,6 +595,45 @@ function Get-CurrentCarryWeight {
     if($script:ThrowablePotions){
         $w += $script:ThrowablePotions.Count
     }
+    # Equipped armor counts toward carry weight. Slot-based defaults:
+    #   Helmet 3, Chest 5, Shield 4, Amulet 1, Boots 2  (= 15 if fully geared)
+    # Items that store an explicit Weight field use that instead.
+    if($script:EquippedArmor){
+        foreach($slot in @("Helmet","Chest","Shield","Amulet","Boots")){
+            $piece = $script:EquippedArmor[$slot]
+            if($piece){
+                if($piece.Weight){
+                    $w += [int]$piece.Weight
+                } else {
+                    $defaultWt = switch($slot){
+                        "Helmet" { 3 }
+                        "Chest"  { 5 }
+                        "Shield" { 4 }
+                        "Amulet" { 1 }
+                        "Boots"  { 2 }
+                        default  { 0 }
+                    }
+                    $w += $defaultWt
+                }
+            }
+        }
+    }
+    # Equipped weapon contributes weight too. Default 4 wt unless the weapon
+    # stores an explicit Weight field.
+    if($script:EquippedWeapon){
+        if($script:EquippedWeapon.Weight){
+            $w += [int]$script:EquippedWeapon.Weight
+        } else {
+            $w += 4
+        }
+    }
+    # Cooking ingredients: 1 wt each. They live in $script:Ingredients
+    # (not the bag), so we sum the counter values.
+    if($script:Ingredients){
+        foreach($k in $script:Ingredients.Keys){
+            $w += [int]$script:Ingredients[$k]
+        }
+    }
     return $w
 }
 
@@ -548,6 +651,12 @@ function Get-ItemSellValue {
     if($Item.Kind -eq "Armor" -or $Item.Slot){
         if($Item.Price){ return [math]::Max([int][math]::Floor([int]$Item.Price * 0.5), 1) }
     }
+    # Potions and throwables (Category="Potion"/"Throwable") sell at 50% Price.
+    # Extra-Strong (Category="Special") have Price=0 in shop data; use 250g notional.
+    if($Item.Category -eq "Potion" -or $Item.Category -eq "Throwable"){
+        if($Item.Price){ return [math]::Max([int][math]::Floor([int]$Item.Price * 0.5), 1) }
+    }
+    if($Item.Category -eq "Special"){ return 250 }
     if($Item.Value){ return [int]$Item.Value }
     if($Item.Price){ return [math]::Max([int][math]::Floor([int]$Item.Price * 0.5), 1) }
     return 0
@@ -576,6 +685,12 @@ function Init-ItemWeight {
 #
 # If the target slot is empty, auto-equip with no prompt — there's no
 # meaningful choice (equipping vs. carrying a useless item with weight).
+# Returns gold multiplier from pet effects. Currently only Raven contributes.
+function Get-PetGoldMul {
+    if($script:Pet -and $script:Pet.Type -eq "Raven"){ return 1.05 }
+    return 1.0
+}
+
 function Invoke-GearAcquired {
     param(
         $Item,                    # the new item (hashtable)
@@ -584,16 +699,29 @@ function Invoke-GearAcquired {
     if(-not $Item){ return }
 
     if($Kind -eq "Weapon"){
+        # 2H exclusivity: if the incoming weapon is 2H, we'll need to
+        # stow the shield (if any) when the player accepts the equip.
+        $needShieldStow = ($Item.TwoHanded -and $script:EquippedArmor.Shield)
         $currentEquipped = $script:EquippedWeapon
         if(-not $currentEquipped){
             # Slot empty — auto-equip with no prompt
+            if($needShieldStow){
+                $shield = $script:EquippedArmor.Shield
+                if(-not $shield.Kind){ $shield.Kind = "Armor" }
+                [void]$script:Inventory.Add($shield)
+                $script:EquippedArmor.Shield = $null
+                Write-CL "  $($Item.Name) is two-handed — stowed your $($shield.Name)." "DarkYellow"
+            }
             $script:EquippedWeapon = $Item
             Write-CL "  Equipped: $($Item.Name)" "Green"
             return
         }
         Write-Host ""
         Write-CL "  You already have $($currentEquipped.Name) equipped." "DarkGray"
-        Write-CL "  New item: $($Item.Name)" "Yellow"
+        Write-CL "  New item: $($Item.Name)$(if($Item.TwoHanded){' (Two-Handed)'}else{''})" "Yellow"
+        if($needShieldStow){
+            Write-CL "  NOTE: Equipping this two-handed weapon will stow your shield." "DarkYellow"
+        }
         Write-Host ""
         Write-CL "    [1] Equip $($Item.Name) now (old goes to inventory)" "Cyan"
         Write-CL "    [2] Stow $($Item.Name) in inventory" "DarkCyan"
@@ -601,8 +729,13 @@ function Invoke-GearAcquired {
         Write-C "    > " "Yellow"
         $c = Read-Host
         if($c -eq "1"){
-            # Old equipped goes to inventory; new becomes equipped.
-            # Stamp Kind so weight calc works.
+            if($needShieldStow){
+                $shield = $script:EquippedArmor.Shield
+                if(-not $shield.Kind){ $shield.Kind = "Armor" }
+                [void]$script:Inventory.Add($shield)
+                $script:EquippedArmor.Shield = $null
+                Write-CL "  Stowed your $($shield.Name) (two-handed weapon needs both hands)." "DarkYellow"
+            }
             if(-not $currentEquipped.Kind){ $currentEquipped.Kind = "Weapon" }
             [void]$script:Inventory.Add($currentEquipped)
             $script:EquippedWeapon = $Item
@@ -627,8 +760,19 @@ function Invoke-GearAcquired {
             Write-CL "  Stowed $($Item.Name) in your bag." "DarkCyan"
             return
         }
+        # Shield + 2H exclusivity: if equipping a Shield while wielding a
+        # two-handed weapon, the player must consent to stowing the weapon.
+        $needWeaponStow = ($slot -eq "Shield" -and $script:EquippedWeapon -and $script:EquippedWeapon.TwoHanded)
         $currentEquipped = $script:EquippedArmor[$slot]
         if(-not $currentEquipped){
+            if($needWeaponStow){
+                # Auto-equip with note that weapon was stowed
+                $wep = $script:EquippedWeapon
+                if(-not $wep.Kind){ $wep.Kind = "Weapon" }
+                [void]$script:Inventory.Add($wep)
+                $script:EquippedWeapon = $null
+                Write-CL "  Stowed $($wep.Name) (two-handed) to make room for the shield." "DarkYellow"
+            }
             $script:EquippedArmor[$slot] = $Item
             Write-CL "  Equipped: $($Item.Name) ($slot)" "Green"
             return
@@ -636,6 +780,9 @@ function Invoke-GearAcquired {
         Write-Host ""
         Write-CL "  You already have $($currentEquipped.Name) equipped in $slot slot." "DarkGray"
         Write-CL "  New item: $($Item.Name)" "Yellow"
+        if($needWeaponStow){
+            Write-CL "  NOTE: Equipping this shield will stow your two-handed weapon." "DarkYellow"
+        }
         Write-Host ""
         Write-CL "    [1] Equip $($Item.Name) now (old goes to inventory)" "Cyan"
         Write-CL "    [2] Stow $($Item.Name) in inventory" "DarkCyan"
@@ -643,6 +790,13 @@ function Invoke-GearAcquired {
         Write-C "    > " "Yellow"
         $c = Read-Host
         if($c -eq "1"){
+            if($needWeaponStow){
+                $wep = $script:EquippedWeapon
+                if(-not $wep.Kind){ $wep.Kind = "Weapon" }
+                [void]$script:Inventory.Add($wep)
+                $script:EquippedWeapon = $null
+                Write-CL "  Stowed $($wep.Name) (two-handed)." "DarkYellow"
+            }
             if(-not $currentEquipped.Kind){ $currentEquipped.Kind = "Armor" }
             [void]$script:Inventory.Add($currentEquipped)
             $script:EquippedArmor[$slot] = $Item
@@ -672,6 +826,16 @@ function Invoke-EquipFromInventory {
     $kind = $item.Kind
 
     if($kind -eq "Weapon" -or $item.WeaponType){
+        # 2H weapons can't coexist with a shield. If the new weapon is 2H
+        # AND a shield is equipped, auto-stow the shield first. If the bag
+        # would overflow, abort the equip.
+        if($item.TwoHanded -and $script:EquippedArmor.Shield){
+            $shield = $script:EquippedArmor.Shield
+            if(-not $shield.Kind){ $shield.Kind = "Armor" }
+            [void]$script:Inventory.Add($shield)
+            $script:EquippedArmor.Shield = $null
+            Write-CL "  $($item.Name) requires both hands. Stowed your $($shield.Name)." "DarkYellow"
+        }
         $oldWep = $script:EquippedWeapon
         $script:Inventory.RemoveAt($InvIndex)
         if($oldWep){
@@ -689,6 +853,17 @@ function Invoke-EquipFromInventory {
         if(-not $slot){
             Write-CL "  This item has no armor slot — cannot equip." "Red"
             return $false
+        }
+        # Block shield equip while wielding a 2H weapon — stow the weapon
+        # first, then equip the shield. Player gives explicit consent in
+        # the gear-acquisition flow; here we just auto-resolve it since
+        # this path is always a deliberate equip from the inventory.
+        if($slot -eq "Shield" -and $script:EquippedWeapon -and $script:EquippedWeapon.TwoHanded){
+            $wep = $script:EquippedWeapon
+            if(-not $wep.Kind){ $wep.Kind = "Weapon" }
+            [void]$script:Inventory.Add($wep)
+            $script:EquippedWeapon = $null
+            Write-CL "  Stowed $($wep.Name) (two-handed) to make room for the shield." "DarkYellow"
         }
         $oldArm = $script:EquippedArmor[$slot]
         $script:Inventory.RemoveAt($InvIndex)
@@ -765,6 +940,26 @@ function Init-ItemDurability {
     foreach($k in $Item.Keys){ $copy[$k] = $Item[$k] }
     $copy.MaxDurability = $max
     $copy.Durability    = $max  # full on pickup
+    # Cursed Loot mutator: gear drops are cursed — start at 50% durability
+    # but grant +50% to ATK / DEF / MAGBonus. Indestructible items
+    # (Dutchman's Blade, MaxDurability=-1) are unaffected by the
+    # durability part but still get the stat boost.
+    if(Has-Mutator "CursedLoot" -and ($copy.WeaponType -or $copy.Slot)){
+        if($max -gt 0){
+            $copy.Durability = [math]::Max(1, [math]::Floor($max * 0.5))
+        }
+        if($copy.ATK){
+            $copy.ATK = [math]::Floor($copy.ATK * 1.5)
+        }
+        if($copy.DEF){
+            $copy.DEF = [math]::Floor($copy.DEF * 1.5)
+        }
+        if($copy.MAGBonus){
+            $copy.MAGBonus = [math]::Floor($copy.MAGBonus * 1.5)
+        }
+        # Mark for inventory display flair
+        $copy.Cursed = $true
+    }
     return $copy
 }
 
@@ -931,8 +1126,8 @@ function Get-AchievementList {
         @{Id="BossKiller";     Name="Boss Slayer";         Desc="Defeat your first dungeon boss";       Gold=100; XP=50;  Req="bosses:1"}
         @{Id="BossKiller5";    Name="Legendary Hero";      Desc="Defeat 5 dungeon bosses";              Gold=400; XP=300; Req="bosses:5"}
         @{Id="BossKiller10";   Name="Dungeon Master";      Desc="Defeat 10 dungeon bosses";             Gold=1000;XP=750; Req="bosses:10"}
-        @{Id="DeepDiver";      Name="Deep Diver";          Desc="Clear dungeon level 5";                Gold=200; XP=150; Req="dungeon:5"}
-        @{Id="AbyssWalker";    Name="Abyss Walker";        Desc="Clear dungeon level 10";               Gold=600; XP=500; Req="dungeon:10"}
+        @{Id="DeepDiver";      Name="Deep Diver";          Desc="Clear 5 dungeons";                     Gold=200; XP=150; Req="cleared:5"}
+        @{Id="AbyssWalker";    Name="Abyss Walker";        Desc="Clear 10 dungeons";                    Gold=600; XP=500; Req="cleared:10"}
         @{Id="Wealthy";        Name="Wealthy";             Desc="Accumulate 1000 gold";                 Gold=0;   XP=100; Req="gold:1000"}
         @{Id="Tycoon";         Name="Tycoon";              Desc="Accumulate 5000 gold";                 Gold=0;   XP=500; Req="gold:5000"}
         @{Id="FullPlate";      Name="Knight Errant";       Desc="Equip all 5 armor slots";              Gold=150; XP=100; Req="armor:all"}
@@ -959,7 +1154,7 @@ function Get-AchievementList {
         @{Id="TrueScholar";    Name="True Scholar";        Desc="Complete 25 quests";                   Gold=500; XP=500; Req="quests:25"}
         @{Id="GearGuru";       Name="Gear Guru";           Desc="Repair gear at the blacksmith 10 times"; Gold=150; XP=150; Req="repairs:10"}
         @{Id="HighRoller";     Name="High Roller";         Desc="Accumulate 10000 gold";                Gold=0;   XP=1000; Req="gold:10000"}
-        @{Id="DeepestDive";    Name="Deepest Dive";        Desc="Clear dungeon level 20";               Gold=2000; XP=1500; Req="dungeon:20"}
+        @{Id="DeepestDive";    Name="Tireless Adventurer"; Desc="Clear 20 dungeons";                    Gold=2000; XP=1500; Req="cleared:20"}
     )
 }
 
@@ -989,6 +1184,7 @@ function Check-Achievements {
         kills        = $script:TotalKills
         bosses       = $script:BossesDefeated
         dungeon      = $script:DungeonLevel
+        cleared      = $script:DungeonsCleared
         gold         = $script:Gold
         weapons      = $script:WeaponsOwned.Count
         streak       = $script:BestStreak
@@ -1042,6 +1238,30 @@ function Get-TrainingCost {
 
 
 # ─── LOOT GENERATION ─────────────────────────────────────────────
+# ─── FOUND NOTES (v1.5) ───────────────────────────────────────────
+# Rare drops from chests — fragments of a previous adventurer's journal.
+# Each note has Title, Body. Read in inventory. Pure flavor — no
+# mechanical effect. Adds lore texture without overwriting backstory.
+function Get-NotePool {
+    @(
+        @{ Title="Crumpled Stack Trace";   Body="Day 1. The Guild handed me a map and a whetstone. Neither had documentation. I drew my own diagrams in the dirt with a stick. The stick broke. I think that means something." }
+        @{ Title="Sysadmin's Diary (3)";   Body="Day 3. Encountered a sealed chamber. Five tumblers. The mechanism gave me an obscure error code on every failed pick. Tier 3 support told me to file a ticket. I am tier 3 support. I filed a ticket against myself. It was closed as duplicate." }
+        @{ Title="Daemon's Memo";          Body="Day 7. The walls down here weren't built. They were instantiated. I leaned against one and felt it allocate memory under my hand. I have not leaned against a wall since." }
+        @{ Title="Architect's Footnote";   Body="The Depths are not a place. They are a process tree. Each floor is a child spawned by the one above. The Lich King is not at the bottom because he is the deepest. He is at the bottom because nothing has terminated him yet." }
+        @{ Title="Severed Pull Request";   Body="Aldric — DO NOT MERGE the cursed blade branch. The Dutchman's repo is forked from a deleted commit. I traced it. The commit message reads: 'fixed bug, also kills you.' Burn the map. Squash this branch. — M." }
+        @{ Title="Cleric's Try/Catch";     Body="Light eternal, hold our pointers steady. Bless our crit rolls and our retry logic. Forgive us our null references, as we forgive those who null-ref against us. May our potions be unbroken and our mana never throw OutOfMemory. Amen." }
+        @{ Title="Treasure Map (.bak)";    Body="...third fork past the segfault, beneath the twin pillars (load-balanced), behind the stone with the chipped corner. The floor in that room runs on a tick counter. Every fifth tile is a trap. I learned the hard way. — Halix the Lost (deceased)" }
+        @{ Title="Necromancer's TODO";     Body="// FIXME: figure out why the dead remember their old job titles\n// FIXME: bones keep reassembling on respawn — memory leak?\n// TODO: ask Lich King about garbage collection\n// TODO: don't ask Lich King about anything ever" }
+        @{ Title="Sailor's Stack Dump";    Body="...met the Flying Dutchman at level fifteen. Lost a coin toss because I assumed Get-Random was uniform. It is uniform. I was just unlucky. He took my pet falcon. I miss the falcon more than the gold. The gold I can earn back." }
+        @{ Title="Smith's Invoice";        Body="WORK ORDER #00471. Customer: Wenna of the Eastern Hills. Repair: chainmail, full set. Status: paid in advance. Customer did not return for pickup. Item stored 90 days per policy. Note: name matched grave in family plot. Refund issued to next of kin: also Wenna. We did not ask follow-up questions." }
+        @{ Title="Adventurer's EULA";      Body="By descending past this point you agree to: (1) the Guild of SysAdmins is not liable for soul loss, (2) durability is not guaranteed in caustic environments, (3) the Dutchman's blade comes AS-IS with no warranty. Continue? [Y/N]. The forest does not show this prompt twice." }
+        @{ Title="Carved Stone Tablet";    Body="HE WHO DEPLOYS TO PRODUCTION THRICE OPENS THE DOOR. We do not know which door. We have lost five climbers searching. The carving is older than the language it is written in, which sysadmins find professionally upsetting." }
+        @{ Title="Brewmaster's Manifest";  Body="Extra Strong reds: triple the moonpetal, halve the mandrake, add a single tear shed in honest grief over a deleted production database. The grief is the active ingredient. Without it you brew colored water. With it you brew miracles. Backups not included." }
+        @{ Title="Encoded Riddle Card";    Body="I have three tongues but no mouth. Six faces but no eyes. Walk through me with nothing equipped, and I dress you. Walk through me wearing armor, and I strip you. (Answer scratched out and replaced with: 'a corrupted character creation screen.')" }
+        @{ Title="Knight's Resignation";   Body="I swore to defend the realm. I swore to follow the king. I did not swear to descend into the Server Halls and fight a man whose CV is older than the kingdom. But here we are. The king is on PTO. The realm is a crashed VM. A sword is a sword." }
+    )
+}
+
 function New-RandomLoot {
     param([int]$Tier)
     $types = @("Rusty Dagger","Old Ring","Gem Shard","Goblin Ear","Bone Fragment",
@@ -1125,8 +1345,10 @@ function New-Enemy {
         "Troll"    {@{HP=72;ATK=16;DEF=10;SPD=6; MAG=3; XP=50; G=Get-Random -Min 12 -Max 33}}
         "Skeleton" {@{HP=46;ATK=13;DEF=7; SPD=9; MAG=4; XP=36; G=Get-Random -Min 10 -Max 33}}
     }
-    # Per-level scale: was 0.30, bumped to 0.32 — modest mid-game ramp.
-    $s = 1+($Lvl-1)*0.32
+    # Per-level scale: was 0.32 in v1.3, softened to 0.28 in v1.4 — players
+    # were getting walled at mid dungeons. Combat math still rewards higher
+    # depth runs, just with a gentler curve.
+    $s = 1+($Lvl-1)*0.28
     # Build ability list with cooldowns. Type-specific abilities now include
     # heals or self-buffs at higher levels for variety.
     $abilities = @(
@@ -1167,11 +1389,39 @@ function New-Enemy {
             $abilities += @{Name="Bite"; Power=4; Type="Physical"; Cooldown=2}
         }
     }
-    @{ Name="$Type";DisplayName="$Type (Lv$Lvl)";HP=[math]::Floor($b.HP*$s);MaxHP=[math]::Floor($b.HP*$s)
-       ATK=[math]::Floor($b.ATK*$s);DEF=[math]::Floor($b.DEF*$s);SPD=[math]::Floor($b.SPD*$s)
-       MAG=[math]::Floor($b.MAG*$s);XP=[math]::Floor($b.XP*$s);Gold=$b.G
+    # ── Procedural variants (v1.5) ──
+    # Each enemy spawn has a 22% chance to roll a variant — a flavor name
+    # plus a small stat-tweak profile. Variants don't change abilities or
+    # XP value; they just nudge the feel of each fight. The Bestiary
+    # tracks kills per (Type, Variant) combo so completionists can hunt
+    # them down.
+    $variantName = ""
+    $variant = $null
+    if((Get-Random -Max 100) -lt 22){
+        $variants = @(
+            @{Name="Frenzied"; AtkMul=1.30; DefMul=0.75; HpMul=1.00; SpdMul=1.10; Color="Red"   }
+            @{Name="Armored";  AtkMul=0.85; DefMul=1.50; HpMul=1.10; SpdMul=0.90; Color="DarkGray"}
+            @{Name="Hulking";  AtkMul=1.10; DefMul=1.00; HpMul=1.40; SpdMul=0.80; Color="DarkYellow"}
+            @{Name="Swift";    AtkMul=0.95; DefMul=0.80; HpMul=0.85; SpdMul=1.50; Color="Cyan"  }
+            @{Name="Sickly";   AtkMul=0.80; DefMul=0.80; HpMul=0.70; SpdMul=0.95; Color="DarkGreen"}
+            @{Name="Brutal";   AtkMul=1.20; DefMul=0.95; HpMul=1.05; SpdMul=1.00; Color="Magenta"}
+        )
+        $variant = $variants | Get-Random
+        $variantName = $variant.Name
+    }
+    $hpFinal  = [math]::Max([math]::Floor($b.HP * $s * $(if($variant){$variant.HpMul}else{1.0})), 1)
+    $atkFinal = [math]::Max([math]::Floor($b.ATK * $s * $(if($variant){$variant.AtkMul}else{1.0})), 1)
+    $defFinal = [math]::Max([math]::Floor($b.DEF * $s * $(if($variant){$variant.DefMul}else{1.0})), 0)
+    $spdFinal = [math]::Max([math]::Floor($b.SPD * $s * $(if($variant){$variant.SpdMul}else{1.0})), 1)
+    $magFinal = [math]::Max([math]::Floor($b.MAG * $s), 0)
+    $displayName = if($variantName){"$variantName $Type (Lv$Lvl)"}else{"$Type (Lv$Lvl)"}
+
+    @{ Name="$Type";DisplayName=$displayName;HP=$hpFinal;MaxHP=$hpFinal
+       ATK=$atkFinal;DEF=$defFinal;SPD=$spdFinal
+       MAG=$magFinal;XP=[math]::Floor($b.XP*$s);Gold=$b.G
        IsBoss=$false;IsMiniBoss=$false;Loot=(New-RandomLoot $Lvl);Stunned=$false;DropsKey=$false
        Abilities=$abilities
+       Variant=$variantName
     }
 }
 
@@ -1225,8 +1475,9 @@ function New-MiniBoss {
     $names=@("Shadow Knight","Dark Shaman","Iron Golem","Venom Queen","Flame Warden","Bone Colossus","Frost Wyrm","Void Sentinel")
     $n=$names|Get-Random
     # Mini-boss base stats: slightly bumped in v1.4 so they remain a
-    # threat as the player gears up. Scale rate also nudged.
-    $s = 1 + ($Lvl - 1) * 0.32
+    # threat as the player gears up. Scale rate softened from 0.32 to 0.28
+    # to match normal enemies and prevent mid-game walls.
+    $s = 1 + ($Lvl - 1) * 0.28
     # Equipment drops: 30% weapon, 30% armor (independent rolls). Tier scales with level.
     $weaponDrop = $null; $armorDrop = $null
     if((Get-Random -Max 100) -lt 30){
@@ -1263,9 +1514,10 @@ function New-Boss {
     # Boss tuning v1.4: substantially toned down. Was overtuned at high
     # player levels — combined with player-gear contribution at fight
     # start, bosses were dealing one-shot damage and had bullet-sponge HP.
-    # Reduced base HP/ATK and softened scaling.
-    $hpScale  = 1 + ($Lvl - 1) * 0.28
-    $atkScale = 1 + ($Lvl - 1) * 0.24
+    # Reduced base HP/ATK and softened scaling. v1.4 follow-up: scaling
+    # softened further (0.28->0.24 HP, 0.24->0.20 ATK) after play feedback.
+    $hpScale  = 1 + ($Lvl - 1) * 0.24
+    $atkScale = 1 + ($Lvl - 1) * 0.20
     # Boss drops: 50% weapon, 50% armor — bigger tier range
     $weaponDrop = $null; $armorDrop = $null
     if((Get-Random -Max 100) -lt 50){
@@ -1761,6 +2013,11 @@ function Render-Screen {
         $d.Seen = New-Object 'bool[,]' $d.H, $d.W
     }
     $sightR = 3   # reveal a 7x7 area around the player each render
+    # Falcon pet: expands the per-step fog reveal radius from 3 to 5,
+    # giving the player better situational awareness on the minimap.
+    if($script:Pet -and $script:Pet.Type -eq "Falcon"){
+        $sightR = 5
+    }
     for($dy=-$sightR;$dy -le $sightR;$dy++){
         for($dx=-$sightR;$dx -le $sightR;$dx++){
             $mx = $d.PX + $dx; $my = $d.PY + $dy
@@ -1773,6 +2030,9 @@ function Render-Screen {
     # ── Build minimap lines: windowed view centered on player, with fog ──
     # 11x21 window keeps the right panel within the 3D viewport's 24 rows.
     $dirChar = switch($d.PDir){0{'^'}1{'>'}2{'v'}3{'<'}}
+    # Hound pet: chest cells inside the minimap window are always visible
+    # even through fog, helping the player spot loot from a distance.
+    $houndOwned = ($script:Pet -and $script:Pet.Type -eq "Hound")
     $mapLines = [System.Collections.ArrayList]@()
     [void]$mapLines.Add("  MAP ")
     $mapR = 5    # half-radius (window is (2R+1) tall)
@@ -1787,7 +2047,12 @@ function Render-Screen {
             } elseif($mx -eq $d.PX -and $my -eq $d.PY){
                 $ml += $dirChar
             } elseif(-not $d.Seen[$my, $mx]){
-                $ml += "·"  # fog
+                # Hound: chest cells visible through fog so player can plan routes
+                if($houndOwned -and $d.Grid[$my, $mx] -eq 6){
+                    $ml += "$"
+                } else {
+                    $ml += "·"  # fog
+                }
             } else {
                 $c = $d.Grid[$my, $mx]
                 $ml += switch($c){1{"#"} 0{"."} 2{"!"} 3{"M"} 4{"B"} 5{">"} 6{"$"} 7{"?"} default{" "}}
@@ -1829,6 +2094,10 @@ function Render-Screen {
     # indicator. Streak is still tracked and shown on the stats page.
     if($script:HasBossKey){ $hudLines += " >> BOSS KEY <<" }
     if($script:Partner){ $hudLines += " Ally: $($script:Partner.Name)" }
+    if($script:Pet){ $hudLines += " Pet: $($script:Pet.Type)" }
+    if($script:DungeonMutator){ $hudLines += " Mut: $($script:DungeonMutator.Name)" }
+    if($script:ActiveFoodBuff){ $hudLines += " Food: $($script:ActiveFoodBuff.Name)" }
+    if($script:NGPlusLevel -gt 0){ $hudLines += " NG+$($script:NGPlusLevel)" }
     # Active quests are no longer shown inline. Press [J] in dungeon to view
     # the full quest log with progress bars.
 
@@ -2212,35 +2481,51 @@ function Start-Combat {
     $magBonus  = Get-WeaponMAGBonus
 
     # ── Player-gear contribution to enemy stats ──
-    # The user's gear shouldn't trivialize content. Each enemy gets a small
-    # ATK/DEF bump based on the player's CURRENT gear bonuses, scaled by
-    # role: stronger contribution for normals/minis (they're the "filler"
-    # that needs to keep up), reduced for bosses (already powerful, just
-    # toned down). This runs ONCE per fight at the start, so swapping gear
-    # mid-dungeon doesn't make trash enemies suddenly tougher.
+    # The user's gear shouldn't trivialize content, but the contribution is
+    # also intentionally MILD so the player can still feel the benefit of
+    # better gear. Training point boosts (ATK/DEF/SPD/MAG/HP/MP from the
+    # Training Grounds) are NOT factored in — those are the player's reward
+    # for spending gold and should give a real combat advantage.
+    # Locked at fight start so swapping gear mid-dungeon doesn't matter.
     $gearAtk = $bonusATK + $magBonus
     $gearDef = $armorDEF
     if($e.IsBoss){
-        $bossAtkBump = [math]::Floor($gearAtk * 0.20)
-        $bossDefBump = [math]::Floor($gearDef * 0.20)
+        # Bosses are already strong from base stats + level scaling. Light gear bump.
+        $bossAtkBump = [math]::Floor($gearAtk * 0.12)
+        $bossDefBump = [math]::Floor($gearDef * 0.12)
         $e.ATK += $bossAtkBump
         $e.DEF += $bossDefBump
     } elseif($e.IsMiniBoss){
-        $miniAtkBump = [math]::Floor($gearAtk * 0.30)
-        $miniDefBump = [math]::Floor($gearDef * 0.30)
+        $miniAtkBump = [math]::Floor($gearAtk * 0.18)
+        $miniDefBump = [math]::Floor($gearDef * 0.18)
         $e.ATK += $miniAtkBump
         $e.DEF += $miniDefBump
         # Mini-bosses get a small HP bump scaled to player's gear too
-        $e.MaxHP += [math]::Floor($gearAtk * 0.6)
-        $e.HP    += [math]::Floor($gearAtk * 0.6)
+        $e.MaxHP += [math]::Floor($gearAtk * 0.4)
+        $e.HP    += [math]::Floor($gearAtk * 0.4)
     } else {
-        $normAtkBump = [math]::Floor($gearAtk * 0.30)
-        $normDefBump = [math]::Floor($gearDef * 0.30)
+        $normAtkBump = [math]::Floor($gearAtk * 0.18)
+        $normDefBump = [math]::Floor($gearDef * 0.18)
         $e.ATK += $normAtkBump
         $e.DEF += $normDefBump
         # Normals get a tiny HP bump so they don't die in 1 shot to a high-ATK player
-        $e.MaxHP += [math]::Floor($gearAtk * 0.35)
-        $e.HP    += [math]::Floor($gearAtk * 0.35)
+        $e.MaxHP += [math]::Floor($gearAtk * 0.20)
+        $e.HP    += [math]::Floor($gearAtk * 0.20)
+    }
+
+    # ── Mutator-driven stat overlays ──
+    if(Has-Mutator "Speedrun"){
+        # Enemies +25% SPD on this run
+        $e.SPD = [math]::Floor($e.SPD * 1.25)
+    }
+    # ── New Game Plus scaling ──
+    # Each NG+ level multiplies enemy HP and ATK by an additional 20%.
+    # Stacks multiplicatively on top of the existing dungeon scaling.
+    if($script:NGPlusLevel -gt 0){
+        $ngMul = 1.0 + ($script:NGPlusLevel * 0.20)
+        $e.HP    = [math]::Floor($e.HP * $ngMul)
+        $e.MaxHP = [math]::Floor($e.MaxHP * $ngMul)
+        $e.ATK   = [math]::Floor($e.ATK * $ngMul)
     }
 
     $defBuff   = 0; $atkBuff = 0
@@ -2258,6 +2543,28 @@ function Start-Combat {
     $enemyBuffTurns   = 0
     $combatLog = [System.Collections.ArrayList]@()
 
+    # ── Start-of-fight talent procs ──
+    # Knight Holy Vigil: heal 5 HP at start of every fight.
+    if(Has-Talent "Knight_T2_C"){
+        $heal = [math]::Min(5, $script:Player.MaxHP - $script:Player.HP)
+        if($heal -gt 0){
+            $script:Player.HP += $heal
+            [void]$combatLog.Add(@{Text=">> Holy Vigil grants $heal HP.";Color="Green"})
+        }
+    }
+    # Ranger Quickdraw: first attack of the fight is a guaranteed crit.
+    # Cleared after first hit lands.
+    $quickdrawArmed = (Has-Talent "Ranger_T2_C")
+    # Berserker Reckless Charge: first attack deals +50%.
+    $recklessChargeArmed = (Has-Talent "Berserker_T2_C")
+    # Knight Last Stand / Cleric Resurrection / Berserker Final Stand:
+    # one-time per dungeon proc flags. Cleared on dungeon entry, not here.
+    # (See Enter-Dungeon for the per-run reset.)
+    # Cleric Lay on Hands: one free full heal per dungeon (used flag).
+    # Necromancer Death Pact / Berserker Rampage: stacking ATK buffs from
+    # killing blows. Stacks max at 5 / 3 respectively, decay each turn.
+    $rampageStacks  = 0
+    $deathPactStacks = 0
     # Status effects on enemy (local to this fight)
     $ePoisoned  = $false
     $eSlowed    = $false
@@ -2285,7 +2592,13 @@ function Start-Combat {
     function Get-PlayerCrit {
         param($spd, $luckBonus)
         $c = 5 + [math]::Floor($spd / 4) + $luckBonus
-        if($c -gt 60){ $c = 60 }
+        # Ranger Eagle Eye: +5% crit
+        if(Has-Talent "Ranger_T1_A"){ $c += 5 }
+        # Brawler Berserk: +40% crit when below 25% HP
+        if(Has-Talent "Brawler_T3_A" -and $script:Player.HP -lt ($script:Player.MaxHP * 0.25)){
+            $c += 40
+        }
+        if($c -gt 95){ $c = 95 }
         if($c -lt 0){ $c = 0 }
         return $c
     }
@@ -2482,9 +2795,31 @@ function Start-Combat {
         # ── Player stats (with stance applied) ──
         $stanceATK = Get-StanceATKMult
         $stanceDEF = Get-StanceDEFMult
-        $totalDEF = [int][math]::Floor(($p.DEF + $armorDEF + $defBuff) * $stanceDEF)
-        $totalATK = [int][math]::Floor(($p.ATK + $bonusATK + $atkBuff) * $stanceATK)
-        $totalMAG = [int][math]::Floor(($p.MAG + $magBonus) * $stanceATK)  # MAG scales with ATK multiplier
+        # Cooking food buffs: ATKBoost adds flat ATK; DEFBoost adds flat DEF.
+        # Applied BEFORE stance multiplier so it scales with stance.
+        $foodATK = 0; $foodDEF = 0
+        if($script:ActiveFoodBuff){
+            switch($script:ActiveFoodBuff.Effect){
+                "ATKBoost" { $foodATK = [int]$script:ActiveFoodBuff.Value }
+                "DEFBoost" { $foodDEF = [int]$script:ActiveFoodBuff.Value }
+            }
+        }
+        # Talent stat bonuses (passive, always-on flat stats)
+        $talATK = Get-TalentStatBonus "ATK"
+        $talDEF = Get-TalentStatBonus "DEF"
+        $talMAG = Get-TalentStatBonus "MAG"
+        # Class-specific weapon-type bonuses (e.g. Sword Discipline)
+        $wepBonus = 0
+        if($script:EquippedWeapon){
+            $wt = $script:EquippedWeapon.WeaponType
+            if(Has-Talent "Knight_T1_C"   -and $wt -eq "Sword"){ $wepBonus += 2 }
+            if(Has-Talent "Berserker_T1_C" -and $wt -eq "Sword"){ $wepBonus += 3 }
+            if(Has-Talent "Cleric_T1_C"   -and $wt -eq "Mace"){  $wepBonus += 2 }
+            if(Has-Talent "Brawler_T1_B"  -and $wt -eq "Fist"){  $wepBonus += 3 }
+        }
+        $totalDEF = [int][math]::Floor(($p.DEF + $armorDEF + $defBuff + $foodDEF + $talDEF) * $stanceDEF)
+        $totalATK = [int][math]::Floor(($p.ATK + $bonusATK + $atkBuff + $foodATK + $talATK + $wepBonus) * $stanceATK)
+        $totalMAG = [int][math]::Floor(($p.MAG + $magBonus + $talMAG) * $stanceATK)  # MAG scales with ATK multiplier
         $pHPPct = [math]::Max($p.HP / $p.MaxHP, 0)
         $wep = if($script:EquippedWeapon){$script:EquippedWeapon.Name}else{"Bare Hands"}
 
@@ -2520,6 +2855,16 @@ function Start-Combat {
         $throwCount = $script:ThrowablePotions.Count
         $defLabel = if($defendCooldown -gt 0){"Defend(${defendCooldown}t)"}else{"Defend"}
         Write-CL "   [1] Attack  [2] Ability  [3] Potion  [4] Throw($throwCount)  [5] $defLabel  [6] Flee" "White"
+        $extraOptions = @()
+        if(Has-Talent "Cleric_T3_B" -and -not $script:LayOnHandsUsed){
+            $extraOptions += "[L] Lay on Hands"
+        }
+        if(Has-Talent "Warlock_T2_B"){
+            $extraOptions += "[O] Soul Tap"
+        }
+        if($extraOptions.Count -gt 0){
+            Write-CL ("   " + ($extraOptions -join "  ")) "Magenta"
+        }
         Write-CL "   [T] Stance (free action)" "DarkCyan"
         Write-CL ("  " + "-" * 66) "DarkGray"
         Write-C "  > " "Yellow"
@@ -2527,22 +2872,115 @@ function Start-Combat {
 
         $acted = $true
         $playerDefending = $false
+        # Track enemy HP before this action so on-kill talents can know the
+        # pre-strike HP for threshold checks (e.g., Eternal Bargain).
+        $script:LastEnemyHpBeforeAction = [int]$e.HP
 
         switch($choice){
             "1" {
-                if((Get-Random -Max 100) -ge $playerHitChance){
+                # Necromancer Reaper: enemies below 25% HP are killed
+                # automatically by basic attack. Skips hit roll, perks,
+                # crits, and all damage math.
+                if(Has-Talent "Necromancer_T3_C" -and $e.HP -le ($e.MaxHP * 0.25) -and $e.HP -gt 0){
+                    [void]$combatLog.Add(@{Text=">> REAPER. Their thread is harvested.";Color="DarkMagenta"})
+                    $script:RunStats.DamageDealt += $e.HP
+                    $e.HP = 0
+                }
+                elseif((Get-Random -Max 100) -ge $playerHitChance){
                     [void]$combatLog.Add(@{Text=">> You attack but MISS!";Color="DarkGray"})
                 } else {
                     $raw = $totalATK - [math]::Floor($e.DEF * 0.5)
                     $playerDmg = [math]::Max($raw + (Get-Random -Min -2 -Max 4), 1)
-                    # Crit roll: 2x damage if it lands
+                    # Glass Cannon mutator: +50% damage dealt
+                    if(Has-Mutator "GlassCannon"){
+                        $playerDmg = [math]::Floor($playerDmg * 1.5)
+                    }
+                    # ── Talent damage modifiers (apply BEFORE crit doubling) ──
+                    if($e.IsBoss -and (Has-Talent "Knight_T3_A")){
+                        $playerDmg = [math]::Floor($playerDmg * 1.25)
+                    }
+                    if(Has-Talent "Ranger_T2_A" -and ($e.HP -ge ($e.MaxHP * 0.75))){
+                        $playerDmg = [math]::Floor($playerDmg * 1.15)
+                    }
+                    if(Has-Talent "Brawler_T2_A" -and $script:Player.HP -lt ($script:Player.MaxHP * 0.50)){
+                        $playerDmg = [math]::Floor($playerDmg * 1.20)
+                    }
+                    if(Has-Talent "Berserker_T2_A" -and $script:Player.HP -lt ($script:Player.MaxHP * 0.40)){
+                        $playerDmg = [math]::Floor($playerDmg * 1.30)
+                    }
+                    # Weapon-type +% mastery talents
+                    if($script:EquippedWeapon){
+                        $wt = $script:EquippedWeapon.WeaponType
+                        if(Has-Talent "Mage_T1_C"        -and $wt -eq "Staff"){  $playerDmg = [math]::Floor($playerDmg * 1.10) }
+                        if(Has-Talent "Warlock_T1_C"     -and $wt -eq "Staff"){  $playerDmg = [math]::Floor($playerDmg * 1.10) }
+                        if(Has-Talent "Ranger_T1_C"      -and $wt -eq "Bow"){    $playerDmg = [math]::Floor($playerDmg * 1.10) }
+                        if(Has-Talent "Necromancer_T1_C" -and $wt -eq "Scythe"){ $playerDmg = [math]::Floor($playerDmg * 1.10) }
+                    }
+                    # Cleric Smiter: +25% to undead enemy types
+                    if(Has-Talent "Cleric_T2_B" -and ($e.Name -eq "Skeleton" -or $e.Name -eq "Zombie")){
+                        $playerDmg = [math]::Floor($playerDmg * 1.25)
+                    }
+                    # Berserker Reckless Charge: first attack +50%
+                    if($recklessChargeArmed){
+                        $playerDmg = [math]::Floor($playerDmg * 1.50)
+                    }
+                    # Necromancer Lich's Pact: +30% damage (HP penalty already
+                    # applied at purchase). Note: T3_A already used for Lich
+                    # in our talent table for Necromancer.
+                    if(Has-Talent "Necromancer_T3_A"){
+                        $playerDmg = [math]::Floor($playerDmg * 1.30)
+                    }
+                    # Stacking ATK buffs from kills: each stack = +5 flat
+                    # damage, applied as a multiplier-equivalent boost.
+                    if($rampageStacks -gt 0){
+                        $playerDmg += (5 * $rampageStacks)
+                    }
+                    if($deathPactStacks -gt 0){
+                        $bump = [math]::Floor($playerDmg * (0.05 * $deathPactStacks))
+                        $playerDmg += $bump
+                    }
+                    # Crit roll: 2x damage if it lands. Quickdraw forces crit
+                    # on the first attack of the fight if owned.
                     $isCrit = ((Get-Random -Max 100) -lt $playerCritChance)
-                    if($isCrit){ $playerDmg *= 2 }
+                    if($quickdrawArmed){
+                        $isCrit = $true
+                        $quickdrawArmed = $false
+                    }
+                    # Reckless Charge consumed on first hit
+                    $recklessChargeArmed = $false
+                    if($isCrit){
+                        # Ranger Deadshot: crits deal 3x instead of 2x
+                        if(Has-Talent "Ranger_T3_A"){ $playerDmg *= 3 }
+                        else { $playerDmg *= 2 }
+                    }
                     Show-AttackAnim $animType $playerDmg "Yellow"
                     $e.HP -= $playerDmg
+                    $script:RunStats.DamageDealt += $playerDmg
                     if($isCrit){
                         [void]$combatLog.Add(@{Text=">> CRITICAL HIT! $playerDmg damage!";Color="Yellow"})
-                        Update-QuestProgress "Crit"; $script:TotalCrits++
+                        Update-QuestProgress "Crit"; $script:TotalCrits++; $script:RunStats.CritsThisRun++
+                        # ── On-crit talent procs ──
+                        # Brawler Combo Strike: heal 8 HP
+                        if(Has-Talent "Brawler_T2_C"){
+                            $heal = [math]::Min(8, $script:Player.MaxHP - $script:Player.HP)
+                            if($heal -gt 0){
+                                $script:Player.HP += $heal
+                                [void]$combatLog.Add(@{Text="   Combo Strike: +$heal HP";Color="Green"})
+                            }
+                        }
+                        # Mage Mana Surge: restore 10 MP
+                        if(Has-Talent "Mage_T3_B"){
+                            $manaR = [math]::Min(10, $script:Player.MaxMP - $script:Player.MP)
+                            if($manaR -gt 0){
+                                $script:Player.MP += $manaR
+                                [void]$combatLog.Add(@{Text="   Mana Surge: +$manaR MP";Color="Cyan"})
+                            }
+                        }
+                        # Brawler Knockout: 30% chance to stun on crit
+                        if(Has-Talent "Brawler_T3_C" -and (Get-Random -Max 100) -lt 30){
+                            $e.Stunned = $true
+                            [void]$combatLog.Add(@{Text="   KNOCKOUT! Enemy is stunned!";Color="Yellow"})
+                        }
                     } else {
                         [void]$combatLog.Add(@{Text=">> You attack for $playerDmg damage!";Color="Green"})
                     }
@@ -2557,17 +2995,39 @@ function Start-Combat {
                         }
                     }
 
-                    # Weapon perk proc
+                    # Ranger Multishot: 20% chance to attack a second time.
+                    # Half damage, no perk procs, no durability loss to keep
+                    # the proc cheap and the combat log readable.
+                    if(Has-Talent "Ranger_T3_B" -and (Get-Random -Max 100) -lt 20 -and $e.HP -gt 0){
+                        $extraDmg = [math]::Max([math]::Floor($playerDmg * 0.5), 1)
+                        $e.HP -= $extraDmg
+                        $script:RunStats.DamageDealt += $extraDmg
+                        [void]$combatLog.Add(@{Text="   Multishot! Second arrow flies for $extraDmg.";Color="Green"})
+                    }
+
+                    # Weapon perk proc. Some talents bump the perk chance
+                    # (Toxic Tips, Hexweave) — apply those before the roll.
                     if($script:EquippedWeapon -and $script:EquippedWeapon.Perk){
-                        if((Get-Random -Max 100) -lt $script:EquippedWeapon.PerkChance){
+                        $perkChance = [int]$script:EquippedWeapon.PerkChance
+                        if(Has-Talent "Ranger_T2_B" -and $script:EquippedWeapon.Perk -eq "Poison"){
+                            $perkChance = [math]::Floor($perkChance * 1.25)
+                        }
+                        if(Has-Talent "Warlock_T2_A" -and $script:EquippedWeapon.Perk -eq "Drain"){
+                            $perkChance = [math]::Floor($perkChance * 1.25)
+                        }
+                        if((Get-Random -Max 100) -lt $perkChance){
                             switch($script:EquippedWeapon.Perk){
                                 "Bleed" {
                                     $bleedDmg = Get-Random -Min 3 -Max 9
+                                    # Berserker Bleed Mastery: doubled
+                                    if(Has-Talent "Berserker_T2_B"){ $bleedDmg *= 2 }
                                     $e.HP -= $bleedDmg
                                     [void]$combatLog.Add(@{Text="   BLEED! $bleedDmg extra damage!";Color="DarkRed"})
                                 }
                                 "Burn" {
                                     $burnDmg = Get-Random -Min 3 -Max 8
+                                    # Mage Burnsight: doubled
+                                    if(Has-Talent "Mage_T2_C"){ $burnDmg *= 2 }
                                     $e.HP -= $burnDmg
                                     [void]$combatLog.Add(@{Text="   BURN! $burnDmg extra damage!";Color="DarkYellow"})
                                 }
@@ -2578,6 +3038,8 @@ function Start-Combat {
                                 }
                                 "Drain" {
                                     $drainAmt = [math]::Floor($playerDmg * 0.25)
+                                    # Necromancer Drain Mastery: heal doubled
+                                    if(Has-Talent "Necromancer_T2_A"){ $drainAmt *= 2 }
                                     $p.HP = [math]::Min($p.HP + $drainAmt, $p.MaxHP)
                                     [void]$combatLog.Add(@{Text="   DRAIN! Restored $drainAmt HP!";Color="Magenta"})
                                 }
@@ -2649,6 +3111,8 @@ function Start-Combat {
                         # decrements at end of turn, so a Cooldown=2 ability skips
                         # the next 2 turns then is ready again.
                         $cdVal = if($p.Abilities[$idx].Cooldown){[int]$p.Abilities[$idx].Cooldown}else{2}
+                        # Mage Time Slip: ability cooldowns -1 turn (min 1)
+                        if(Has-Talent "Mage_T3_C"){ $cdVal = [math]::Max($cdVal - 1, 1) }
                         $abilityCooldowns[$ab.Name] = $cdVal
 
                         if($ab.Type -eq "Buff"){
@@ -2687,17 +3151,75 @@ function Start-Combat {
                                 $base = [int][math]::Floor($base * (Get-StanceATKMult))
                                 $raw = $base + $ab.Power - [math]::Floor($e.DEF * 0.4)
                                 $playerDmg = [math]::Max($raw + (Get-Random -Min -2 -Max 5), 1)
-                                # Crit roll on abilities too
+                                # Glass Cannon mutator: +50% ability damage
+                                if(Has-Mutator "GlassCannon"){
+                                    $playerDmg = [math]::Floor($playerDmg * 1.5)
+                                }
+                                # Crit roll on abilities too. Quickdraw/Reckless apply too.
                                 $isCrit = ((Get-Random -Max 100) -lt $playerCritChance)
-                                if($isCrit){ $playerDmg *= 2 }
+                                if($quickdrawArmed){ $isCrit = $true; $quickdrawArmed = $false }
+                                if($recklessChargeArmed){
+                                    $playerDmg = [math]::Floor($playerDmg * 1.50)
+                                    $recklessChargeArmed = $false
+                                }
+                                # Necromancer Lich's Pact: +30% damage
+                                if(Has-Talent "Necromancer_T3_A"){
+                                    $playerDmg = [math]::Floor($playerDmg * 1.30)
+                                }
+                                # Mage Archmage: +30% damage on Magic abilities
+                                if(Has-Talent "Mage_T3_A" -and $ab.Type -eq "Magic"){
+                                    $playerDmg = [math]::Floor($playerDmg * 1.30)
+                                }
+                                # Stacking buffs from kills
+                                if($rampageStacks -gt 0){ $playerDmg += (5 * $rampageStacks) }
+                                if($deathPactStacks -gt 0){
+                                    $playerDmg += [math]::Floor($playerDmg * (0.05 * $deathPactStacks))
+                                }
+                                if($isCrit){
+                                    if(Has-Talent "Ranger_T3_A"){ $playerDmg *= 3 }
+                                    else { $playerDmg *= 2 }
+                                }
                                 $abAnim = if($ab.Type -eq "Magic" -or $ab.Type -eq "Sacrifice"){"magic"}else{$animType}
                                 Show-AttackAnim $abAnim $playerDmg "Cyan"
                                 $e.HP -= $playerDmg
+                                $script:RunStats.DamageDealt += $playerDmg
                                 if($isCrit){
                                     [void]$combatLog.Add(@{Text=">> CRITICAL $($ab.Name) hits for $playerDmg!";Color="Yellow"})
-                                    Update-QuestProgress "Crit"; $script:TotalCrits++
+                                    Update-QuestProgress "Crit"; $script:TotalCrits++; $script:RunStats.CritsThisRun++
+                                    # On-crit talent procs (apply for ability crits too)
+                                    if(Has-Talent "Brawler_T2_C"){
+                                        $h = [math]::Min(8, $p.MaxHP - $p.HP)
+                                        if($h -gt 0){ $p.HP += $h; [void]$combatLog.Add(@{Text="   Combo Strike: +$h HP";Color="Green"}) }
+                                    }
+                                    if(Has-Talent "Mage_T3_B"){
+                                        $m = [math]::Min(10, $p.MaxMP - $p.MP)
+                                        if($m -gt 0){ $p.MP += $m; [void]$combatLog.Add(@{Text="   Mana Surge: +$m MP";Color="Cyan"}) }
+                                    }
+                                    if(Has-Talent "Brawler_T3_C" -and (Get-Random -Max 100) -lt 30){
+                                        $e.Stunned = $true
+                                        [void]$combatLog.Add(@{Text="   KNOCKOUT! Enemy is stunned!";Color="Yellow"})
+                                    }
                                 } else {
                                     [void]$combatLog.Add(@{Text=">> $($ab.Name) hits for $playerDmg!";Color="Cyan"})
+                                }
+
+                                # Mage Spell Echo: 15% chance for the ability
+                                # to refund its MP cost (applied AFTER spend).
+                                if(Has-Talent "Mage_T2_B" -and (Get-Random -Max 100) -lt 15 -and $ab.Cost -gt 0){
+                                    $refund = [math]::Min($ab.Cost, $p.MaxMP - $p.MP)
+                                    if($refund -gt 0){
+                                        $p.MP += $refund
+                                        [void]$combatLog.Add(@{Text="   Spell Echo: $refund MP refunded";Color="Cyan"})
+                                    }
+                                }
+                                # Warlock Soul Drain: ability damage heals for 30%.
+                                if(Has-Talent "Warlock_T3_B"){
+                                    $drain = [math]::Floor($playerDmg * 0.30)
+                                    $drain = [math]::Min($drain, $p.MaxHP - $p.HP)
+                                    if($drain -gt 0){
+                                        $p.HP += $drain
+                                        [void]$combatLog.Add(@{Text="   Soul Drain: +$drain HP";Color="DarkMagenta"})
+                                    }
                                 }
 
                                 # Weapon durability: ability hits also wear the weapon (counts for magic/physical)
@@ -2767,7 +3289,12 @@ function Start-Combat {
                             $pot = $script:Potions[$pidx]
                             switch($pot.Type){
                                 "Heal" {
-                                    $healed = [math]::Min($pot.Power, $p.MaxHP - $p.HP)
+                                    $power = [int]$pot.Power
+                                    # Cleric Healer's Touch: heal potions +30%
+                                    if(Has-Talent "Cleric_T2_A"){
+                                        $power = [math]::Floor($power * 1.30)
+                                    }
+                                    $healed = [math]::Min($power, $p.MaxHP - $p.HP)
                                     $p.HP += $healed
                                     [void]$combatLog.Add(@{Text=">> Healed for $healed HP!";Color="Green"})
                                 }
@@ -2795,6 +3322,8 @@ function Start-Combat {
                             }
                         }
                         $script:Potions.RemoveAt($pidx)
+                        $script:RunStats.PotionsUsed++
+                        $script:UsedPotionsThisDungeon = $true
                         } else { $acted = $false }
                 }
             }
@@ -2884,7 +3413,95 @@ function Start-Combat {
                 # Free action — does NOT cost a turn
                 $acted = $false
             }
+            "L" {
+                # Cleric Lay on Hands: full heal, once per dungeon. Costs
+                # the player's turn but full HP recovery is worth it.
+                if(-not (Has-Talent "Cleric_T3_B")){
+                    [void]$combatLog.Add(@{Text=">> You don't have that talent.";Color="DarkGray"})
+                    $acted = $false
+                } elseif($script:LayOnHandsUsed){
+                    [void]$combatLog.Add(@{Text=">> Lay on Hands already used this dungeon.";Color="DarkGray"})
+                    $acted = $false
+                } else {
+                    $heal = $p.MaxHP - $p.HP
+                    $p.HP = $p.MaxHP
+                    $script:LayOnHandsUsed = $true
+                    [void]$combatLog.Add(@{Text=">> LAY ON HANDS — restored $heal HP.";Color="Green"})
+                }
+            }
+            "O" {
+                # Warlock Soul Tap: spend 5 HP to deal +10 damage on this
+                # turn's basic attack. Sets a flag the basic attack reads.
+                if(-not (Has-Talent "Warlock_T2_B")){
+                    [void]$combatLog.Add(@{Text=">> You don't have that talent.";Color="DarkGray"})
+                    $acted = $false
+                } elseif($p.HP -le 5){
+                    [void]$combatLog.Add(@{Text=">> Not enough HP to Soul Tap (need >5).";Color="Red"})
+                    $acted = $false
+                } else {
+                    # Deduct HP, deal direct damage with hit roll
+                    $p.HP -= 5
+                    if((Get-Random -Max 100) -ge $playerHitChance){
+                        [void]$combatLog.Add(@{Text=">> Soul Tap MISSES! Lost 5 HP for nothing.";Color="DarkGray"})
+                    } else {
+                        $rawTap = $totalATK + 10 - [math]::Floor($e.DEF * 0.5)
+                        $tapDmg = [math]::Max($rawTap + (Get-Random -Min -2 -Max 4), 1)
+                        # Crit roll
+                        $tapCrit = ((Get-Random -Max 100) -lt $playerCritChance)
+                        if($tapCrit){
+                            if(Has-Talent "Ranger_T3_A"){ $tapDmg *= 3 } else { $tapDmg *= 2 }
+                        }
+                        $e.HP -= $tapDmg
+                        $script:RunStats.DamageDealt += $tapDmg
+                        if($tapCrit){
+                            [void]$combatLog.Add(@{Text=">> SOUL TAP CRIT! $tapDmg damage. (-5 HP)";Color="Yellow"})
+                        } else {
+                            [void]$combatLog.Add(@{Text=">> Soul Tap: $tapDmg damage. (-5 HP)";Color="DarkMagenta"})
+                        }
+                    }
+                }
+            }
             default { $acted = $false }
+        }
+
+        # ── On-kill talent procs ──
+        # Fired when the player's action this turn brought the enemy
+        # to 0 HP. We check just once before the poison tick so we don't
+        # double-fire on the same kill.
+        if($acted -and $e.HP -le 0){
+            # Berserker Rampage: +1 stack (max 3) — adds to $rampageStacks
+            # which the next basic/ability attack will read.
+            if(Has-Talent "Berserker_T3_A" -and $rampageStacks -lt 3){
+                $rampageStacks++
+                [void]$combatLog.Add(@{Text="   Rampage: stack $rampageStacks/3";Color="DarkRed"})
+            }
+            # Necromancer Death Pact: +1 stack (max 5)
+            if(Has-Talent "Necromancer_T3_B" -and $deathPactStacks -lt 5){
+                $deathPactStacks++
+                [void]$combatLog.Add(@{Text="   Death Pact: stack $deathPactStacks/5";Color="DarkMagenta"})
+            }
+            # Necromancer Soul Harvest: +5 MP per kill
+            if(Has-Talent "Necromancer_T2_C"){
+                $sM = [math]::Min(5, $p.MaxMP - $p.MP)
+                if($sM -gt 0){
+                    $p.MP += $sM
+                    [void]$combatLog.Add(@{Text="   Soul Harvest: +$sM MP";Color="Cyan"})
+                }
+            }
+            # Warlock Eternal Bargain: kill below 20% HP restores 25 HP / 15 MP.
+            # Approximation: any kill below the 20% threshold counts. Since the
+            # killing blow drives HP to or below 0 from some prior value, we use
+            # the fact that the enemy is now dead AND this kill happened. If the
+            # PRE-action HP was already below 20% MaxHP, Eternal Bargain procs.
+            if(Has-Talent "Warlock_T3_C" -and $script:LastEnemyHpBeforeAction -le ($e.MaxHP * 0.20)){
+                $eH = [math]::Min(25, $p.MaxHP - $p.HP)
+                $eM = [math]::Min(15, $p.MaxMP - $p.MP)
+                if($eH -gt 0){ $p.HP += $eH }
+                if($eM -gt 0){ $p.MP += $eM }
+                if($eH -gt 0 -or $eM -gt 0){
+                    [void]$combatLog.Add(@{Text="   Eternal Bargain: +$eH HP, +$eM MP";Color="DarkMagenta"})
+                }
+            }
         }
 
         # ── Poison tick on enemy (after player acts) ──
@@ -3009,15 +3626,80 @@ function Start-Combat {
                         }
                         # Enemy crit roll: 2x damage if it lands
                         $eIsCrit = ((Get-Random -Max 100) -lt $enemyCritChance)
-                        if($eIsCrit){ $eDmg *= 2 }
+                        if($eIsCrit){
+                            $eDmg *= 2
+                            # Brawler Iron Chin: -30% on crits taken
+                            if(Has-Talent "Brawler_T2_B"){
+                                $eDmg = [math]::Floor($eDmg * 0.70)
+                            }
+                        }
+                        # Glass Cannon mutator: +50% damage taken
+                        if(Has-Mutator "GlassCannon"){
+                            $eDmg = [math]::Floor($eDmg * 1.5)
+                        }
+                        # ── Talent damage reductions ──
+                        # Brawler Unbreakable: -15% always
+                        if(Has-Talent "Brawler_T3_B"){
+                            $eDmg = [math]::Floor($eDmg * 0.85)
+                        }
+                        # Necromancer Bone Shield: -10% always
+                        if(Has-Talent "Necromancer_T2_B"){
+                            $eDmg = [math]::Floor($eDmg * 0.90)
+                        }
+                        # Knight Stalwart: -15% when below 30% HP
+                        if(Has-Talent "Knight_T2_A" -and $p.HP -lt ($p.MaxHP * 0.30)){
+                            $eDmg = [math]::Floor($eDmg * 0.85)
+                        }
+                        # Knight Guardian: -10% when shield equipped
+                        if(Has-Talent "Knight_T3_C" -and $script:EquippedArmor.Shield){
+                            $eDmg = [math]::Floor($eDmg * 0.90)
+                        }
+                        # Mage Mana Shield: -20% if MP > 50%
+                        if(Has-Talent "Mage_T2_A" -and $p.MP -gt ($p.MaxMP * 0.50)){
+                            $eDmg = [math]::Floor($eDmg * 0.80)
+                        }
+                        # Cleric Divine Aegis: -20% from magic
+                        if(Has-Talent "Cleric_T3_A" -and $eAbility.Type -eq "Magic"){
+                            $eDmg = [math]::Floor($eDmg * 0.80)
+                        }
+                        # Warlock Fiendish Pact: -15% from physical
+                        if(Has-Talent "Warlock_T2_C" -and $eAbility.Type -eq "Physical"){
+                            $eDmg = [math]::Floor($eDmg * 0.85)
+                        }
+                        # Warlock Doompact: +25% damage taken (was applied as ATK boost in same tier)
+                        if(Has-Talent "Warlock_T3_A"){
+                            $eDmg = [math]::Floor($eDmg * 1.25)
+                        }
+                        # Ensure damage doesn't drop below 1
+                        if($eDmg -lt 1){ $eDmg = 1 }
                         Show-EnemyAttackAnim $eDmg
                         $p.HP -= $eDmg
+                        $script:RunStats.DamageTaken += $eDmg
+                        $script:TookDamageThisDungeon = $true
                         $aName = if($eAbility.Name -eq "Attack"){"attacks"}else{"uses $($eAbility.Name)"}
                         $defNote = if($playerDefending){" (defended!)"}else{""}
                         if($eIsCrit){
                             [void]$combatLog.Add(@{Text="<< CRITICAL! $($e.DisplayName) $aName for $eDmg!$defNote";Color="Red"})
                         } else {
                             [void]$combatLog.Add(@{Text="<< $($e.DisplayName) $aName for $eDmg!$defNote";Color="Red"})
+                        }
+                        # Knight Counter-Strike: 20% chance to retaliate after
+                        # taking a hit while defending. Damage is half of the
+                        # player's totalATK, no perks or crits.
+                        if($playerDefending -and (Has-Talent "Knight_T2_B") -and (Get-Random -Max 100) -lt 20 -and $e.HP -gt 0){
+                            $cDmg = [math]::Max([math]::Floor($totalATK * 0.5), 1)
+                            $e.HP -= $cDmg
+                            $script:RunStats.DamageDealt += $cDmg
+                            [void]$combatLog.Add(@{Text=">> Counter-Strike! You retaliate for $cDmg!";Color="Yellow"})
+                        }
+                        # Berserker Pain Tolerance: 25% of damage taken
+                        # converts to a 1-turn ATK buff.
+                        if(Has-Talent "Berserker_T3_B" -and $eDmg -gt 0){
+                            $bumpAmt = [math]::Floor($eDmg * 0.25)
+                            if($bumpAmt -gt 0){
+                                $atkBuff += $bumpAmt
+                                [void]$combatLog.Add(@{Text="   Pain Tolerance: +$bumpAmt ATK next turn";Color="DarkRed"})
+                            }
                         }
 
                         # Armor durability: 50% chance a random equipped piece loses 1
@@ -3106,12 +3788,73 @@ function Start-Combat {
 
     # ── Outcome ──
     if($p.HP -le 0){
-        $p.HP = 0
-        # Streak reset
-        $script:Streak = 0
-        # Clear luck
-        $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
-        return @{Result="Death"}
+        # Knight Last Stand: survive lethal damage with 1 HP, once per dungeon.
+        if(Has-Talent "Knight_T3_B" -and -not $script:LastStandUsed){
+            $p.HP = 1
+            $script:LastStandUsed = $true
+            [void]$combatLog.Add(@{Text=">> LAST STAND! You refuse to fall — 1 HP remains.";Color="Yellow"})
+            # Render one more frame so the player can see the message and react.
+            # Re-loop by NOT returning Death; fall through to victory-or-continue
+            # check. Since combat ended via the loop break, we conservatively
+            # treat this as a Won outcome only if enemy is also dead; otherwise
+            # the loop has already exited and we have to return.
+            if($e.HP -le 0){
+                # Enemy also died this turn — go to victory.
+            } else {
+                # Player saved but the combat loop already exited. Return as
+                # if fleeing so the player keeps their gear and goes back to
+                # the dungeon at 1 HP.
+                $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
+                return @{Result="Fled"}
+            }
+        }
+        # Cleric Resurrection: revive at 50% HP, once per dungeon.
+        elseif(Has-Talent "Cleric_T3_C" -and -not $script:ResurrectionUsed){
+            $p.HP = [math]::Floor($p.MaxHP * 0.50)
+            $script:ResurrectionUsed = $true
+            [void]$combatLog.Add(@{Text=">> RESURRECTION! Divine light restores you to half HP.";Color="Cyan"})
+            if($e.HP -le 0){
+                # Enemy also died — victory.
+            } else {
+                $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
+                return @{Result="Fled"}
+            }
+        }
+        # Berserker Final Stand: at 1 HP grants +50% all stats for the
+        # rest of the dungeon, once per dungeon. We store the per-stat
+        # deltas in $script:FinalStandBuffs so Reset-MutatorOnEnd can
+        # revert them at dungeon end. Without this, the +50% would
+        # compound permanently each dungeon (exponential stat growth).
+        elseif(Has-Talent "Berserker_T3_C" -and -not $script:FinalStandUsed){
+            $p.HP = 1
+            $script:FinalStandUsed = $true
+            $atkDelta = [math]::Floor($p.ATK * 0.5)
+            $defDelta = [math]::Floor($p.DEF * 0.5)
+            $spdDelta = [math]::Floor($p.SPD * 0.5)
+            $magDelta = [math]::Floor($p.MAG * 0.5)
+            $p.ATK += $atkDelta
+            $p.DEF += $defDelta
+            $p.SPD += $spdDelta
+            $p.MAG += $magDelta
+            $script:FinalStandBuffs = @{
+                ATK = $atkDelta; DEF = $defDelta; SPD = $spdDelta; MAG = $magDelta
+            }
+            [void]$combatLog.Add(@{Text=">> FINAL STAND! +50% all stats. You will not yield.";Color="Red"})
+            if($e.HP -le 0){
+                # Continue to victory
+            } else {
+                $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
+                return @{Result="Fled"}
+            }
+        }
+        else {
+            $p.HP = 0
+            # Streak reset
+            $script:Streak = 0
+            # Clear luck
+            $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
+            return @{Result="Death"}
+        }
     }
     if($fled){
         $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
@@ -3121,6 +3864,7 @@ function Start-Combat {
     # ── Victory ──
     $script:KillCount++
     $script:TotalKills++
+    $script:RunStats.KillsThisRun++
     Update-QuestProgress "Kill"
     if($e.IsMiniBoss){ Update-QuestProgress "MiniBoss" }
     if($e.IsBoss){
@@ -3131,6 +3875,27 @@ function Start-Combat {
     if(-not $script:EquippedWeapon){
         Update-QuestProgress "BareHands"; $script:TotalBareKills++
     }
+    # Bestiary tracking: increment per (enemy name, variant) combo. Boss/mini
+    # are tracked as their own rows. New combos return $true so we can show
+    # "First time defeated!" splash later.
+    # Bestiary key format: "Category~Name" or "Name~Variant".
+    # We use '~' as the field-internal separator because the save format
+    # uses '|' as its top-level field separator AND ';' / ':' to encode
+    # the bestiary itself. Picking a character that doesn't appear in any
+    # enemy name OR in the save grammar lets keys round-trip cleanly.
+    $bestKey = if($e.IsBoss){"Boss~$($e.Name)"}
+               elseif($e.IsMiniBoss){"MiniBoss~$($e.Name)"}
+               elseif($e.Variant){"$($e.Name)~$($e.Variant)"}
+               else{"$($e.Name)~"}
+    if(-not $script:Bestiary.ContainsKey($bestKey)){
+        $script:Bestiary[$bestKey] = @{ Kills = 0; FirstSeen = $true }
+    }
+    $script:Bestiary[$bestKey].Kills++
+
+    # Ingredient drops are now built into the post-victory loot pile
+    # (see "Build loot pile" below) so the player consciously takes them
+    # and sees what they got. The previous silent auto-add to
+    # $script:Ingredients was confusing — players never saw the drop.
 
     clr
     Write-CL ("=" * 70) "Green"
@@ -3165,8 +3930,30 @@ function Start-Combat {
         $xpBonus = [math]::Floor($e.XP * 0.25)
         $xpGain += $xpBonus
     }
+    # Cooking XPBoost: +X% XP from kills
+    if($script:ActiveFoodBuff -and $script:ActiveFoodBuff.Effect -eq "XPBoost"){
+        $foodMul = [int]$script:ActiveFoodBuff.Value / 100.0
+        $foodXP = [math]::Floor($e.XP * $foodMul)
+        if($foodXP -gt 0){
+            $xpGain += $foodXP
+        }
+    }
+    # Pacifist's Path mutator: kills grant zero XP. Quest turn-ins give
+    # double instead.
+    if(Has-Mutator "Pacifist"){
+        $xpGain = 0
+    }
+    # Hardcore mutator: +30% XP from kills (stacks with Bard/Cooking).
+    if(Has-Mutator "Hardcore"){
+        $xpGain = [math]::Floor($xpGain * 1.30)
+    }
     $script:XP += $xpGain
-    Write-CL "  + $xpGain XP" "Cyan"
+    $script:RunStats.XPEarned += $xpGain
+    if($xpGain -gt 0){
+        Write-CL "  + $xpGain XP" "Cyan"
+    } else {
+        Write-CL "  + 0 XP (Pacifist's Path)" "DarkGray"
+    }
     if($script:Partner -and $script:Partner.Class -eq "Bard"){
         Write-CL "    ($($script:Partner.Name): +$xpBonus bonus XP)" "DarkCyan"
     }
@@ -3181,6 +3968,40 @@ function Start-Combat {
         $streakBonus = [math]::Floor($goldGain * 0.15 * [math]::Min($script:Streak, 6))
         $goldGain += $streakBonus
         Write-CL "  + $streakBonus Gold (streak bonus x$($script:Streak))" "Yellow"
+    }
+    # Raven pet: +5% to combat gold (rounded down)
+    $petMul = Get-PetGoldMul
+    if($petMul -gt 1.0){
+        $petBonus = [math]::Floor($goldGain * ($petMul - 1.0))
+        if($petBonus -gt 0){
+            $goldGain += $petBonus
+            Write-CL "  + $petBonus Gold (Raven's eye)" "DarkYellow"
+        }
+    }
+    # Cooking GoldBoost: +X% gold from kills (stacks with Raven)
+    if($script:ActiveFoodBuff -and $script:ActiveFoodBuff.Effect -eq "GoldBoost"){
+        $foodMul = [int]$script:ActiveFoodBuff.Value / 100.0
+        $foodGold = [math]::Floor($goldGain * $foodMul)
+        if($foodGold -gt 0){
+            $goldGain += $foodGold
+            Write-CL "  + $foodGold Gold (well-fed)" "DarkYellow"
+        }
+    }
+    # Mutator gold modifiers (applied last so they multiply the final tally):
+    if(Has-Mutator "Speedrun"){
+        $sBonus = [math]::Floor($goldGain * 0.50)
+        $goldGain += $sBonus
+        if($sBonus -gt 0){ Write-CL "  + $sBonus Gold (Speedrun)" "Yellow" }
+    }
+    if(Has-Mutator "Frugal"){
+        $fBonus = [math]::Floor($goldGain * 0.75)
+        $goldGain += $fBonus
+        if($fBonus -gt 0){ Write-CL "  + $fBonus Gold (Frugal Run)" "DarkYellow" }
+    }
+    if(Has-Mutator "Hardcore"){
+        $hBonus = [math]::Floor($goldGain * 0.30)
+        $goldGain += $hBonus
+        if($hBonus -gt 0){ Write-CL "  + $hBonus Gold (Hardcore)" "Red" }
     }
     # Gold goes through the loot screen now — flows better visually with the
     # rest of the drops. Always free weight, but listed alongside loot items.
@@ -3200,11 +4021,35 @@ function Start-Combat {
         $lootPile += (Init-ItemWeight $e.Loot "Loot")
     }
     # Mini-boss / boss may drop weapon and/or armor (set on enemy by factory)
+    # NG+ feature: 20% chance per drop is "Ascended" — +30% ATK/DEF/MAGBonus,
+    # marked with the Ascended flag for inventory display.
     if($e.WeaponDrop){
-        $lootPile += (Init-ItemWeight $e.WeaponDrop "Weapon")
+        $w = $e.WeaponDrop
+        # Make a defensive copy so we don't mutate the shop template
+        if($script:NGPlusLevel -gt 0 -and (Get-Random -Max 100) -lt 20){
+            $copy = @{}
+            foreach($k in $w.Keys){ $copy[$k] = $w[$k] }
+            if($copy.ATK){ $copy.ATK = [math]::Floor($copy.ATK * 1.30) }
+            if($copy.MAGBonus){ $copy.MAGBonus = [math]::Floor($copy.MAGBonus * 1.30) }
+            $copy.Name = "Ascended " + $copy.Name
+            $copy.Ascended = $true
+            $copy.Perk = if($copy.Perk){$copy.Perk}else{"Soulbound"}
+            $w = $copy
+        }
+        $lootPile += (Init-ItemWeight $w "Weapon")
     }
     if($e.ArmorDrop){
-        $lootPile += (Init-ItemWeight $e.ArmorDrop "Armor")
+        $a = $e.ArmorDrop
+        if($script:NGPlusLevel -gt 0 -and (Get-Random -Max 100) -lt 20){
+            $copy = @{}
+            foreach($k in $a.Keys){ $copy[$k] = $a[$k] }
+            if($copy.DEF){ $copy.DEF = [math]::Floor($copy.DEF * 1.30) }
+            if($copy.MAGBonus){ $copy.MAGBonus = [math]::Floor($copy.MAGBonus * 1.30) }
+            $copy.Name = "Ascended " + $copy.Name
+            $copy.Ascended = $true
+            $a = $copy
+        }
+        $lootPile += (Init-ItemWeight $a "Armor")
     }
     # Potion drop: regular 12%, mini-boss 25%, boss 40%
     $potionDropChance = if($e.IsBoss){40}elseif($e.IsMiniBoss){25}else{12}
@@ -3222,6 +4067,30 @@ function Start-Combat {
             }
             $potCopy.Weight = 1
             $lootPile += $potCopy
+        }
+    }
+    # Cooking ingredients: 12% chance per kill, bosses guaranteed.
+    # Routed through the loot screen so the player sees the drop and
+    # consciously takes it. The take-handler in Show-LootScreen routes
+    # Kind="Ingredient" into the $script:Ingredients hashtable.
+    if($e.IsBoss -or (Get-Random -Max 100) -lt 12){
+        $ingTypes = @("Mushroom","Herb","Meat","Bone")
+        $ingType  = $ingTypes | Get-Random
+        $ingIcon  = switch($ingType){
+            "Mushroom" { "[Mush]" }
+            "Herb"     { "[Herb]" }
+            "Meat"     { "[Meat]" }
+            "Bone"     { "[Bone]" }
+            default    { "[Ing]"  }
+        }
+        $lootPile += @{
+            Name           = "$ingType"
+            Kind           = "Ingredient"
+            IngredientType = $ingType
+            Weight         = 1
+            Value          = 5
+            Icon           = $ingIcon
+            Desc           = "A cooking ingredient. Take it to the Inn's pot."
         }
     }
     if($e.DropsKey){
@@ -3246,7 +4115,7 @@ function Start-Combat {
             Write-Host ""
             Write-CL "  Loot stowed:" "Magenta"
             foreach($t in $taken){
-                $kindTag = switch($t.Kind){"Weapon"{"[Wpn]"}"Armor"{"[Arm]"}default{""}}
+                $kindTag = switch($t.Kind){"Weapon"{"[Wpn]"}"Armor"{"[Arm]"}"Ingredient"{"[Ing]"}"Note"{"[Note]"}default{""}}
                 Write-CL "    + $($t.Name) $kindTag" "Magenta"
             }
             Write-Host ""
@@ -3264,6 +4133,14 @@ function Start-Combat {
         Write-Host ""
         Write-CL "  *** LEVEL UP! Now Level $($script:PlayerLevel)! ***" "Yellow"
         Write-CL "  All stats increased! HP & MP fully restored!" "Yellow"
+        Write-CL "  *** +1 TALENT POINT — spend at the Stats page ***" "Cyan"
+        # Tier-2 / Tier-3 talent unlock prompts
+        if($script:PlayerLevel -eq 5){
+            Write-CL "  *** TALENT TIER 2 UNLOCKED! ***" "Magenta"
+        }
+        if($script:PlayerLevel -eq 10){
+            Write-CL "  *** TALENT TIER 3 UNLOCKED! ***" "Magenta"
+        }
         # Ability tier upgrade notification at milestone levels
         if($script:PlayerLevel -in @(5,10,15)){
             $newTier = Get-AbilityTier $script:PlayerLevel
@@ -3279,6 +4156,223 @@ function Start-Combat {
     return @{Result="Won"}
 }
 
+
+# ─── COOKING STATION (v1.5) ───────────────────────────────────────
+# Inn-side cooking pot. Combines ingredients (Mushroom/Herb/Meat/Bone)
+# dropped from enemies into buff foods that last one full dungeon run.
+# The active food buff is cleared on dungeon clear or death. Only ONE
+# food buff can be active at a time — eating a new food replaces the
+# previous one.
+function Show-CookingStation {
+    $cookLoop = $true
+    while($cookLoop){
+        clr
+        Write-Host ""
+        Write-CL "  ╔══════════════════════════════════════════════════════════╗" "DarkRed"
+        Write-CL "  ║                  T H E   C O O K I N G   P O T          ║" "Yellow"
+        Write-CL "  ╚══════════════════════════════════════════════════════════╝" "DarkRed"
+        Write-Host ""
+        # Cooking pot ASCII
+        Write-CL "                  ___       ___" "DarkGray"
+        Write-CL "                 (   )_____(   )" "DarkGray"
+        Write-CL "                  \\___________/" "DarkGray"
+        Write-CL "                   |  ~~~~~  |" "DarkRed"
+        Write-CL "                   |   ~~~   |" "Red"
+        Write-CL "                   \\_________/" "DarkGray"
+        Write-CL "                    /       \\" "DarkGray"
+        Write-Host ""
+
+        # ── Ingredient inventory ──
+        if(-not $script:Ingredients){ $script:Ingredients = @{} }
+        $mush = if($script:Ingredients.Mushroom){[int]$script:Ingredients.Mushroom}else{0}
+        $herb = if($script:Ingredients.Herb)    {[int]$script:Ingredients.Herb}    else{0}
+        $meat = if($script:Ingredients.Meat)    {[int]$script:Ingredients.Meat}    else{0}
+        $bone = if($script:Ingredients.Bone)    {[int]$script:Ingredients.Bone}    else{0}
+
+        Write-CL "  ── Ingredients ──" "Yellow"
+        Write-CL "    Mushroom: $mush     Herb: $herb     Meat: $meat     Bone: $bone" "DarkGray"
+        Write-Host ""
+
+        # ── Active buff status ──
+        if($script:ActiveFoodBuff){
+            Write-CL "  Active food buff: $($script:ActiveFoodBuff.Name)" "Cyan"
+            Write-CL "    $($script:ActiveFoodBuff.Desc)" "DarkCyan"
+            Write-CL "    (Wears off when this dungeon ends)" "DarkGray"
+        } else {
+            Write-CL "  No active food buff." "DarkGray"
+        }
+        Write-Host ""
+
+        # ── Recipes ──
+        # Each recipe consumes specific ingredients and grants a run-long
+        # buff. Effects map to flags read by combat / drop code:
+        #   "ATKBoost"  — +5 ATK on all attacks (combat math)
+        #   "DEFBoost"  — +3 DEF on all damage taken (combat math)
+        #   "GoldBoost" — +10% gold from all sources (stacks with Raven)
+        #   "XPBoost"   — +15% XP from kills
+        $recipes = @(
+            @{ Name="Hearty Stew";        Mush=1; Herb=0; Meat=2; Bone=0; Effect="ATKBoost";  Value=5;  Desc="+5 ATK for the run"; Color="Red" }
+            @{ Name="Bone Broth";         Mush=0; Herb=2; Meat=0; Bone=2; Effect="DEFBoost";  Value=3;  Desc="+3 DEF for the run"; Color="DarkGray" }
+            @{ Name="Forager's Plate";    Mush=2; Herb=2; Meat=0; Bone=0; Effect="GoldBoost"; Value=10; Desc="+10% gold for the run"; Color="Yellow" }
+            @{ Name="Hunter's Skewer";    Mush=0; Herb=1; Meat=2; Bone=1; Effect="XPBoost";   Value=15; Desc="+15% XP for the run"; Color="Cyan" }
+        )
+
+        Write-CL "  ── Recipes ──" "Yellow"
+        for($ri=0; $ri -lt $recipes.Count; $ri++){
+            $r = $recipes[$ri]
+            $canMake = ($mush -ge $r.Mush -and $herb -ge $r.Herb -and $meat -ge $r.Meat -and $bone -ge $r.Bone)
+            $col = if($canMake){$r.Color}else{"DarkGray"}
+            $reqParts = @()
+            if($r.Mush -gt 0){ $reqParts += "$($r.Mush) Mush" }
+            if($r.Herb -gt 0){ $reqParts += "$($r.Herb) Herb" }
+            if($r.Meat -gt 0){ $reqParts += "$($r.Meat) Meat" }
+            if($r.Bone -gt 0){ $reqParts += "$($r.Bone) Bone" }
+            $req = $reqParts -join ", "
+            Write-CL "    [$($ri+1)] $($r.Name)" $col
+            Write-CL "         Recipe: $req" "DarkGray"
+            Write-CL "         Effect: $($r.Desc)" "DarkGray"
+        }
+        Write-Host ""
+        Write-CL "    [0] Leave" "White"
+        Write-Host ""
+        Write-C "  > " "Yellow"; $cCh = Read-Host
+
+        if($cCh -eq "0"){ $cookLoop = $false; continue }
+        $idx = (ConvertTo-SafeInt -Value $cCh) - 1
+        if($idx -lt 0 -or $idx -ge $recipes.Count){
+            continue
+        }
+        $r = $recipes[$idx]
+        if($mush -lt $r.Mush -or $herb -lt $r.Herb -or $meat -lt $r.Meat -or $bone -lt $r.Bone){
+            Write-CL "  Not enough ingredients for $($r.Name)." "Red"
+            Wait-Key
+            continue
+        }
+        if($script:ActiveFoodBuff){
+            Write-Host ""
+            Write-CL "  You already have a food buff active: $($script:ActiveFoodBuff.Name)" "Yellow"
+            Write-CL "  Eating $($r.Name) will replace it." "DarkYellow"
+            Write-C "  Continue? (y/n): " "White"; $cf = Read-Host
+            if($cf -ne 'y' -and $cf -ne 'Y'){ continue }
+        }
+        # Consume ingredients
+        $script:Ingredients.Mushroom = $mush - $r.Mush
+        $script:Ingredients.Herb     = $herb - $r.Herb
+        $script:Ingredients.Meat     = $meat - $r.Meat
+        $script:Ingredients.Bone     = $bone - $r.Bone
+        # Set active buff
+        $script:ActiveFoodBuff = @{
+            Name   = $r.Name
+            Effect = $r.Effect
+            Value  = $r.Value
+            Desc   = $r.Desc
+        }
+        Write-Host ""
+        Write-CL "  You eat $($r.Name). $($r.Desc)" $r.Color
+        Write-CL "  This buff persists until your next dungeon ends." "DarkGray"
+        Wait-Key
+    }
+}
+
+# ─── PET KENNEL (v1.5) ────────────────────────────────────────────
+# Sub-shop accessed from the Guild Hall. Exactly 3 pets — Hound, Raven,
+# Falcon — each with one passive perk. Player can own ONE pet at a time.
+# Buying a new pet refunds 50% of the prior pet's cost.
+function Show-PetKennel {
+    $kennelLoop = $true
+    while($kennelLoop){
+        clr
+        Write-Host ""
+        Write-CL "  ╔══════════════════════════════════════════════════════════╗" "DarkMagenta"
+        Write-CL "  ║                    T H E   K E N N E L                   ║" "Magenta"
+        Write-CL "  ╚══════════════════════════════════════════════════════════╝" "DarkMagenta"
+        Write-Host ""
+        # Kennel ASCII (small)
+        Write-CL "             /\___/\           //\          " "DarkYellow"
+        Write-CL "            (  o.o  )         /  \      ___ " "Yellow"
+        Write-CL "             >  v  <         (    )    /(*)\\" "DarkYellow"
+        Write-CL "          /\/  HOUND  \/\   /  RAVEN  \/  FALCON" "DarkGray"
+        Write-Host ""
+
+        Write-C "  Gold: " "DarkGray"; Write-CL "$($script:Gold)g" "Yellow"
+        Write-Host ""
+
+        if($script:Pet){
+            Write-CL "  Current Pet: $($script:Pet.Type)" "Cyan"
+            Write-CL "    $($script:Pet.Desc)" "DarkGray"
+            Write-Host ""
+        } else {
+            Write-CL "  You have no pet." "DarkGray"
+            Write-Host ""
+        }
+
+        $pets = @(
+            @{ Type="Hound";  Price=500; Desc="Reveals chests on the minimap regardless of fog" }
+            @{ Type="Raven";  Price=650; Desc="+5% gold from all sources" }
+            @{ Type="Falcon"; Price=600; Desc="Minimap reveal radius increased (5 -> 8)"      }
+        )
+
+        Write-CL "  ── Available Pets ──" "Yellow"
+        for($pi=0; $pi -lt $pets.Count; $pi++){
+            $p = $pets[$pi]
+            $owned = ($script:Pet -and $script:Pet.Type -eq $p.Type)
+            $afford = ($script:Gold -ge $p.Price)
+            $col = if($owned){"DarkGray"}elseif($afford){"Green"}else{"Red"}
+            $tag = if($owned){" [OWNED]"}else{""}
+            Write-CL "    [$($pi+1)] $($p.Type)  ($($p.Price)g)$tag" $col
+            Write-CL "         $($p.Desc)" "DarkGray"
+        }
+        Write-Host ""
+        if($script:Pet){
+            Write-CL "    [R] Release current pet (50% refund)" "DarkYellow"
+        }
+        Write-CL "    [0] Back" "White"
+        Write-Host ""
+        Write-C "  > " "Yellow"; $kCh = Read-Host
+
+        switch($kCh.ToUpper()){
+            {$_ -in @("1","2","3")} {
+                $pIdx = [int]$_ - 1
+                $newPet = $pets[$pIdx]
+                if($script:Pet -and $script:Pet.Type -eq $newPet.Type){
+                    Write-CL "  You already have a $($newPet.Type)." "DarkGray"
+                    Wait-Key
+                } elseif($script:Gold -lt $newPet.Price){
+                    Write-CL "  Not enough gold! Need $($newPet.Price)g." "Red"
+                    Wait-Key
+                } else {
+                    if($script:Pet){
+                        # Find the old pet's price for refund
+                        $oldPrice = ($pets | Where-Object { $_.Type -eq $script:Pet.Type } | Select-Object -First 1).Price
+                        $refund = [math]::Floor($oldPrice * 0.5)
+                        $script:Gold += $refund
+                        Write-CL "  Released your $($script:Pet.Type) for ${refund}g refund." "DarkYellow"
+                    }
+                    $script:Gold -= $newPet.Price
+                    $script:Pet = @{ Type = $newPet.Type; Desc = $newPet.Desc }
+                    Write-Host ""
+                    Write-CL "  $($newPet.Type) bonded with you!" "Green"
+                    Wait-Key
+                }
+            }
+            "R" {
+                if($script:Pet){
+                    Write-C "  Release your $($script:Pet.Type)? (y/n): " "Red"
+                    $confirm = Read-Host
+                    if($confirm -eq 'y'){
+                        $oldPrice = ($pets | Where-Object { $_.Type -eq $script:Pet.Type } | Select-Object -First 1).Price
+                        $refund = [math]::Floor($oldPrice * 0.5)
+                        $script:Gold += $refund
+                        Write-CL "  Your $($script:Pet.Type) wanders off. Refunded ${refund}g." "DarkGray"
+                        $script:Pet = $null
+                        Wait-Key
+                    }
+                }
+            }
+            "0" { $kennelLoop = $false }
+        }
+    }
+}
 
 function Show-GuildHall {
     $ghLoop = $true
@@ -3426,6 +4520,10 @@ function Show-GuildHall {
             Write-C "  │" "DarkGray"; Write-C " [D]" "Red"; Write-C "   Dismiss current ally" "White"
             Write-CL ("$(' ' * $pad2) │") "DarkGray"
         }
+        $rowP = " [P]   Visit the kennel (pets)"
+        $padP = 42 - $rowP.Length
+        Write-C "  │" "DarkGray"; Write-C " [P]" "Magenta"; Write-C "   Visit the kennel (pets)" "White"
+        Write-CL ("$(' ' * $padP) │") "DarkGray"
         $row3 = " [0]   Back"
         $pad3 = 42 - $row3.Length
         Write-C "  │" "DarkGray"; Write-C " [0]" "White"; Write-C "   Back" "White"
@@ -3479,6 +4577,7 @@ function Show-GuildHall {
                     Wait-Key
                 }
             }
+            "P" { Show-PetKennel }
             "0" { $ghLoop = $false }
         }
     }
@@ -3809,12 +4908,16 @@ function Show-Market {
                     $widx=[int]$bi - 1
                     if($widx -ge 0 -and $widx -lt $filtered.Count){
                         $w = $filtered[$widx]
-                        if($script:Gold -ge $w.Price){
-                            $script:Gold -= $w.Price
+                        $effPrice = [int][math]::Ceiling($w.Price * (Get-ShopDiscount))
+                        if($script:Gold -ge $effPrice){
+                            $script:Gold -= $effPrice
                             $newWeapon = Init-ItemDurability $w
                             if(-not $newWeapon.Kind){ $newWeapon.Kind = "Weapon" }
                             $script:WeaponsOwned[$w.Name] = $true
                             Invoke-GearAcquired -Item $newWeapon -Kind "Weapon"
+                            if($effPrice -lt $w.Price){
+                                Write-CL "  (Guild SysAdmin discount applied: $($w.Price)g -> ${effPrice}g)" "Cyan"
+                            }
                             $cb = Get-WeaponClassBonus
                             if($cb -gt 0 -and $script:EquippedWeapon -eq $newWeapon){
                                 Write-CL "  Class bonus active! +$cb ATK" "Green"
@@ -3930,13 +5033,17 @@ function Show-Market {
                     $aIdx = (ConvertTo-SafeInt -Value $aPick) - 1
                     if($aIdx -ge 0 -and $aIdx -lt $slotArmor.Count){
                         $a = $slotArmor[$aIdx]
-                        if($script:Gold -ge $a.Price){
-                            $script:Gold -= $a.Price
+                        $effPrice = [int][math]::Ceiling($a.Price * (Get-ShopDiscount))
+                        if($script:Gold -ge $effPrice){
+                            $script:Gold -= $effPrice
                             $newArmor = Init-ItemDurability $a
                             if(-not $newArmor.Kind){ $newArmor.Kind = "Armor" }
                             if(-not $newArmor.Slot){ $newArmor.Slot = $chosenSlot }
                             $script:ArmorOwned[$a.Name] = $true
                             Invoke-GearAcquired -Item $newArmor -Kind "Armor"
+                            if($effPrice -lt $a.Price){
+                                Write-CL "  (Guild SysAdmin discount: $($a.Price)g -> ${effPrice}g)" "Cyan"
+                            }
                             Write-CL "  Total Armor DEF: +$(Get-TotalArmorDEF)" "Cyan"
                             Check-Achievements
                         } else { Write-CL "  Not enough gold!" "Red" }
@@ -4029,23 +5136,32 @@ function Show-Market {
                     $pidx2=[int]$pi2 - 1
                     if($pidx2 -ge 0 -and $pidx2 -lt $potionShop.Count){
                         $pt=$potionShop[$pidx2]
+                        $effPrice = [int][math]::Ceiling($pt.Price * (Get-ShopDiscount))
                         if($pt.Category -eq "Throwable"){
                             if($script:ThrowablePotions.Count -ge 5){
                                 Write-CL "  Throwable inventory full! (5/5)" "Red"
                             }
-                            elseif($script:Gold -ge $pt.Price){
-                                $script:Gold -= $pt.Price
+                            elseif($script:Gold -ge $effPrice){
+                                $script:Gold -= $effPrice
                                 [void]$script:ThrowablePotions.Add($pt)
-                                Write-CL "  Bought $($pt.Name)!" "Green"
+                                if($effPrice -lt $pt.Price){
+                                    Write-CL "  Bought $($pt.Name)! (SysAdmin discount: ${effPrice}g)" "Green"
+                                } else {
+                                    Write-CL "  Bought $($pt.Name)!" "Green"
+                                }
                             } else { Write-CL "  Not enough gold!" "Red" }
                         } else {
                             if($script:Potions.Count -ge 10){
                                 Write-CL "  Potion inventory full! (10/10)" "Red"
                             }
-                            elseif($script:Gold -ge $pt.Price){
-                                $script:Gold -= $pt.Price
+                            elseif($script:Gold -ge $effPrice){
+                                $script:Gold -= $effPrice
                                 [void]$script:Potions.Add($pt)
-                                Write-CL "  Bought $($pt.Name)!" "Green"
+                                if($effPrice -lt $pt.Price){
+                                    Write-CL "  Bought $($pt.Name)! (SysAdmin discount: ${effPrice}g)" "Green"
+                                } else {
+                                    Write-CL "  Bought $($pt.Name)!" "Green"
+                                }
                             } else { Write-CL "  Not enough gold!" "Red" }
                         }
                         Start-Sleep -Milliseconds 800  # brief feedback instead of Wait-Key; loops back for another purchase
@@ -4066,7 +5182,21 @@ function Show-Market {
                 Write-C "  Gold: " "DarkGray"; Write-CL "$($script:Gold)g" "Yellow"
                 Write-Host ""
 
-                if($script:Inventory.Count -eq 0){
+                # Build a unified sellable list. Each entry tracks Source
+                # ("Inv", "Pot", "Throw") and SourceIdx so we can remove from
+                # the correct backing list when a sale completes.
+                $sellList = New-Object System.Collections.ArrayList
+                for($i=0; $i -lt $script:Inventory.Count; $i++){
+                    [void]$sellList.Add(@{ Item=$script:Inventory[$i]; Source="Inv"; SourceIdx=$i })
+                }
+                for($i=0; $i -lt $script:Potions.Count; $i++){
+                    [void]$sellList.Add(@{ Item=$script:Potions[$i]; Source="Pot"; SourceIdx=$i })
+                }
+                for($i=0; $i -lt $script:ThrowablePotions.Count; $i++){
+                    [void]$sellList.Add(@{ Item=$script:ThrowablePotions[$i]; Source="Throw"; SourceIdx=$i })
+                }
+
+                if($sellList.Count -eq 0){
                     Write-CL "  ┌─────────────────────────────────┐" "DarkGray"
                     Write-CL "  │  Your bags are empty...         │" "DarkGray"
                     Write-CL "  └─────────────────────────────────┘" "DarkGray"
@@ -4076,8 +5206,9 @@ function Show-Market {
                     Write-CL "  │  #  │ Item                 │ Value    │" "DarkGray"
                     Write-CL "  ├─────┼──────────────────────┼──────────┤" "DarkGray"
                     $totalVal = 0
-                    for($i=0;$i -lt $script:Inventory.Count;$i++){
-                        $it=$script:Inventory[$i]
+                    for($i=0;$i -lt $sellList.Count;$i++){
+                        $entry = $sellList[$i]
+                        $it = $entry.Item
                         $sv = Get-ItemSellValue $it
                         $totalVal += $sv
                         $idxStr  = (" $($i+1) ").PadRight(3)
@@ -4085,10 +5216,16 @@ function Show-Market {
                         if($nameStr.Length -gt 20){ $nameStr = $nameStr.Substring(0,20) }
                         $nameStr = $nameStr.PadRight(20)
                         $valStr  = ("${sv}g").PadRight(8)
+                        # Color by source for visual hint
+                        $nameC = switch($entry.Source){
+                            "Pot"   { "Green" }
+                            "Throw" { "Cyan" }
+                            default { "Magenta" }
+                        }
                         Write-C "  │ " "DarkGray"
                         Write-C $idxStr "White"
                         Write-C " │ " "DarkGray"
-                        Write-C $nameStr "Magenta"
+                        Write-C $nameStr $nameC
                         Write-C " │ " "DarkGray"
                         Write-C $valStr "Yellow"
                         Write-CL " │" "DarkGray"
@@ -4102,18 +5239,25 @@ function Show-Market {
                     if($si -eq 'A' -or $si -eq 'a'){
                         $script:Gold += $totalVal
                         $script:Inventory.Clear()
+                        $script:Potions.Clear()
+                        $script:ThrowablePotions.Clear()
                         Write-CL "  Sold everything for ${totalVal}g!" "Green"
                         Write-CL "  Gold: $($script:Gold)g" "Yellow"
                         Wait-Key
                     } else {
                         $sidx=[int]$si - 1
-                        if($sidx -ge 0 -and $sidx -lt $script:Inventory.Count){
-                            $it=$script:Inventory[$sidx]
+                        if($sidx -ge 0 -and $sidx -lt $sellList.Count){
+                            $entry = $sellList[$sidx]
+                            $it = $entry.Item
                             $sv = Get-ItemSellValue $it
                             $script:Gold += $sv
                             Write-CL "  Sold $($it.Name) for ${sv}g!" "Green"
                             Write-CL "  Gold: $($script:Gold)g" "Yellow"
-                            $script:Inventory.RemoveAt($sidx)
+                            switch($entry.Source){
+                                "Inv"   { $script:Inventory.RemoveAt($entry.SourceIdx) }
+                                "Pot"   { $script:Potions.RemoveAt($entry.SourceIdx) }
+                                "Throw" { $script:ThrowablePotions.RemoveAt($entry.SourceIdx) }
+                            }
                             Wait-Key
                         }
                     }
@@ -4154,11 +5298,16 @@ function Show-Market {
                     Write-C "  > " "Yellow"; $qtyStr = Read-Host
                     $qty = 0
                     if([int]::TryParse($qtyStr, [ref]$qty) -and $qty -gt 0){
-                        $cost = 25 * $qty
+                        $rawCost = 25 * $qty
+                        $cost = [int][math]::Ceiling($rawCost * (Get-ShopDiscount))
                         if($script:Gold -ge $cost){
                             $script:Gold -= $cost
                             $script:Lockpicks += $qty
-                            Write-CL "  She slides $qty pick(s) across the counter for ${cost}g." "Green"
+                            if($cost -lt $rawCost){
+                                Write-CL "  She slides $qty pick(s) across the counter for ${cost}g (Guild discount)." "Green"
+                            } else {
+                                Write-CL "  She slides $qty pick(s) across the counter for ${cost}g." "Green"
+                            }
                             Wait-Key
                         } else {
                             Write-CL "  'That'll be $cost gold — come back when you have it.'" "Red"
@@ -4225,6 +5374,7 @@ function Show-LootScreen {
             if($kindKnown -eq "Gold"){
                 $qty = if($it.Quantity){[int]$it.Quantity}else{0}
                 $script:Gold += $qty
+                $script:RunStats.GoldEarned += $qty
                 $taken += $it
             }
             # Lockpicks bundle → increment $script:Lockpicks counter
@@ -4250,6 +5400,19 @@ function Show-LootScreen {
                 } else {
                     $rejected += $it
                 }
+            }
+            # Cooking ingredients → $script:Ingredients hashtable (no inventory slot).
+            # The carry-weight check is handled by the loot screen's mark-toggle
+            # logic itself (you can only mark items the bag can fit), so by the
+            # time we get here the weight has already been validated.
+            elseif($kindKnown -eq "Ingredient"){
+                if(-not $script:Ingredients){ $script:Ingredients = @{} }
+                $iType = if($it.IngredientType){[string]$it.IngredientType}else{$it.Name}
+                if(-not $script:Ingredients.ContainsKey($iType)){
+                    $script:Ingredients[$iType] = 0
+                }
+                $script:Ingredients[$iType]++
+                $taken += $it
             }
             # Loot, weapons, armor → main inventory bag
             else {
@@ -4314,6 +5477,26 @@ function Show-LootScreen {
             }
             $rows += "  Desc:       $desc"
         }
+        # Notes (v1.5): if this is a found note, append the wrapped Body text
+        # below the standard fields. Multi-line wrap at boxW-4 chars.
+        if($Item.IsNote -and $Item.Body){
+            $rows += "  ─── Contents ───"
+            $bodyLeft = $Item.Body
+            $wrapW = $boxW - 4
+            while($bodyLeft.Length -gt 0){
+                if($bodyLeft.Length -le $wrapW){
+                    $rows += "  $bodyLeft"
+                    $bodyLeft = ""
+                } else {
+                    # Find the last space within the window so we wrap on words
+                    $cut = $wrapW
+                    $space = $bodyLeft.Substring(0, $wrapW).LastIndexOf(' ')
+                    if($space -gt 20){ $cut = $space }
+                    $rows += "  $($bodyLeft.Substring(0, $cut))"
+                    $bodyLeft = $bodyLeft.Substring($cut).TrimStart()
+                }
+            }
+        }
         foreach($r in $rows){
             $padded = $r
             if($padded.Length -gt $boxW){ $padded = $padded.Substring(0, $boxW) }
@@ -4376,13 +5559,15 @@ function Show-LootScreen {
             $isCursor = ($i -eq $cursor)
             $box = if($marked[$i]){"[X]"}else{"[ ]"}
             $kindTag = switch($it.Kind){
-                "Weapon"    { "[Wpn]" }
-                "Armor"     { "[Arm]" }
-                "Potion"    { "[Pot]" }
-                "Throwable" { "[Thr]" }
-                "Lockpicks" { "[Pck]" }
-                "Gold"      { "[Gld]" }
-                default     { "[Loot]" }
+                "Weapon"     { "[Wpn]" }
+                "Armor"      { "[Arm]" }
+                "Potion"     { "[Pot]" }
+                "Throwable"  { "[Thr]" }
+                "Lockpicks"  { "[Pck]" }
+                "Gold"       { "[Gld]" }
+                "Ingredient" { "[Ing]" }
+                "Note"       { "[Note]" }
+                default      { "[Loot]" }
             }
             $name = $it.Name
             if($name.Length -gt 24){ $name = $name.Substring(0,24) }
@@ -4629,12 +5814,14 @@ function Show-DropScreen {
                 "Weapon" { "[Wpn]" }
                 "Armor"  { "[Arm]" }
                 "Potion" { "[Pot]" }
+                "Note"   { "[Note]" }
                 default  { "[Loot]" }
             }
             $tagColor = switch($it.Kind){
                 "Weapon" { "Yellow" }
                 "Armor"  { "DarkCyan" }
                 "Potion" { "Green" }
+                "Note"   { "DarkMagenta" }
                 default  { "Magenta" }
             }
             Write-C " " "DarkGray"
@@ -4990,6 +6177,369 @@ function Show-Blacksmith {
 # Triggered during dungeon movement. Pulls player out of navigation
 # briefly to present a choice. Dutchman is rare and unlocks the
 # best weapon in the game (or demotes the player by 2 levels).
+# ─── BLACKJACK MINI-GAME ──────────────────────────────────────────
+# Self-contained 21 game used by the Underground Gambler encounter.
+# Standard rules:
+#   - Deck is a fresh single 52-card deck per session (no shoe across hands)
+#   - Player can Hit, Stand, Double Down (if first action), Split (if first
+#     action and pair), and use Insurance? — keeping it simple: NO insurance
+#   - Dealer stands on all 17 (including soft)
+#   - Blackjack (natural 21 on first two cards) pays 3:2
+#   - Push (tie) returns the bet
+#   - Player bust = immediate loss
+#   - Doubling doubles the bet, adds exactly one more card, then stands
+#   - Split creates two hands from a pair, each gets one new card; bet doubled
+#   - Splits resolve sequentially. No re-splitting (max 2 hands).
+# Returns the NET gold change (negative for loss, 0 for push, positive for
+# win). The caller deducts/adds gold based on the return value.
+function Start-Blackjack {
+    param([int]$Bet)
+
+    # ── Deck ──────────────────────────────────────────────────────
+    # Build and shuffle a fresh 52-card deck. Cards are hashtables with
+    # Suit (♠♥♦♣ as text), Rank (2-10, J, Q, K, A), and Value (numeric).
+    $suits = @("S","H","D","C")
+    $ranks = @(
+        @{R="2"; V=2},@{R="3"; V=3},@{R="4"; V=4},@{R="5"; V=5},@{R="6"; V=6},
+        @{R="7"; V=7},@{R="8"; V=8},@{R="9"; V=9},@{R="10";V=10},
+        @{R="J"; V=10},@{R="Q"; V=10},@{R="K"; V=10},@{R="A"; V=11}
+    )
+    $deck = New-Object System.Collections.ArrayList
+    foreach($s in $suits){
+        foreach($r in $ranks){
+            [void]$deck.Add(@{Suit=$s; Rank=$r.R; Value=$r.V})
+        }
+    }
+    # Fisher-Yates shuffle
+    $rng = [System.Random]::new()
+    for($i=$deck.Count-1; $i -gt 0; $i--){
+        $j = $rng.Next(0, $i+1)
+        $tmp = $deck[$i]; $deck[$i] = $deck[$j]; $deck[$j] = $tmp
+    }
+    $deckIdx = 0
+    $drawCard = {
+        if($deckIdx -ge $deck.Count){ return $null }
+        $c = $deck[$deckIdx]
+        $script:bjDeckIdx = $deckIdx + 1
+        return $c
+    }
+
+    # ── Hand value calc (handles aces as 1 or 11) ─────────────────
+    function _BJ-HandValue {
+        param($Hand)
+        $total = 0; $aces = 0
+        foreach($c in $Hand){
+            $total += $c.Value
+            if($c.Rank -eq "A"){ $aces++ }
+        }
+        # Demote aces from 11 to 1 while busting
+        while($total -gt 21 -and $aces -gt 0){
+            $total -= 10
+            $aces--
+        }
+        return $total
+    }
+
+    # ── Card art (compact ASCII, 5 rows tall, 7 cols wide) ────────
+    function _BJ-CardLines {
+        param($Card,[switch]$Hidden)
+        if($Hidden){
+            return @(
+                "┌─────┐",
+                "│░░░░░│",
+                "│░ ? ░│",
+                "│░░░░░│",
+                "└─────┘"
+            )
+        }
+        $r = $Card.Rank
+        $s = switch($Card.Suit){
+            "S" { [char]0x2660 }   # ♠
+            "H" { [char]0x2665 }   # ♥
+            "D" { [char]0x2666 }   # ♦
+            "C" { [char]0x2663 }   # ♣
+        }
+        # Pad rank to 2 chars (so "10" fits, others get a space)
+        $rL = if($r.Length -eq 1){"$r "}else{"$r"}
+        $rR = if($r.Length -eq 1){" $r"}else{"$r"}
+        return @(
+            "┌─────┐",
+            "│$rL   │",
+            "│  $s  │",
+            "│   $rR│",
+            "└─────┘"
+        )
+    }
+
+    # ── Render a hand horizontally ────────────────────────────────
+    function _BJ-DrawHand {
+        param($Hand,$Label,[switch]$HideHole,$ColorRank="White",$ColorBorder="DarkGray")
+        $rows = @("","","","","")
+        for($ci=0; $ci -lt $Hand.Count; $ci++){
+            $hide = ($HideHole.IsPresent -and $ci -eq 1)
+            $lines = _BJ-CardLines -Card $Hand[$ci] -Hidden:$hide
+            for($li=0; $li -lt 5; $li++){
+                $rows[$li] += $lines[$li] + " "
+            }
+        }
+        $val = if($HideHole.IsPresent){ "?" } else { _BJ-HandValue $Hand }
+        Write-CL "  $Label  ($val)" $ColorRank
+        foreach($row in $rows){
+            Write-C "  " "Black"
+            $isRed = $false
+            # Color suits red for hearts/diamonds when visible
+            for($ci=0; $ci -lt $row.Length; $ci++){
+                $ch = $row[$ci]
+                $col = $ColorBorder
+                if($ch -eq [char]0x2665 -or $ch -eq [char]0x2666){ $col = "Red" }
+                elseif($ch -eq [char]0x2660 -or $ch -eq [char]0x2663){ $col = "White" }
+                elseif($ch -eq '░'){ $col = "DarkBlue" }
+                elseif([char]::IsLetterOrDigit($ch)){ $col = "White" }
+                Write-C ([string]$ch) $col
+            }
+            Write-Host ""
+        }
+    }
+
+    # ── Deal opening hand ─────────────────────────────────────────
+    $playerHands = @()
+    $playerBets  = @()
+    $h = New-Object System.Collections.ArrayList
+    [void]$h.Add($deck[$deckIdx]); $deckIdx++
+    [void]$h.Add($deck[$deckIdx]); $deckIdx++
+    $playerHands += ,$h
+    $playerBets  += $Bet
+
+    $dealerHand = New-Object System.Collections.ArrayList
+    [void]$dealerHand.Add($deck[$deckIdx]); $deckIdx++
+    [void]$dealerHand.Add($deck[$deckIdx]); $deckIdx++
+
+    # ── Dealing animation ─────────────────────────────────────────
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
+    Write-CL "  ║          U N D E R G R O U N D   2 1            ║" "Yellow"
+    Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
+    Write-Host ""
+    Write-CL "  Bet: ${Bet}g" "Yellow"
+    Write-Host ""
+    Write-CL "  Dealing..." "DarkGray"
+    Start-Sleep -Milliseconds 600
+
+    # ── Player turn loop (handles split as second hand) ───────────
+    $handIdx = 0
+    while($handIdx -lt $playerHands.Count){
+        $hand = $playerHands[$handIdx]
+        $playerStanding = $false
+        $firstAction = $true
+        $doubled = $false
+
+        while(-not $playerStanding){
+            clr
+            Write-Host ""
+            Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
+            Write-CL "  ║          U N D E R G R O U N D   2 1            ║" "Yellow"
+            Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
+            Write-Host ""
+            $betLabel = "Bet"
+            if($playerHands.Count -gt 1){ $betLabel = "Hand $($handIdx+1) Bet" }
+            Write-CL "  $betLabel`: $($playerBets[$handIdx])g       Your Gold: $($script:Gold)g" "Yellow"
+            Write-Host ""
+            _BJ-DrawHand -Hand $dealerHand -Label "DEALER" -HideHole -ColorRank "Magenta"
+            Write-Host ""
+            $playerLabel = if($playerHands.Count -gt 1){"YOU (Hand $($handIdx+1) of $($playerHands.Count))"}else{"YOU"}
+            _BJ-DrawHand -Hand $hand -Label $playerLabel -ColorRank "Cyan"
+            Write-Host ""
+
+            $pVal = _BJ-HandValue $hand
+            if($pVal -eq 21 -and $hand.Count -eq 2){
+                # Natural blackjack — auto-stand
+                Write-CL "  *** BLACKJACK! ***" "Yellow"
+                Start-Sleep -Milliseconds 1200
+                $playerStanding = $true
+                break
+            }
+            if($pVal -gt 21){
+                Write-CL "  BUST!" "Red"
+                Start-Sleep -Milliseconds 1200
+                $playerStanding = $true
+                break
+            }
+
+            # Build action menu
+            $opts = "[H]it  [S]tand"
+            $canDouble = ($firstAction -and $script:Gold -ge $playerBets[$handIdx])
+            if($canDouble){ $opts += "  [D]ouble" }
+            $canSplit = ($firstAction -and $hand.Count -eq 2 -and $hand[0].Value -eq $hand[1].Value -and $playerHands.Count -lt 2 -and $script:Gold -ge $Bet)
+            if($canSplit){ $opts += "  [P] Split" }
+            Write-CL "  $opts" "White"
+            Write-C  "  > " "Yellow"
+            $action = Read-Host
+            if(-not $action){ continue }
+            $action = $action.ToUpper().Substring(0,1)
+
+            if($action -eq "H"){
+                [void]$hand.Add($deck[$deckIdx]); $deckIdx++
+                $firstAction = $false
+            }
+            elseif($action -eq "S"){
+                $playerStanding = $true
+            }
+            elseif($action -eq "D" -and $canDouble){
+                # Double the bet for THIS hand (gold is already on the line — we tracked
+                # it as deducted upfront. Add the additional bet to script:Gold-going-out.
+                $script:Gold -= $playerBets[$handIdx]   # extra wager
+                $playerBets[$handIdx] *= 2
+                [void]$hand.Add($deck[$deckIdx]); $deckIdx++
+                $doubled = $true
+                $playerStanding = $true
+            }
+            elseif($action -eq "P" -and $canSplit){
+                # Split: take the second card off into a new hand. Each hand
+                # gets one fresh card. Bet for the new hand equals original.
+                $script:Gold -= $Bet  # extra wager for the new hand
+                $secondCard = $hand[1]
+                $hand.RemoveAt(1)
+                [void]$hand.Add($deck[$deckIdx]); $deckIdx++
+                $newHand = New-Object System.Collections.ArrayList
+                [void]$newHand.Add($secondCard)
+                [void]$newHand.Add($deck[$deckIdx]); $deckIdx++
+                $playerHands += ,$newHand
+                $playerBets  += $Bet
+                $firstAction = $false
+                # Continue with current hand (don't break loop)
+            }
+        }
+        $handIdx++
+    }
+
+    # ── Dealer turn ───────────────────────────────────────────────
+    # Dealer reveals hole, then hits until 17 or higher (stands on all 17).
+    # Skip dealer turn if all player hands busted (saves time).
+    $allBust = $true
+    foreach($ph in $playerHands){
+        if((_BJ-HandValue $ph) -le 21){ $allBust = $false; break }
+    }
+
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
+    Write-CL "  ║          U N D E R G R O U N D   2 1            ║" "Yellow"
+    Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
+    Write-Host ""
+    _BJ-DrawHand -Hand $dealerHand -Label "DEALER" -ColorRank "Magenta"
+    Write-Host ""
+    for($pi=0; $pi -lt $playerHands.Count; $pi++){
+        $lbl = if($playerHands.Count -gt 1){"YOU (Hand $($pi+1))"}else{"YOU"}
+        _BJ-DrawHand -Hand $playerHands[$pi] -Label $lbl -ColorRank "Cyan"
+        Write-Host ""
+    }
+    Start-Sleep -Milliseconds 800
+
+    if(-not $allBust){
+        $dVal = _BJ-HandValue $dealerHand
+        while($dVal -lt 17){
+            Write-CL "  Dealer hits..." "DarkGray"
+            Start-Sleep -Milliseconds 700
+            [void]$dealerHand.Add($deck[$deckIdx]); $deckIdx++
+            $dVal = _BJ-HandValue $dealerHand
+            clr
+            Write-Host ""
+            Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
+            Write-CL "  ║          U N D E R G R O U N D   2 1            ║" "Yellow"
+            Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
+            Write-Host ""
+            _BJ-DrawHand -Hand $dealerHand -Label "DEALER" -ColorRank "Magenta"
+            Write-Host ""
+            for($pi=0; $pi -lt $playerHands.Count; $pi++){
+                $lbl = if($playerHands.Count -gt 1){"YOU (Hand $($pi+1))"}else{"YOU"}
+                _BJ-DrawHand -Hand $playerHands[$pi] -Label $lbl -ColorRank "Cyan"
+                Write-Host ""
+            }
+        }
+        if($dVal -gt 21){
+            Write-CL "  Dealer BUSTS!" "Green"
+        } else {
+            Write-CL "  Dealer stands on $dVal." "DarkGray"
+        }
+        Start-Sleep -Milliseconds 1000
+    } else {
+        Write-CL "  Dealer doesn't need to play." "DarkGray"
+        Start-Sleep -Milliseconds 800
+    }
+
+    # ── Resolve each hand ─────────────────────────────────────────
+    # Bet accounting: the initial $Bet was already deducted by the caller
+    # before calling this function. Any ADDITIONAL bets from doubling or
+    # splitting were also deducted live above. So at this point all wagers
+    # are "off the table". We now credit $script:Gold based on results:
+    #   - Win:        credit 2x the hand's bet (return + winnings)
+    #   - Blackjack:  credit 2.5x the original bet (3:2 payout)
+    #   - Push:       credit 1x the hand's bet (bet returned)
+    #   - Loss/Bust:  credit 0 (already gone)
+    # netChange is the net delta from PRE-bet gold (informational only).
+    $dealerVal = _BJ-HandValue $dealerHand
+    $netChange = -$Bet   # initial bet
+    # Account for additional wagers from double/split
+    foreach($pb in $playerBets){
+        if($pb -ne $Bet){
+            # bet was doubled (or split made an extra entry of $Bet — that
+            # added bet was already counted). Track total wagered.
+            $netChange -= ($pb - $Bet)
+        }
+    }
+    # For splits, each hand has its own $Bet entry so the loop above only
+    # catches doubled hands. The extra split wager was deducted live.
+    if($playerHands.Count -gt 1){
+        $netChange -= $Bet * ($playerHands.Count - 1)
+    }
+
+    Write-Host ""
+    Write-CL "  ── Results ──" "Yellow"
+    for($pi=0; $pi -lt $playerHands.Count; $pi++){
+        $ph = $playerHands[$pi]
+        $pv = _BJ-HandValue $ph
+        $pBet = $playerBets[$pi]
+        $isNatural = ($ph.Count -eq 2 -and $pv -eq 21 -and $playerHands.Count -eq 1)
+        $label = if($playerHands.Count -gt 1){"Hand $($pi+1)"}else{"Hand"}
+        if($pv -gt 21){
+            Write-CL "    $label`: BUST. Lost ${pBet}g." "Red"
+            # No credit — wager already gone.
+        }
+        elseif($isNatural -and $dealerVal -ne 21){
+            # 3:2 payout — get bet back PLUS 1.5x bet winnings
+            $payout = $pBet + [int][math]::Floor($pBet * 1.5)
+            $script:Gold += $payout
+            $netChange += $payout
+            $winAmt = [int][math]::Floor($pBet * 1.5)
+            Write-CL "    $label`: BLACKJACK! Won ${winAmt}g (3:2)." "Yellow"
+        }
+        elseif($dealerVal -gt 21){
+            # Dealer bust — get bet back plus 1x bet winnings
+            $script:Gold += ($pBet * 2)
+            $netChange += ($pBet * 2)
+            Write-CL "    $label`: Dealer bust. Won ${pBet}g." "Green"
+        }
+        elseif($pv -gt $dealerVal){
+            $script:Gold += ($pBet * 2)
+            $netChange += ($pBet * 2)
+            Write-CL "    $label`: WIN. Won ${pBet}g." "Green"
+        }
+        elseif($pv -lt $dealerVal){
+            Write-CL "    $label`: LOSE. Lost ${pBet}g." "Red"
+        }
+        else {
+            # Push — return bet
+            $script:Gold += $pBet
+            $netChange += $pBet
+            Write-CL "    $label`: PUSH. Bet returned." "DarkGray"
+        }
+    }
+    Write-Host ""
+    Write-CL "  Net change: $(if($netChange -ge 0){'+'}else{''})${netChange}g" $(if($netChange -gt 0){"Green"}elseif($netChange -lt 0){"Red"}else{"DarkGray"})
+    return $netChange
+}
+
 function Start-RandomEncounter {
     param([string]$Type = "")
     # If the player was holding a movement key when the encounter triggered,
@@ -5015,12 +6565,16 @@ function Start-RandomEncounter {
         # Pick from available options.
         # - Alchemist can't spawn if potion bag is full (trade would be wasted).
         # - Bard can't spawn if HP and MP are both already full (heal would be wasted).
+        # - Gambler needs at least 50g to bet meaningfully.
         $options = @("Merchant")
         if($p.HP -lt $p.MaxHP -or $p.MP -lt $p.MaxMP){
             $options += "Bard"
         }
         if($script:Potions.Count -lt 10){
             $options += "Alchemist"
+        }
+        if($script:Gold -ge 50){
+            $options += "Gambler"
         }
         $Type = $options | Get-Random
     }
@@ -5314,11 +6868,18 @@ function Start-RandomEncounter {
                     }
                 } catch {}
             }
-            $result = if((Get-Random -Min 0 -Max 2) -eq 0){"h"}else{"t"}
+            # Use a freshly-seeded Random for the actual coin flip. Get-Random's
+            # default RNG should be fair, but a player reported tails winning
+            # 100% of the time — likely just sample noise, but switching to an
+            # explicit seeded RNG removes any doubt about distribution.
+            $coinRng = [System.Random]::new()
+            $coinVal = $coinRng.Next(0, 2)   # 0 or 1, evenly distributed
+            $result = if($coinVal -eq 0){"h"}else{"t"}
             $resFace = if($result -eq 'h'){"( H )"}else{"( T )"}
             Write-CL "  Result: $resFace" "Yellow"
             Write-Host ""
-            if($call -eq $result){
+            # Case-insensitive comparison just in case input had odd casing
+            if($call.Trim().ToLower() -eq $result){
                 Write-CL "  The Dutchman bows solemnly." "Cyan"
                 Write-CL "  'The blade is yours. Use it well, mortal.'" "DarkCyan"
                 # Add the blade
@@ -5350,6 +6911,63 @@ function Start-RandomEncounter {
                 if($p.MP -gt $p.MaxMP){ $p.MP = $p.MaxMP }
                 Write-CL "  You lost $lost levels. (Now level $($script:PlayerLevel))" "Red"
             }
+            Write-Host ""
+            Read-Host "  [Press Enter to continue]" | Out-Null
+        }
+        "Gambler" {
+            Write-Host ""
+            Write-CL "  ╔══════════════════════════════════════════════════════════╗" "DarkYellow"
+            Write-CL "  ║          T H E   U N D E R G R O U N D   G A M B L E R         ║" "Yellow"
+            Write-CL "  ╚══════════════════════════════════════════════════════════╝" "DarkYellow"
+            Write-Host ""
+            # Quick ASCII portrait — shady figure at a card table
+            Write-CL "                ___" "DarkGray"
+            Write-CL "              .'   '." "DarkGray"
+            Write-CL "             | () () |" "Yellow"
+            Write-CL "             | ' ▔ ' |" "Yellow"
+            Write-CL "             |  \=/  |" "DarkYellow"
+            Write-CL "            /│       │\\" "DarkGray"
+            Write-CL "           ░░│  ♠ ♥  │░░" "DarkRed"
+            Write-CL "          ░░░│  ♦ ♣  │░░░" "Red"
+            Write-CL "         ░░░░├───────┤░░░░" "DarkGray"
+            Write-Host ""
+            Write-CL "  A hooded figure waves you over to a candlelit table." "Gray"
+            Write-CL "  'A hand of twenty-one, traveler? Just one. Your bet.'" "Yellow"
+            Write-Host ""
+            Write-C "  You have " "DarkGray"
+            Write-CL "$($script:Gold)g" "Yellow"
+            Write-Host ""
+            Write-CL "  [P]lay   [L]eave" "White"
+            Write-C "  > " "Yellow"; $gAns = Read-Host
+            if($gAns -ne 'P' -and $gAns -ne 'p'){
+                Write-CL "  The gambler shrugs. 'Another time, then.'" "DarkGray"
+                Write-Host ""
+                Read-Host "  [Press Enter to continue]" | Out-Null
+                break
+            }
+            # Bet entry
+            Write-Host ""
+            Write-CL "  Enter your bet (1-$($script:Gold), or 'A' for ALL-IN):" "Yellow"
+            Write-C "  > " "Yellow"; $bAns = Read-Host
+            $bet = 0
+            if($bAns -eq 'A' -or $bAns -eq 'a'){
+                $bet = $script:Gold
+            } else {
+                $parsed = 0
+                if([int]::TryParse($bAns, [ref]$parsed)){
+                    $bet = $parsed
+                }
+            }
+            if($bet -lt 1 -or $bet -gt $script:Gold){
+                Write-CL "  'That's not a real wager. Walk on.'" "Red"
+                Write-Host ""
+                Read-Host "  [Press Enter to continue]" | Out-Null
+                break
+            }
+            # Deduct upfront. Start-Blackjack credits gold internally on win/push.
+            $script:Gold -= $bet
+            $netChange = Start-Blackjack -Bet $bet
+            Write-CL "  Your gold: $($script:Gold)g" "Yellow"
             Write-Host ""
             Read-Host "  [Press Enter to continue]" | Out-Null
         }
@@ -5783,6 +7401,573 @@ function Start-Lockpicking {
 
 
 
+# ─── TALENT TREE (v1.5 Pass 2) ────────────────────────────────────
+# 1 talent point per player level, spent at the Stats page. Each class
+# has 9 talents in 3 tiers (3 talents per tier). Tiers gate on player
+# level: T1 from level 1, T2 from 5, T3 from 10.
+#
+# Effects are read by various combat/loot/town code via Has-Talent.
+# All effects are PASSIVE (no active triggers). Talents are kept simple
+# and additive so they compose cleanly with potions, gear, and pets.
+function Get-TalentsForClass {
+    param([string]$Class)
+    # Each talent: Id (unique per class), Name, Tier (1/2/3), Desc
+    $base = switch($Class){
+        "Knight" {
+            @(
+                @{ Id="Knight_T1_A"; Name="Iron Resolve";    Tier=1; Desc="+5 max HP per player level" }
+                @{ Id="Knight_T1_B"; Name="Steady Stance";   Tier=1; Desc="+3 DEF (passive)" }
+                @{ Id="Knight_T1_C"; Name="Sword Discipline";Tier=1; Desc="+2 ATK with sword weapons" }
+                @{ Id="Knight_T2_A"; Name="Stalwart";        Tier=2; Desc="-15% damage taken below 30% HP" }
+                @{ Id="Knight_T2_B"; Name="Counter-Strike";  Tier=2; Desc="20% chance to counter when defending" }
+                @{ Id="Knight_T2_C"; Name="Holy Vigil";      Tier=2; Desc="+5 HP regen at start of every fight" }
+                @{ Id="Knight_T3_A"; Name="Crusader";        Tier=3; Desc="+25% damage to bosses" }
+                @{ Id="Knight_T3_B"; Name="Last Stand";      Tier=3; Desc="Survive lethal damage with 1 HP (once per dungeon)" }
+                @{ Id="Knight_T3_C"; Name="Guardian";        Tier=3; Desc="-10% damage taken when shield is equipped" }
+            )
+        }
+        "Mage" {
+            @(
+                @{ Id="Mage_T1_A"; Name="Arcane Focus";    Tier=1; Desc="+5 max MP per player level" }
+                @{ Id="Mage_T1_B"; Name="Mystic Insight";  Tier=1; Desc="+3 MAG (passive)" }
+                @{ Id="Mage_T1_C"; Name="Staff Mastery";   Tier=1; Desc="+10% damage with staff weapons" }
+                @{ Id="Mage_T2_A"; Name="Mana Shield";     Tier=2; Desc="-20% damage taken if MP > 50%" }
+                @{ Id="Mage_T2_B"; Name="Spell Echo";      Tier=2; Desc="15% chance for abilities to refund MP" }
+                @{ Id="Mage_T2_C"; Name="Burnsight";       Tier=2; Desc="Burn perk damage doubled" }
+                @{ Id="Mage_T3_A"; Name="Archmage";        Tier=3; Desc="+30% magic damage" }
+                @{ Id="Mage_T3_B"; Name="Mana Surge";      Tier=3; Desc="Crit hits restore 10 MP" }
+                @{ Id="Mage_T3_C"; Name="Time Slip";       Tier=3; Desc="Ability cooldowns -1 turn" }
+            )
+        }
+        "Brawler" {
+            @(
+                @{ Id="Brawler_T1_A"; Name="Tough Hide";    Tier=1; Desc="+5 DEF (passive)" }
+                @{ Id="Brawler_T1_B"; Name="Bigger Fists";  Tier=1; Desc="+3 ATK with fist weapons" }
+                @{ Id="Brawler_T1_C"; Name="Lung Capacity"; Tier=1; Desc="+8 max HP per player level" }
+                @{ Id="Brawler_T2_A"; Name="Adrenaline";    Tier=2; Desc="+20% damage when below 50% HP" }
+                @{ Id="Brawler_T2_B"; Name="Iron Chin";     Tier=2; Desc="-30% damage from enemy critical hits" }
+                @{ Id="Brawler_T2_C"; Name="Combo Strike";  Tier=2; Desc="Crits restore 8 HP" }
+                @{ Id="Brawler_T3_A"; Name="Berserk";       Tier=3; Desc="+40% crit chance below 25% HP" }
+                @{ Id="Brawler_T3_B"; Name="Unbreakable";   Tier=3; Desc="-15% damage taken (always)" }
+                @{ Id="Brawler_T3_C"; Name="Knockout";      Tier=3; Desc="Crits have 30% chance to stun" }
+            )
+        }
+        "Ranger" {
+            @(
+                @{ Id="Ranger_T1_A"; Name="Eagle Eye";      Tier=1; Desc="+5% crit chance" }
+                @{ Id="Ranger_T1_B"; Name="Light Step";     Tier=1; Desc="+3 SPD (passive)" }
+                @{ Id="Ranger_T1_C"; Name="Bow Mastery";    Tier=1; Desc="+10% damage with bow weapons" }
+                @{ Id="Ranger_T2_A"; Name="Hunter's Mark";  Tier=2; Desc="+15% damage to enemies above 75% HP" }
+                @{ Id="Ranger_T2_B"; Name="Toxic Tips";     Tier=2; Desc="Poison perk procs +25% more often" }
+                @{ Id="Ranger_T2_C"; Name="Quickdraw";      Tier=2; Desc="First attack each fight is a guaranteed crit" }
+                @{ Id="Ranger_T3_A"; Name="Deadshot";       Tier=3; Desc="Crits deal 3x damage (was 2x)" }
+                @{ Id="Ranger_T3_B"; Name="Multishot";      Tier=3; Desc="20% chance to attack twice" }
+                @{ Id="Ranger_T3_C"; Name="Trapfinder";     Tier=3; Desc="+1 free lockpick on dungeon entry" }
+            )
+        }
+        "Cleric" {
+            @(
+                @{ Id="Cleric_T1_A"; Name="Devout";         Tier=1; Desc="+4 max HP and +4 max MP per level" }
+                @{ Id="Cleric_T1_B"; Name="Faithful";       Tier=1; Desc="+3 DEF (passive)" }
+                @{ Id="Cleric_T1_C"; Name="Mace Discipline";Tier=1; Desc="+2 ATK with mace weapons" }
+                @{ Id="Cleric_T2_A"; Name="Healer's Touch"; Tier=2; Desc="Healing potions restore +30%" }
+                @{ Id="Cleric_T2_B"; Name="Smiter";         Tier=2; Desc="+25% damage to undead (Skeleton, Zombie)" }
+                @{ Id="Cleric_T2_C"; Name="Sanctuary";      Tier=2; Desc="Regenerate 3 HP per dungeon step" }
+                @{ Id="Cleric_T3_A"; Name="Divine Aegis";   Tier=3; Desc="-20% damage taken from magic" }
+                @{ Id="Cleric_T3_B"; Name="Lay on Hands";   Tier=3; Desc="One free full heal per dungeon" }
+                @{ Id="Cleric_T3_C"; Name="Resurrection";   Tier=3; Desc="On death, revive at 50% HP (once per dungeon)" }
+            )
+        }
+        "Necromancer" {
+            @(
+                @{ Id="Necromancer_T1_A"; Name="Soul Pool";    Tier=1; Desc="+5 max MP per player level" }
+                @{ Id="Necromancer_T1_B"; Name="Death's Grip"; Tier=1; Desc="+3 MAG (passive)" }
+                @{ Id="Necromancer_T1_C"; Name="Scythe Mastery"; Tier=1; Desc="+10% damage with scythe weapons" }
+                @{ Id="Necromancer_T2_A"; Name="Drain Mastery"; Tier=2; Desc="Drain perk heals double" }
+                @{ Id="Necromancer_T2_B"; Name="Bone Shield";  Tier=2; Desc="-10% damage taken (always)" }
+                @{ Id="Necromancer_T2_C"; Name="Soul Harvest"; Tier=2; Desc="Kills restore 5 MP" }
+                @{ Id="Necromancer_T3_A"; Name="Lich's Pact";  Tier=3; Desc="+30% damage but -20% max HP" }
+                @{ Id="Necromancer_T3_B"; Name="Death Pact";   Tier=3; Desc="On killing blow, +5% damage next fight (stacking, max 5)" }
+                @{ Id="Necromancer_T3_C"; Name="Reaper";       Tier=3; Desc="Killing an enemy below 25% HP is automatic" }
+            )
+        }
+        "Berserker" {
+            @(
+                @{ Id="Berserker_T1_A"; Name="Reckless Strike";Tier=1; Desc="+4 ATK (passive)" }
+                @{ Id="Berserker_T1_B"; Name="Battle Hunger";  Tier=1; Desc="+5 max HP per player level" }
+                @{ Id="Berserker_T1_C"; Name="Sword Fury";     Tier=1; Desc="+3 ATK with sword weapons" }
+                @{ Id="Berserker_T2_A"; Name="Bloodlust";      Tier=2; Desc="+30% damage when below 40% HP" }
+                @{ Id="Berserker_T2_B"; Name="Bleed Mastery";  Tier=2; Desc="Bleed perk damage doubled" }
+                @{ Id="Berserker_T2_C"; Name="Reckless Charge";Tier=2; Desc="First attack each fight deals +50%" }
+                @{ Id="Berserker_T3_A"; Name="Rampage";        Tier=3; Desc="Kills grant +5 ATK for 3 turns (stacking, max 3)" }
+                @{ Id="Berserker_T3_B"; Name="Pain Tolerance"; Tier=3; Desc="Damage taken converts 25% to ATK buff next turn" }
+                @{ Id="Berserker_T3_C"; Name="Final Stand";    Tier=3; Desc="At 1 HP, +50% all stats (once per dungeon)" }
+            )
+        }
+        "Warlock" {
+            @(
+                @{ Id="Warlock_T1_A"; Name="Cursed Mind";    Tier=1; Desc="+3 MAG (passive)" }
+                @{ Id="Warlock_T1_B"; Name="Pact's Vigor";   Tier=1; Desc="+5 max HP per player level" }
+                @{ Id="Warlock_T1_C"; Name="Staff Discipline";Tier=1; Desc="+10% damage with staff weapons" }
+                @{ Id="Warlock_T2_A"; Name="Hexweave";       Tier=2; Desc="Drain perk procs +25% more often" }
+                @{ Id="Warlock_T2_B"; Name="Soul Tap";       Tier=2; Desc="Spend 5 HP to deal +10 damage on basic attack" }
+                @{ Id="Warlock_T2_C"; Name="Fiendish Pact";  Tier=2; Desc="-15% damage taken from physical attacks" }
+                @{ Id="Warlock_T3_A"; Name="Doompact";       Tier=3; Desc="+25% damage but +25% damage taken" }
+                @{ Id="Warlock_T3_B"; Name="Soul Drain";     Tier=3; Desc="All abilities heal you for 30% damage dealt" }
+                @{ Id="Warlock_T3_C"; Name="Eternal Bargain";Tier=3; Desc="Kills below 20% HP restore 25 HP and 15 MP" }
+            )
+        }
+        default { @() }
+    }
+    return $base
+}
+
+# Returns 1 if the player has purchased the given talent, else 0.
+# Returns flat stat bonuses from purchased talents. Used by combat
+# stats display, level-up logic, and gear math. Each return key maps
+# to one stat. Multiplicative effects (e.g. +X% damage to bosses) are
+# applied inline at the relevant call site.
+function Get-TalentStatBonus {
+    param([string]$Stat)
+    # Returns flat stat bonuses from purchased talents that apply to
+    # ATK/DEF/SPD/MAG every combat tick. MaxHP and MaxMP talents do NOT
+    # flow through this helper — they're applied as one-shot deltas at
+    # talent-purchase time (see Show-TalentTree) and reapplied on ascend
+    # (see the [N] handler in the town menu). Keeping HP/MP out of here
+    # avoids any ambiguity about whether HP totals are dynamic.
+    $b = 0
+    $lvl = [int]$script:PlayerLevel
+    switch($Stat){
+        "ATK" {
+            if(Has-Talent "Berserker_T1_A")  { $b += 4 }
+        }
+        "DEF" {
+            if(Has-Talent "Knight_T1_B")     { $b += 3 }
+            if(Has-Talent "Brawler_T1_A")    { $b += 5 }
+            if(Has-Talent "Cleric_T1_B")     { $b += 3 }
+        }
+        "SPD" {
+            if(Has-Talent "Ranger_T1_B")     { $b += 3 }
+        }
+        "MAG" {
+            if(Has-Talent "Mage_T1_B")          { $b += 3 }
+            if(Has-Talent "Necromancer_T1_B")   { $b += 3 }
+            if(Has-Talent "Warlock_T1_A")       { $b += 3 }
+        }
+    }
+    return $b
+}
+
+# Returns 1 if the player has purchased the given talent, else 0.
+function Has-Talent {
+    param([string]$Id)
+    if(-not $script:Talents){ return $false }
+    return ($script:Talents.ContainsKey($Id) -and $script:Talents[$Id] -eq 1)
+}
+
+# How many talent points the player has unspent.
+# Total = PlayerLevel; Spent = count of purchased talents.
+function Get-AvailableTalentPoints {
+    $total = [int]$script:PlayerLevel
+    $spent = if($script:Talents){$script:Talents.Count}else{0}
+    $avail = $total - $spent
+    if($avail -lt 0){ $avail = 0 }
+    return $avail
+}
+
+# Tier gating: returns the minimum player level required to spend in
+# this tier. Tier 1 = level 1; Tier 2 = level 5; Tier 3 = level 10.
+function Get-TalentTierMinLevel {
+    param([int]$Tier)
+    switch($Tier){
+        1 { return 1 }
+        2 { return 5 }
+        3 { return 10 }
+        default { return 1 }
+    }
+}
+
+# Talent screen — shown from the Stats page when the player presses [T].
+# Lets the player browse their class's tree and spend points.
+function Show-TalentTree {
+    if(-not $script:Talents){ $script:Talents = @{} }
+    $loop = $true
+    while($loop){
+        $talents = Get-TalentsForClass $script:PlayerClass
+        $avail   = Get-AvailableTalentPoints
+        clr
+        Write-Host ""
+        Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "DarkCyan"
+        $tt = "  T A L E N T   T R E E   —   $($script:PlayerClass)"
+        $padT = 66 - $tt.Length
+        if($padT -lt 0){ $padT = 0 }
+        Write-C  "  ║" "DarkCyan"; Write-C $tt "Cyan"; Write-CL "$(' ' * $padT)║" "DarkCyan"
+        Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "DarkCyan"
+        Write-Host ""
+        Write-C  "  Player Level: " "DarkGray"; Write-C "$($script:PlayerLevel)" "White"
+        Write-C  "    Available Talent Points: " "DarkGray"; Write-CL "$avail" "Yellow"
+        Write-Host ""
+        Write-CL "  Tier gates: T1 @ Lv1   T2 @ Lv5   T3 @ Lv10" "DarkGray"
+        Write-Host ""
+
+        # Group talents by tier
+        for($tier=1; $tier -le 3; $tier++){
+            $tierMin = Get-TalentTierMinLevel $tier
+            $tierLabel = "── Tier $tier (Lv $tierMin+) ──"
+            $tierColor = if($script:PlayerLevel -ge $tierMin){"Yellow"}else{"DarkGray"}
+            Write-CL "  $tierLabel" $tierColor
+            $idx = 0
+            foreach($t in $talents){
+                if($t.Tier -ne $tier){ continue }
+                $idx++
+                $owned = Has-Talent $t.Id
+                $unlocked = ($script:PlayerLevel -ge $tierMin)
+                $key = "$tier$idx"   # e.g. "1A" -> 11, 12, 13, 21, ...
+                $status = if($owned){"[X]"}elseif($unlocked -and $avail -gt 0){"[ ]"}else{"[-]"}
+                $col = if($owned){"Green"}elseif($unlocked -and $avail -gt 0){"White"}else{"DarkGray"}
+                Write-C "    [$key] " $col
+                Write-C $status $col
+                Write-C "  $($t.Name)" $col
+                $padN = 24 - $t.Name.Length
+                if($padN -lt 1){ $padN = 1 }
+                Write-CL ("$(' ' * $padN) — $($t.Desc)") "DarkGray"
+            }
+            Write-Host ""
+        }
+
+        Write-CL "    [0] Back" "White"
+        Write-Host ""
+        Write-CL "  Spend points by entering the talent code (e.g., 11 = Tier1 first)." "DarkGray"
+        Write-Host ""
+        Write-C  "  > " "Yellow"
+        $sel = Read-Host
+
+        if($sel -eq "0" -or [string]::IsNullOrWhiteSpace($sel)){
+            $loop = $false
+            continue
+        }
+        # Parse two-digit code: tier then index
+        if($sel.Length -ne 2){
+            continue
+        }
+        $tierChar = $sel.Substring(0,1)
+        $idxChar  = $sel.Substring(1,1)
+        $tierN    = 0
+        $idxN     = 0
+        if(-not [int]::TryParse($tierChar, [ref]$tierN)){ continue }
+        if(-not [int]::TryParse($idxChar,  [ref]$idxN )){ continue }
+        if($tierN -lt 1 -or $tierN -gt 3 -or $idxN -lt 1 -or $idxN -gt 3){ continue }
+
+        # Find the talent
+        $tierTalents = @($talents | Where-Object { $_.Tier -eq $tierN })
+        if($idxN -gt $tierTalents.Count){ continue }
+        $picked = $tierTalents[$idxN - 1]
+
+        if(Has-Talent $picked.Id){
+            Write-CL "  $($picked.Name) is already purchased." "DarkGray"
+            Wait-Key
+            continue
+        }
+        if($script:PlayerLevel -lt (Get-TalentTierMinLevel $tierN)){
+            Write-CL "  Locked: requires level $(Get-TalentTierMinLevel $tierN)." "Red"
+            Wait-Key
+            continue
+        }
+        if($avail -lt 1){
+            Write-CL "  No talent points to spend." "Red"
+            Wait-Key
+            continue
+        }
+        # Confirm purchase
+        Write-Host ""
+        Write-CL "  Confirm: spend 1 point on $($picked.Name)?" "Yellow"
+        Write-CL "    $($picked.Desc)" "DarkGray"
+        Write-C  "  [y/n]: " "White"
+        $cf = Read-Host
+        if($cf -ne 'y' -and $cf -ne 'Y'){ continue }
+        $script:Talents[$picked.Id] = 1
+        # Some talents grant immediate stat boosts. The combat code
+        # already reads talent bonuses dynamically for ATK/DEF/MAG/SPD,
+        # but MaxHP/MaxMP are stored on the player object — apply the
+        # delta directly so the current pool benefits right away.
+        $p = $script:Player
+        $hpDelta = 0; $mpDelta = 0
+        switch($picked.Id){
+            "Knight_T1_A"     { $hpDelta = (5 * $script:PlayerLevel) }
+            "Brawler_T1_C"    { $hpDelta = (8 * $script:PlayerLevel) }
+            "Cleric_T1_A"     { $hpDelta = (4 * $script:PlayerLevel); $mpDelta = (4 * $script:PlayerLevel) }
+            "Berserker_T1_B"  { $hpDelta = (5 * $script:PlayerLevel) }
+            "Warlock_T1_B"    { $hpDelta = (5 * $script:PlayerLevel) }
+            "Mage_T1_A"       { $mpDelta = (5 * $script:PlayerLevel) }
+            "Necromancer_T1_A"{ $mpDelta = (5 * $script:PlayerLevel) }
+        }
+        # Lich's Pact: -20% max HP at purchase. (One-shot, doesn't
+        # re-apply on level up — keeps the math simple.)
+        if($picked.Id -eq "Necromancer_T3_A"){
+            $reduction = [math]::Floor($p.MaxHP * 0.20)
+            $p.MaxHP = [math]::Max($p.MaxHP - $reduction, 30)
+            if($p.HP -gt $p.MaxHP){ $p.HP = $p.MaxHP }
+        }
+        if($hpDelta -gt 0){
+            $p.MaxHP += $hpDelta
+            $p.HP    += $hpDelta
+        }
+        if($mpDelta -gt 0){
+            $p.MaxMP += $mpDelta
+            $p.MP    += $mpDelta
+        }
+        Write-CL "  $($picked.Name) acquired!" "Green"
+        if($hpDelta -gt 0){ Write-CL "  +$hpDelta Max HP" "Green" }
+        if($mpDelta -gt 0){ Write-CL "  +$mpDelta Max MP" "Cyan" }
+        Wait-Key
+    }
+}
+
+# ─── HIDDEN BOSS: THE ORPHANED PROCESS (v1.5 Pass 2) ──────────────
+# Secret super-boss. Spawn condition is gated to Daily Dungeon clears
+# at 100% HP with zero potions used. On defeat: permanent "Guild of
+# SysAdmin Favor" buff (+5 to all stats) and a 15% shop discount flag.
+# Sysadmin lore: an Orphaned Process is one whose parent has terminated
+# but the process itself never died — a perfect monster for a dungeon
+# built atop deprecated infrastructure.
+function Start-HiddenBossEncounter {
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "DarkMagenta"
+    Write-CL "  ║                                                                  ║" "DarkMagenta"
+    Write-CL "  ║              A   F L I C K E R   I N   T H E   L O G S          ║" "Magenta"
+    Write-CL "  ║                                                                  ║" "DarkMagenta"
+    Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "DarkMagenta"
+    Write-Host ""
+    Start-Sleep -Milliseconds 600
+    Write-CL "  As you turn to leave, the air goes still." "Gray"
+    Write-CL "  The torches sputter once, twice, then burn cold blue." "DarkCyan"
+    Write-Host ""
+    Start-Sleep -Milliseconds 800
+    Write-CL "  Something flickers at the edge of your awareness — a process" "Gray"
+    Write-CL "  whose parent terminated long ago, but which never received" "Gray"
+    Write-CL "  the signal. It has been running, alone, since before your" "Gray"
+    Write-CL "  kingdom was a kingdom." "Gray"
+    Write-Host ""
+    Start-Sleep -Milliseconds 1200
+    Write-CL "  An ORPHANED PROCESS surfaces from the depths." "Magenta"
+    Write-Host ""
+    Write-CL "                    ░░░░░░░" "DarkMagenta"
+    Write-CL "                  ░░  ▓▓▓  ░░" "Magenta"
+    Write-CL "                ░░  ▓ X X ▓  ░░" "DarkMagenta"
+    Write-CL "                ░░  ▓ ▔▔▔ ▓  ░░" "Magenta"
+    Write-CL "                  ░░  ▓▓▓  ░░" "DarkMagenta"
+    Write-CL "                    ░░ │ ░░" "Magenta"
+    Write-CL "                       │" "DarkMagenta"
+    Write-CL "                    pid:????" "DarkGray"
+    Write-Host ""
+    Write-CL "  '...still... running... still... running...'" "DarkMagenta"
+    Write-Host ""
+    Write-CL "  This is a SUPER-BOSS. Far stronger than any boss." "Yellow"
+    Write-Host ""
+    Write-C "  Engage? [y/n]: " "Yellow"
+    $eng = Read-Host
+    if($eng -ne 'y' -and $eng -ne 'Y'){
+        Write-CL "  You back away. The flicker fades. Some processes do not" "DarkGray"
+        Write-CL "  respond to keyboard interrupts." "DarkGray"
+        Wait-Key
+        return
+    }
+
+    # Build the hidden boss enemy. Stats: ~3x normal boss, with unique
+    # ability set themed around process/log/zombie-process flavor.
+    $lvl = [math]::Max($script:DungeonLevel, 5)
+    $hpScale = 1 + ($lvl - 1) * 0.30
+    $atkScale = 1 + ($lvl - 1) * 0.22
+    $orphan = @{
+        Name        = "Orphaned Process"
+        DisplayName = "*** THE ORPHANED PROCESS ***"
+        HP          = [math]::Floor(700 * $hpScale)
+        MaxHP       = [math]::Floor(700 * $hpScale)
+        ATK         = [math]::Floor(34 * $atkScale)
+        DEF         = [math]::Floor(20 * $hpScale)
+        SPD         = [math]::Floor(15 * $atkScale)
+        MAG         = [math]::Floor(28 * $atkScale)
+        XP          = [math]::Floor(1500 * $hpScale)
+        Gold        = [math]::Floor(800 + $lvl * 80)
+        IsBoss      = $true
+        IsMiniBoss  = $false
+        DropsKey    = $false
+        Stunned     = $false
+        Loot        = (New-RandomLoot ($lvl + 3))
+        Variant     = ""
+        Abilities   = @(
+            @{Name="Attack";          Power=0;  Type="Normal";    Cooldown=0}
+            @{Name="Stack Overflow";  Power=22; Type="Magic";     Cooldown=2}
+            @{Name="Zombie Spawn";    Power=18; Type="Physical";  Cooldown=3}
+            @{Name="Memory Leak";     Power=0;  Type="Buff";      Effect="ATK+8"; Cooldown=4}
+            @{Name="Force-Quit";      Power=30; Type="Physical";  Cooldown=5}
+            @{Name="Garbage Collect"; Power=40; Type="Heal";                     Cooldown=6}
+        )
+    }
+    $result = Start-Combat $orphan
+    if($result.Result -eq "Won"){
+        clr
+        Write-Host ""
+        Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "Yellow"
+        Write-CL "  ║                                                                  ║" "Yellow"
+        Write-CL "  ║              T H E   P R O C E S S   T E R M I N A T E S        ║" "Yellow"
+        Write-CL "  ║                                                                  ║" "Yellow"
+        Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "Yellow"
+        Write-Host ""
+        Write-CL "  The Orphaned Process emits one final stack trace and dissolves." "DarkGray"
+        Write-CL "  A scroll falls at your feet, signed by the Guild of SysAdmins." "Gray"
+        Write-Host ""
+        Write-CL "  ╔═══════════════════════════════════════════════════════╗" "Cyan"
+        Write-CL "  ║         GUILD OF SYSADMIN FAVOR GRANTED              ║" "Cyan"
+        Write-CL "  ╠═══════════════════════════════════════════════════════╣" "Cyan"
+        Write-CL "  ║   +5 ATK   +5 DEF   +5 SPD   +5 MAG                   ║" "Yellow"
+        Write-CL "  ║   +25 Max HP   +15 Max MP                            ║" "Green"
+        Write-CL "  ║   15% discount at all shops, permanently             ║" "Magenta"
+        Write-CL "  ╚═══════════════════════════════════════════════════════╝" "Cyan"
+        Write-Host ""
+        $p = $script:Player
+        $p.ATK    += 5
+        $p.DEF    += 5
+        $p.SPD    += 5
+        $p.MAG    += 5
+        $p.MaxHP  += 25; $p.HP += 25
+        $p.MaxMP  += 15; $p.MP += 15
+        if($p.HP -gt $p.MaxHP){ $p.HP = $p.MaxHP }
+        if($p.MP -gt $p.MaxMP){ $p.MP = $p.MaxMP }
+        $script:HiddenBossDefeated = $true
+        Write-CL "  Your Bestiary records a new entry: 'The Orphaned Process'." "DarkMagenta"
+        Wait-Key
+    } else {
+        Write-CL "  The Process keeps running. It always was. It always will be." "DarkGray"
+        Wait-Key
+    }
+}
+
+# Optional risk/reward modifiers offered at dungeon entry. Player picks
+# 1 of 3 random mutators or skips entirely. Each mutator amplifies a
+# specific stat or behavior in exchange for bonus rewards on clear.
+# Cleared on dungeon end (clear or death).
+function Get-MutatorPool {
+    @(
+        @{ Id="GlassCannon";  Name="Glass Cannon";    Desc="+50% damage dealt and taken";        Color="Red"     ; RewardMul=1.30 }
+        @{ Id="Pacifist";     Name="Pacifist's Path"; Desc="No XP from kills, +200% quest XP";   Color="Cyan"    ; RewardMul=1.20 }
+        @{ Id="CursedLoot";   Name="Cursed Loot";     Desc="Gear drops at 50% durability, +50% stats"; Color="DarkMagenta"; RewardMul=1.25 }
+        @{ Id="Speedrun";     Name="Speedrun";        Desc="Enemies +25% SPD, +50% gold from kills"; Color="Yellow"; RewardMul=1.20 }
+        @{ Id="Frugal";       Name="Frugal Run";      Desc="No starting potions/lockpicks, +75% gold"; Color="DarkYellow"; RewardMul=1.40 }
+        @{ Id="Hardcore";     Name="Hardcore";        Desc="Death loses 50% gold, +30% all rewards"; Color="DarkRed"  ; RewardMul=1.30 }
+    )
+}
+
+# True if the active mutator has the given ID. Safe to call when no
+# mutator is active.
+function Has-Mutator {
+    param([string]$Id)
+    if(-not $script:DungeonMutator){ return $false }
+    return $script:DungeonMutator.Id -eq $Id
+}
+
+# Returns the cleared-dungeon reward multiplier from the active mutator
+# (or 1.0 if none). Used at the boss-defeat/exit reward step.
+function Get-MutatorRewardMul {
+    if(-not $script:DungeonMutator){ return 1.0 }
+    return [double]$script:DungeonMutator.RewardMul
+}
+
+# Pre-dungeon screen offering 3 random mutators. Returns silently after
+# the player picks (sets $script:DungeonMutator) or skips ($null).
+function Show-MutatorChoice {
+    # Clear any leftover mutator from a previous run defensively.
+    $script:DungeonMutator = $null
+
+    $pool = Get-MutatorPool
+    # Pick 3 distinct random offers
+    $offers = @($pool | Get-Random -Count 3)
+
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "DarkYellow"
+    Write-CL "  ║                D U N G E O N   M U T A T O R S                  ║" "Yellow"
+    Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "DarkYellow"
+    Write-Host ""
+    Write-CL "  Before you descend, a Guild SysAdmin pins three sticky notes" "Gray"
+    Write-CL "  to your pack. Each is a runtime flag you can pass to today's" "Gray"
+    Write-CL "  dungeon — risk/reward modifiers that change the rules and" "Gray"
+    Write-CL "  amplify the gold/XP at the end if you clear it." "Gray"
+    Write-Host ""
+    Write-CL "  Pick one or skip." "DarkGray"
+    Write-Host ""
+
+    for($i=0; $i -lt $offers.Count; $i++){
+        $m = $offers[$i]
+        $rewardPct = [int](($m.RewardMul - 1.0) * 100)
+        Write-CL "    [$($i+1)] $($m.Name)" $m.Color
+        Write-CL "         $($m.Desc)" "Gray"
+        Write-CL "         Reward bonus on clear: +${rewardPct}% gold/XP" "DarkGray"
+        Write-Host ""
+    }
+    Write-CL "    [0] Skip — no mutator" "DarkGray"
+    Write-Host ""
+    Write-C "  > " "Yellow"
+    $choice = Read-Host
+    if([string]::IsNullOrWhiteSpace($choice)){ return }
+    $parsed = $null
+    if(-not [int]::TryParse($choice.Trim(), [ref]$parsed)){ return }
+    if($parsed -lt 1 -or $parsed -gt $offers.Count){ return }
+    $picked = $offers[$parsed - 1]
+    $script:DungeonMutator = @{
+        Id        = $picked.Id
+        Name      = $picked.Name
+        Desc      = $picked.Desc
+        Color     = $picked.Color
+        RewardMul = $picked.RewardMul
+    }
+    Write-Host ""
+    Write-CL "  Mutator activated: $($picked.Name)" $picked.Color
+    Write-CL "  $($picked.Desc)" "DarkGray"
+    Start-Sleep -Milliseconds 900
+}
+
+# Cleans up mutator state at dungeon end. Called from BOTH the
+# clear-and-exit path and the death path so the player isn't stuck
+# without their stashed gear after a Frugal run.
+function Reset-MutatorOnEnd {
+    if(Has-Mutator "Frugal"){
+        if($script:FrugalStashedPotions){
+            foreach($p in $script:FrugalStashedPotions){
+                [void]$script:Potions.Add($p)
+            }
+        }
+        if($script:FrugalStashedThrowables){
+            foreach($p in $script:FrugalStashedThrowables){
+                [void]$script:ThrowablePotions.Add($p)
+            }
+        }
+        $script:Lockpicks += [int]$script:FrugalStashedLockpicks
+    }
+    $script:FrugalStashedPotions    = $null
+    $script:FrugalStashedThrowables = $null
+    $script:FrugalStashedLockpicks  = 0
+    $script:DungeonMutator          = $null
+    # Revert Berserker Final Stand stat buffs so they don't compound
+    # across dungeons. The deltas were stored at proc time.
+    if($script:FinalStandBuffs){
+        $p = $script:Player
+        if($p){
+            $p.ATK -= [int]$script:FinalStandBuffs.ATK
+            $p.DEF -= [int]$script:FinalStandBuffs.DEF
+            $p.SPD -= [int]$script:FinalStandBuffs.SPD
+            $p.MAG -= [int]$script:FinalStandBuffs.MAG
+            # Floor at 1 to avoid negative stats from mismatched math
+            if($p.ATK -lt 1){ $p.ATK = 1 }
+            if($p.DEF -lt 1){ $p.DEF = 1 }
+            if($p.SPD -lt 1){ $p.SPD = 1 }
+            if($p.MAG -lt 1){ $p.MAG = 1 }
+        }
+        $script:FinalStandBuffs = $null
+    }
+}
+
 function Enter-Dungeon {
     $script:DungeonLevel++
     $script:HasBossKey   = $false
@@ -5792,9 +7977,58 @@ function Enter-Dungeon {
     $script:EncountersThisDungeon = 0  # reset encounter cap counter
     $script:EncounterTiles = @{}      # reset per-tile encounter history
 
-    # Restore some HP/MP on entry
-    $script:Player.HP = [math]::Min($script:Player.HP + [math]::Floor($script:Player.MaxHP*0.3), $script:Player.MaxHP)
-    $script:Player.MP = [math]::Min($script:Player.MP + [math]::Floor($script:Player.MaxMP*0.3), $script:Player.MaxMP)
+    # Reset per-run state — bestiary "first seen" flags clear, run stats
+    # restart at zero, and the hidden-boss gating flags reset.
+    $script:RunStats = @{
+        DamageDealt   = 0
+        DamageTaken   = 0
+        GoldEarned    = 0
+        XPEarned      = 0
+        KillsThisRun  = 0
+        CritsThisRun  = 0
+        PotionsUsed   = 0
+        HighestCombo  = 0
+        StepsTaken    = 0
+    }
+    $script:UsedPotionsThisDungeon = $false
+    $script:TookDamageThisDungeon  = $false
+    # Per-dungeon one-shot talent flags. Reset on every dungeon entry so
+    # the player gets the proc once per run.
+    $script:LastStandUsed     = $false   # Knight T3_B
+    $script:ResurrectionUsed  = $false   # Cleric  T3_C
+    $script:FinalStandUsed    = $false   # Berserker T3_C
+    $script:LayOnHandsUsed    = $false   # Cleric  T3_B
+
+    # Ranger Trapfinder: +1 free lockpick on dungeon entry
+    if(Has-Talent "Ranger_T3_C"){
+        $script:Lockpicks += 1
+    }
+    # Cooking food buffs persist for one dungeon run only. Cleared here
+    # so the buff doesn't carry into the NEXT entry.
+    $script:ActiveFoodBuff = $null
+    foreach($k in @($script:Bestiary.Keys)){
+        if($script:Bestiary[$k].FirstSeen){ $script:Bestiary[$k].FirstSeen = $false }
+    }
+
+    # Frugal Run mutator: stash all potions, throwables, and lockpicks
+    # for the run. Restored automatically on dungeon end (clear or death).
+    if(Has-Mutator "Frugal"){
+        $script:FrugalStashedPotions    = @($script:Potions.ToArray())
+        $script:FrugalStashedThrowables = @($script:ThrowablePotions.ToArray())
+        $script:FrugalStashedLockpicks  = $script:Lockpicks
+        $script:Potions.Clear()
+        $script:ThrowablePotions.Clear()
+        $script:Lockpicks = 0
+    } else {
+        $script:FrugalStashedPotions    = $null
+        $script:FrugalStashedThrowables = $null
+        $script:FrugalStashedLockpicks  = 0
+    }
+
+    # NOTE: Dungeon entry no longer auto-restores HP/MP. Players were
+    # exploiting this by entering and exiting dungeons repeatedly to
+    # heal for free. To recover, use potions, sleep at the Inn, or
+    # rely on Cleric/Bard healing.
 
     # Reset frame buffer so the first dungeon render is a full paint
     Reset-FrameBuffer
@@ -5923,6 +8157,13 @@ function Enter-Dungeon {
             # cooldown still applies so spamming W against a wall doesn't
             # fall through into hyper-speed input later.
             $lastMoveStamp = [DateTime]::Now
+            $script:RunStats.StepsTaken++
+            # Cleric Sanctuary: +3 HP per dungeon step (capped at MaxHP).
+            # Quietly applied — no status message to keep the step loop
+            # uncluttered.
+            if(Has-Talent "Cleric_T2_C" -and $script:Player.HP -lt $script:Player.MaxHP){
+                $script:Player.HP = [math]::Min($script:Player.HP + 3, $script:Player.MaxHP)
+            }
         }
         if($isMoveKey -and (Test-Encumbered)){
             $cur = Get-CurrentCarryWeight
@@ -6002,7 +8243,7 @@ function Enter-Dungeon {
                             Write-CL "    *    .      .       *      .       .   " "Yellow"
                             Write-CL "       .    *      .      *    .    *      " "DarkYellow"
                             Write-Host ""
-                            Write-CL "  You emerge victorious from Dungeon Level $($script:DungeonLevel)!" "Green"
+                            Write-CL "  You emerge victorious from the dungeon!" "Green"
                             Write-Host ""
 
                             # Streak tracking: survived a clear
@@ -6010,15 +8251,27 @@ function Enter-Dungeon {
                             if($script:Streak -gt $script:BestStreak){
                                 $script:BestStreak = $script:Streak
                             }
+                            # Lifetime clears counter for achievements
+                            $script:DungeonsCleared++
                             Write-CL "  Current clear streak: $($script:Streak)x" "Yellow"
 
                             $dailyMultiplier = if($script:DailyDungeonActive){2}else{1}
                             $bonusGold = 100 * $dailyMultiplier
+                            # Mutator reward multiplier: applied on top of daily multiplier
+                            $mutMul = Get-MutatorRewardMul
+                            if($mutMul -gt 1.0){
+                                $mutBonus = [math]::Floor($bonusGold * ($mutMul - 1.0))
+                                $bonusGold += $mutBonus
+                            }
                             $script:Gold += $bonusGold
                             if($dailyMultiplier -gt 1){
                                 Write-CL "  + $bonusGold Gold (DAILY DUNGEON 2x BONUS!)" "Yellow"
                             } else {
                                 Write-CL "  + $bonusGold Gold (Completion Bonus)" "Yellow"
+                            }
+                            if($mutMul -gt 1.0 -and $script:DungeonMutator){
+                                $pct = [int](($mutMul - 1.0) * 100)
+                                Write-CL "    (+${pct}% from mutator: $($script:DungeonMutator.Name))" $script:DungeonMutator.Color
                             }
 
                             Write-Host ""
@@ -6086,7 +8339,43 @@ function Enter-Dungeon {
                             Write-CL "  Total loot in inventory: ${totalLoot}g sell value" "DarkGray"
                             Write-CL "  Gold on hand: $($script:Gold)g" "Yellow"
                             Write-Host ""
+                            Show-RunSummary -Outcome "VICTORY"
+
+                            # ── Hidden boss check ──
+                            # Spawn condition: Daily Dungeon, full HP, no potions used.
+                            # Once defeated permanently (lifetime flag), no respawn.
+                            # Note: while Frugal mutator is active, potions are
+                            # stashed at the door — UsedPotionsThisDungeon will
+                            # be false even if the player would have used them
+                            # but couldn't. We accept this consistency: Frugal
+                            # is a "no consumables" run anyway, so the spawn
+                            # gate semantically holds.
+                            $hbCondition = (
+                                $script:DailyDungeonActive -and
+                                $script:Player.HP -eq $script:Player.MaxHP -and
+                                -not $script:UsedPotionsThisDungeon -and
+                                -not $script:HiddenBossDefeated
+                            )
+                            if($hbCondition){
+                                Wait-Key
+                                # Preserve streak across the optional fight.
+                                # If the player dies to the hidden boss, the
+                                # combat exit handler will reset $script:Streak
+                                # to 0 — but since the dungeon was already
+                                # cleared, we restore the streak so the
+                                # decision to engage the optional boss isn't
+                                # punished by losing the clear streak.
+                                $streakBeforeHidden = [int]$script:Streak
+                                $bestBeforeHidden   = [int]$script:BestStreak
+                                Start-HiddenBossEncounter
+                                if($script:Player.HP -le 0){
+                                    $script:Streak     = $streakBeforeHidden
+                                    $script:BestStreak = $bestBeforeHidden
+                                }
+                            }
+
                             Wait-Key
+                            Reset-MutatorOnEnd
                             $inDungeon = $false
                         } else {
                             $script:StatusMsg = "Defeat the BOSS before you can leave!"
@@ -6167,6 +8456,24 @@ function Enter-Dungeon {
                                     $chestPile += $pickBundle
                                 }
 
+                                # Found notes (v1.5): 15% chance to include a journal
+                                # entry from the previous adventurer's pile of regrets.
+                                # Pure flavor — no mechanics. Read in inventory ("V").
+                                if((Get-Random -Max 100) -lt 15){
+                                    $notePool = Get-NotePool
+                                    $note = $notePool | Get-Random
+                                    $noteItem = @{
+                                        Name      = $note.Title
+                                        Kind      = "Note"
+                                        IsNote    = $true
+                                        Body      = $note.Body
+                                        Weight    = 1
+                                        Value     = 5
+                                        Desc      = "A weathered scrap of writing. (View to read)"
+                                    }
+                                    $chestPile += $noteItem
+                                }
+
                                 Update-QuestProgress "Treasure"
                                 Update-QuestProgress "Lockpicker"; $script:TotalLocksPicked++
                                 $d.Grid[$ny,$nx] = 0      # remove chest (taken or not)
@@ -6179,7 +8486,7 @@ function Enter-Dungeon {
                                     Write-Host ""
                                     Write-CL "  Loot stowed:" "Magenta"
                                     foreach($t in $taken){
-                                        $kindTag = switch($t.Kind){"Weapon"{"[Wpn]"}"Armor"{"[Arm]"}default{""}}
+                                        $kindTag = switch($t.Kind){"Weapon"{"[Wpn]"}"Armor"{"[Arm]"}"Ingredient"{"[Ing]"}"Note"{"[Note]"}default{""}}
                                         Write-CL "    + $($t.Name) $kindTag" "Magenta"
                                     }
                                     Write-Host ""
@@ -6249,14 +8556,20 @@ function Enter-Dungeon {
                                 if($pp -and $pp.MaxDurability -ge 0 -and $pp.Durability -lt $pp.MaxDurability){ $hasDamagedGear = $true; break }
                             }
                         }
-                        if($dutchAllowed -and $roll -lt 15){
+                        if($dutchAllowed -and $roll -lt 15 -and $script:EncountersThisDungeon -lt 3){
+                            $script:EncountersThisDungeon++
                             $script:EncounterTiles[$tileKey] = $true
                             Start-RandomEncounter -Type "Dutchman"
-                        } elseif($hasDamagedGear -and $roll -ge 15 -and $roll -lt 20 -and $tileFreshForEncounter){
+                        } elseif($hasDamagedGear -and $roll -ge 15 -and $roll -lt 20 -and $tileFreshForEncounter -and $script:EncountersThisDungeon -lt 3){
                             # 0.5% (5 in 1000) chance for free repair encounter — rare gift
+                            $script:EncountersThisDungeon++
                             $script:EncounterTiles[$tileKey] = $true
                             Start-RandomEncounter -Type "RepairSmith"
-                        } elseif($roll -lt 15 -and $script:EncountersThisDungeon -lt 2 -and $tileFreshForEncounter){
+                        } elseif($roll -lt 10 -and $script:EncountersThisDungeon -lt 2 -and $tileFreshForEncounter){
+                            # Normal encounters: 1.0% per step (was 1.5%).
+                            # Cap at 2 normals per dungeon; Dutchman+RepairSmith
+                            # share the larger 3 cap above so all-types-combined
+                            # never exceeds 3 encounters per dungeon run.
                             $script:EncountersThisDungeon++
                             $script:EncounterTiles[$tileKey] = $true
                             Start-RandomEncounter
@@ -6282,10 +8595,12 @@ function Enter-Dungeon {
                         $script:PlayerLevel -ge 15 -and
                         -not $script:OwnsDutchmanBlade
                     )
-                    if($dutchAllowed -and $roll -lt 10){
+                    if($dutchAllowed -and $roll -lt 10 -and $script:EncountersThisDungeon -lt 3){
+                        $script:EncountersThisDungeon++
                         $script:EncounterTiles[$tileKey] = $true
                         Start-RandomEncounter -Type "Dutchman"
-                    } elseif($roll -lt 8 -and $script:EncountersThisDungeon -lt 2 -and $tileFreshForEncounter){
+                    } elseif($roll -lt 5 -and $script:EncountersThisDungeon -lt 2 -and $tileFreshForEncounter){
+                        # Backward steps trigger encounters at 0.5% (was 0.8%)
                         $script:EncountersThisDungeon++
                         $script:EncounterTiles[$tileKey] = $true
                         Start-RandomEncounter
@@ -6330,10 +8645,16 @@ function Enter-Dungeon {
                                     if($p.HP -eq $p.MaxHP){
                                         $script:StatusMsg = "HP already full!"
                                     } else {
-                                        $healed = [math]::Min($pot.Power, $p.MaxHP - $p.HP)
+                                        $power = [int]$pot.Power
+                                        if(Has-Talent "Cleric_T2_A"){
+                                            $power = [math]::Floor($power * 1.30)
+                                        }
+                                        $healed = [math]::Min($power, $p.MaxHP - $p.HP)
                                         $p.HP += $healed
                                         $script:StatusMsg = "Used $($pot.Name)! Restored $healed HP! ($($p.HP)/$($p.MaxHP))"
                                         $script:Potions.Remove($pot)
+                                        $script:RunStats.PotionsUsed++
+                                        $script:UsedPotionsThisDungeon = $true
                                     }
                                 }
                                 "Mana" {
@@ -6344,6 +8665,8 @@ function Enter-Dungeon {
                                         $p.MP += $restored
                                         $script:StatusMsg = "Used $($pot.Name)! Restored $restored MP! ($($p.MP)/$($p.MaxMP))"
                                         $script:Potions.Remove($pot)
+                                        $script:RunStats.PotionsUsed++
+                                        $script:UsedPotionsThisDungeon = $true
                                     }
                                 }
                             }
@@ -6425,6 +8748,7 @@ function Enter-Dungeon {
                     Write-CL "  Remaining Loot: $($script:Inventory.Count) item(s)" "DarkGray"
                     Write-Host ""
                     Wait-Key
+                    Reset-MutatorOnEnd
                     $inDungeon = $false
                     $script:DungeonLevel--
                 }
@@ -6435,6 +8759,16 @@ function Enter-Dungeon {
     }
 
         if($script:Player.HP -le 0){
+        # Hardcore mutator: lose 50% of gold on death (instead of zero
+        # under normal play — corpse-runs are not a thing in this game).
+        if(Has-Mutator "Hardcore"){
+            $hcLoss = [math]::Floor($script:Gold * 0.50)
+            if($hcLoss -gt 0){
+                $script:Gold -= $hcLoss
+            }
+        }
+        # Mutator state cleared so the next dungeon entry starts fresh.
+        Reset-MutatorOnEnd
         clr
         Write-CL "" "Red"
         Write-CL "  ╔══════════════════════════════════════════════════════╗" "DarkRed"
@@ -6461,6 +8795,8 @@ function Enter-Dungeon {
         Write-CL "  Player Level: $($script:PlayerLevel)" "DarkGray"
         Write-CL "  Gold: $($script:Gold)" "DarkGray"
         Write-CL "  Enemies Slain: Many." "DarkGray"
+        Write-Host ""
+        Show-RunSummary -Outcome "DEATH"
         Write-Host ""
         Write-CL "  ┌─────────────────────────────────────┐" "DarkGray"
         Write-CL "  │                                     │" "DarkGray"
@@ -6655,9 +8991,28 @@ function Show-CharacterSelect {
     Write-CL "  TIP: Weapons matching your class grant bonus ATK." "DarkGray"
     Write-Host ""
 
-    Write-C "  > " "Yellow"; $pick = Read-Host
-    $pickIdx = (ConvertTo-SafeInt -Value $pick) - 1
-    if($pickIdx -lt 0 -or $pickIdx -ge $classOrder.Count){ $pickIdx = 0 }
+    # Loop until the player gives a valid 1-8 selection. Empty input
+    # (just hitting Enter) is rejected — previously this silently defaulted
+    # to Knight, which surprised players.
+    $pickIdx = -1
+    while($pickIdx -lt 0 -or $pickIdx -ge $classOrder.Count){
+        Write-C "  > " "Yellow"; $pick = Read-Host
+        if([string]::IsNullOrWhiteSpace($pick)){
+            Write-CL "  Please choose a class (1-$($classOrder.Count))." "Red"
+            continue
+        }
+        $parsed = $null
+        if(-not [int]::TryParse($pick.Trim(), [ref]$parsed)){
+            Write-CL "  '$pick' is not a number. Choose 1-$($classOrder.Count)." "Red"
+            continue
+        }
+        $cand = $parsed - 1
+        if($cand -lt 0 -or $cand -ge $classOrder.Count){
+            Write-CL "  Out of range. Choose 1-$($classOrder.Count)." "Red"
+            continue
+        }
+        $pickIdx = $cand
+    }
     $className = $classOrder[$pickIdx]
     $template = $classes[$className]
 
@@ -6693,6 +9048,9 @@ function Show-CharacterSelect {
     $script:XPToNext = 100
     $script:KillCount = 0
     $script:Partner = $null
+    $script:Pet     = $null
+    $script:Ingredients = @{}
+    $script:ActiveFoodBuff = $null
     $script:Quests.Clear()
     $script:TrainingPoints = @{ ATK=0; DEF=0; SPD=0; MAG=0; HP=0; MP=0 }
     $script:Streak = 0
@@ -6719,10 +9077,119 @@ function Show-CharacterSelect {
     $script:TotalStanceSwaps = 0
     $script:TotalRepairs = 0
     $script:TotalEncumbered = 0
+    $script:DungeonsCleared = 0
+    $script:NGPlusLevel = 0
+    $script:HiddenBossDefeated = $false
+    $script:Bestiary = @{}
+    $script:Talents = @{}
+    $script:LastStandUsed    = $false
+    $script:ResurrectionUsed = $false
+    $script:FinalStandUsed   = $false
+    $script:LayOnHandsUsed   = $false
 
     Write-Host ""
     Write-CL "  You are a $className. Your journey begins..." "Green"
     Wait-Key
+}
+
+
+# ─── DEBUG RUN (HIDDEN) ───────────────────────────────────────────
+# Triggered by typing the dev passphrase at the splash menu prompt.
+# Spins up a fully-stocked Cleric in town with 9999 gold so the
+# developer can play-test deep systems without grinding to them.
+# Mirrors the state initialization in Show-CharacterSelect, then
+# overrides gold, then jumps directly into the main town loop.
+# Not advertised anywhere; tutorial offer is suppressed too.
+function Start-DebugRun {
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkMagenta"
+    Write-CL "  ║              D E B U G   M O D E                 ║" "Magenta"
+    Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkMagenta"
+    Write-Host ""
+    Write-CL "  Spawning Cleric in town with 9999g..." "DarkGray"
+    Write-Host ""
+
+    $classes = Get-ClassTemplates
+    $template = $classes["Cleric"]
+
+    $script:PlayerClass = "Cleric"
+    $script:Player = @{
+        Name      = $template.Name
+        HP        = $template.HP
+        MaxHP     = $template.MaxHP
+        MP        = $template.MP
+        MaxMP     = $template.MaxMP
+        ATK       = $template.ATK
+        DEF       = $template.DEF
+        SPD       = $template.SPD
+        MAG       = $template.MAG
+        Abilities = $template.Abilities
+    }
+    $script:EquippedWeapon = $null
+    $script:EquippedArmor = @{
+        Helmet = $null; Chest = $null; Shield = $null; Amulet = $null; Boots = $null
+    }
+    # The defining override — debug starts you flush so the entire shop
+    # is reachable in one trip. Everything else mirrors a clean new game.
+    $script:Gold = 9999
+    $script:Inventory.Clear()
+    $script:Potions.Clear()
+    $script:ThrowablePotions.Clear()
+    [void]$script:Potions.Add(@{Name="Small Health Potion";Type="Heal";Power=30;Price=25;Desc="Restore 30 HP"})
+    $script:DungeonLevel = 0
+    $script:PlayerLevel = 1
+    $script:XP = 0
+    $script:XPToNext = 100
+    $script:KillCount = 0
+    $script:Partner = $null
+    $script:Pet     = $null
+    $script:Ingredients = @{}
+    $script:ActiveFoodBuff = $null
+    $script:Quests.Clear()
+    $script:TrainingPoints = @{ ATK=0; DEF=0; SPD=0; MAG=0; HP=0; MP=0 }
+    $script:Streak = 0
+    $script:BestStreak = 0
+    $script:Achievements = @{}
+    $script:TotalKills = 0
+    $script:BossesDefeated = 0
+    $script:WeaponsOwned = @{}
+    $script:ArmorOwned = @{}
+    $script:OwnsDutchmanBlade = $false
+    $script:CompletedQuests = 0
+    $script:DailyDungeonActive = $false
+    $script:Lockpicks = 5
+    $script:RepairKits = 0
+    $script:ExtraStrongPotions = 0
+    $script:DisturbedChests = @{}
+    $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
+    $script:Stance = "Balanced"
+    $script:TotalCrits = 0
+    $script:TotalLocksPicked = 0
+    $script:TotalBareKills = 0
+    $script:TotalUntouched = 0
+    $script:TotalStanceSwaps = 0
+    $script:TotalRepairs = 0
+    $script:TotalEncumbered = 0
+    $script:DungeonsCleared = 0
+    $script:NGPlusLevel = 0
+    $script:HiddenBossDefeated = $false
+    $script:Bestiary = @{}
+    $script:Talents = @{}
+    $script:LastStandUsed    = $false
+    $script:ResurrectionUsed = $false
+    $script:FinalStandUsed   = $false
+    $script:LayOnHandsUsed   = $false
+    # Skip the tutorial offer — debug runs assume the dev knows the game.
+    $script:TutorialSeen = $true
+
+    Write-CL "  Ready. Press a key to enter town." "Green"
+    Wait-Key
+
+    # Jump into the main town loop. Show-MainMenu doesn't return until
+    # the player quits the game, so this satisfies the splash-menu
+    # caller, which uses `return` after invoking us.
+    Show-MainMenu
 }
 
 
@@ -7062,6 +9529,10 @@ if(-not $script:AvailableQuests -or $script:AvailableQuests.Count -eq 0){
                             $totalBardBonus += $bonus
                             $thisXP += $bonus
                         }
+                        # Pacifist's Path mutator: triple quest XP rewards
+                        if(Has-Mutator "Pacifist"){
+                            $thisXP *= 3
+                        }
                         $totalXP += $thisXP
                         Write-CL "  ✓ $($rq.Desc)" "Green"
                         Write-CL "    + $($rq.RewardGold)g, + $thisXP XP" "DarkGray"
@@ -7174,6 +9645,17 @@ function Get-WeaponShop {
         @{Name="War Hammer";       ATK=12; Price=300;  WeaponType="Hammer"; ClassAffinity="Brawler";     AffinityBonus=3; Perk=$null;   PerkChance=0}
         @{Name="Phoenix Edge";     ATK=25; Price=1800; WeaponType="Dagger"; ClassAffinity="Ranger";      AffinityBonus=5; Perk="Burn";  PerkChance=40}
         @{Name="Worldbreaker Maul";ATK=28; Price=2100; WeaponType="Hammer"; ClassAffinity="Brawler";     AffinityBonus=5; Perk="Stun";  PerkChance=35}
+
+        # ── TWO-HANDED WEAPONS (v1.5) ──
+        # Trade your shield slot for serious damage. The TwoHanded=$true
+        # field is detected at equip time: equipping a 2H auto-stows your
+        # shield, and equipping a shield while wielding 2H stows the
+        # weapon. Brawler is intentionally excluded (already strong).
+        @{Name="Greatsword";        ATK=38; Price=800;  WeaponType="Sword";  ClassAffinity="Knight";      AffinityBonus=8;  Perk="Bleed";  PerkChance=40; TwoHanded=$true; Weight=8}
+        @{Name="Archmage's Spire";  ATK=32; Price=900;  WeaponType="Staff";  ClassAffinity="Mage";        AffinityBonus=8;  Perk="Burn";   PerkChance=40; TwoHanded=$true; MAGBonus=12; Weight=7}
+        @{Name="Hunter's Longbow";  ATK=33; Price=750;  WeaponType="Bow";    ClassAffinity="Ranger";      AffinityBonus=8;  Perk="Poison"; PerkChance=40; TwoHanded=$true; Weight=6}
+        @{Name="War Maul";          ATK=36; Price=850;  WeaponType="Mace";   ClassAffinity="Cleric";      AffinityBonus=8;  Perk="Stun";   PerkChance=40; TwoHanded=$true; Weight=9}
+        @{Name="Death Scythe";      ATK=40; Price=1100; WeaponType="Scythe"; ClassAffinity="Necromancer"; AffinityBonus=10; Perk="Drain";  PerkChance=45; TwoHanded=$true; MAGBonus=10; Weight=8}
     )
 }
 
@@ -7252,16 +9734,31 @@ function Save-Game {
         }
     }
 
-    # ── Potion counts (v5: 7 regular + 4 throwable; bomb added in this update) ──
+    # ── Potion counts (v6: 7 regular + 4 throwable + 4 special). Special
+    # potions (Extra Strong) live in the regular potion bag but were
+    # excluded from saves before v6, silently disappearing on save/load.
     $potShop = Get-PotionShop
-    $potCounts = @(0, 0, 0, 0, 0, 0, 0)
-    $throwCounts = @(0, 0, 0, 0)
+    $potCounts     = @(0, 0, 0, 0, 0, 0, 0)
+    $throwCounts   = @(0, 0, 0, 0)
+    $specialCounts = @(0, 0, 0, 0)   # ES Health, ES Mana, ES Strength, ES Luck
 
     foreach($pot in $script:Potions){
+        $matched = $false
+        # Regular (indices 0..6)
         for($i = 0; $i -lt 7; $i++){
             if($pot.Name -eq $potShop[$i].Name){
                 $potCounts[$i]++
+                $matched = $true
                 break
+            }
+        }
+        # Special (indices 11..14) — same bag, distinct slot in save format
+        if(-not $matched){
+            for($i = 11; $i -lt 15; $i++){
+                if($pot.Name -eq $potShop[$i].Name){
+                    $specialCounts[$i - 11]++
+                    break
+                }
             }
         }
     }
@@ -7324,7 +9821,7 @@ function Save-Game {
     $durStr = $durParts -join ","
 
     $saveStr = @(
-        "5"                          # [0]  format version (v5: lifetime stat counters)
+        "7"                          # [0]  format version (v7: pet, ingredients, food buff, hidden boss, NG+)
         $classIdx                    # [1]  class
         $script:PlayerLevel          # [2]  level
         $script:XP                   # [3]  current XP
@@ -7344,7 +9841,7 @@ function Save-Game {
         $weapIdx                     # [17] weapon
         ($armorIndices -join ",")    # [18] armor "h,c,s,a,b"
         ($potCounts -join ",")       # [19] potion counts (7)
-        ($throwCounts -join ",")     # [20] throwable counts (3)
+        ($throwCounts -join ",")     # [20] throwable counts (4)
         $partnerIdx                  # [21] partner
         # ── v2 extensions ──
         0                            # [22] streak (always saved as 0)
@@ -7361,11 +9858,47 @@ function Save-Game {
         # ── v3 extension ──
         $durStr                      # [33] durability "weapon,helmet,chest,shield,amulet,boots"
         # ── v3 extension ──
-        "$($script:RepairKits),$($script:ExtraStrongPotions)"  # [34] special items
+        "$($script:RepairKits),$($script:ExtraStrongPotions)"  # [34] special items (legacy ESP counter)
         $script:Stance               # [35] combat stance ("Aggressive"/"Balanced"/"Defensive")
         # ── v5 extension: lifetime stat counters (drives new achievements) ──
         # Single packed field to keep the format compact: comma-separated.
         "$($script:TotalCrits),$($script:TotalLocksPicked),$($script:TotalBareKills),$($script:TotalUntouched),$($script:TotalStanceSwaps),$($script:TotalRepairs),$($script:CompletedQuests)"  # [36]
+        # ── v6 extension: ES potion counts in bag (Health,Mana,Strength,Luck) ──
+        ($specialCounts -join ",")   # [37]
+        # ── v6 extension: more lifetime counters added in this batch ──
+        "$($script:DungeonsCleared),$($script:TotalEncumbered)"  # [38]
+        # ── v7 extension: pet ("Hound"/"Raven"/"Falcon" or "") ──
+        $(if($script:Pet){$script:Pet.Type}else{""})  # [39]
+        # ── v7 extension: NG+ level (Pass 2 feature) and hidden-boss flag ──
+        "$(if($script:NGPlusLevel){$script:NGPlusLevel}else{0}),$(if($script:HiddenBossDefeated){1}else{0})"  # [40]
+        # ── v7 extension: cooking ingredients "Mushroom,Herb,Meat,Bone" ──
+        "$(if($script:Ingredients.Mushroom){[int]$script:Ingredients.Mushroom}else{0}),$(if($script:Ingredients.Herb){[int]$script:Ingredients.Herb}else{0}),$(if($script:Ingredients.Meat){[int]$script:Ingredients.Meat}else{0}),$(if($script:Ingredients.Bone){[int]$script:Ingredients.Bone}else{0})"  # [41]
+        # ── v7 extension: bestiary, encoded as "key:count" pairs joined by ';' ──
+        # ActiveFoodBuff intentionally omitted — buffs reset on dungeon
+        # transitions, so saving the player in town would clear them anyway.
+        $(
+            $bestPairs = @()
+            foreach($k in $script:Bestiary.Keys){
+                $cnt = $script:Bestiary[$k].Kills
+                # Strip semicolons and pipes from keys defensively (variant
+                # names are clean but defense in depth never hurts).
+                $cleanK = ($k -replace '[;\|:]', '_')
+                $bestPairs += "${cleanK}:${cnt}"
+            }
+            $bestPairs -join ";"
+        )  # [42]
+        # ── v7 extension: talents — semicolon-joined list of purchased IDs ──
+        $(
+            $tIds = @()
+            if($script:Talents){
+                foreach($k in $script:Talents.Keys){
+                    if($script:Talents[$k] -eq 1){
+                        $tIds += ($k -replace '[;\|:]', '_')
+                    }
+                }
+            }
+            $tIds -join ";"
+        )  # [43]
     ) -join "|"
 
     # ── Checksum ──
@@ -7397,23 +9930,27 @@ function Load-Game {
     # ── Split into parts ──
     $parts = $saveStr -split '\|'
     $ver = $parts[0]
-    # Only v4 and v5 accepted. v1/v2 predate durability; v3 predates the
-    # inventory weight system. v4 = inventory weight; v5 = adds lifetime
-    # stat counters for the new achievements.
+    # Only v4, v5, and v6 accepted. v1/v2 predate durability; v3 predates
+    # the inventory weight system. v4 = inventory weight; v5 = lifetime
+    # stat counters; v6 = ES potion bag entries + DungeonsCleared/TotalEncumbered.
     if($ver -eq "1" -or $ver -eq "2" -or $ver -eq "3"){
         return @{ Success = $false; Error = "This save is from an older version and can't be loaded. The inventory weight update requires a new character." }
     }
-    if($ver -ne "4" -and $ver -ne "5"){
+    if($ver -ne "4" -and $ver -ne "5" -and $ver -ne "6" -and $ver -ne "7"){
         return @{ Success = $false; Error = "Unknown save format version '$ver'." }
     }
     # Accepted lengths (parts including checksum):
     #   v4 with stance:    37  (36 data + 1 checksum)
     #   v4 without stance: 36  (legacy v4)
     #   v5:                38  (37 data + 1 checksum)
+    #   v6:                40  (39 data + 1 checksum)
+    #   v7:                45  (44 data + 1 checksum, includes talents)
     $expectedLen = $parts.Count
     $validLen = switch($ver){
         "4" { @(36, 37) -contains $expectedLen }
         "5" { $expectedLen -eq 38 }
+        "6" { $expectedLen -eq 40 }
+        "7" { $expectedLen -eq 45 }
     }
     if(-not $validLen){
         return @{ Success = $false; Error = "Save code is corrupted (wrong length for v$ver)." }
@@ -7693,6 +10230,104 @@ function Load-Game {
         } catch {
             # Malformed counters — leave at 0, don't fail the whole load
         }
+    }
+
+    # ── ES potion bag (field [37], v6+): "h,m,s,l" counts.
+    # Order: Health, Mana, Strength, Luck. Adds the matching templates
+    # to $script:Potions. v4/v5 saves don't have this field — ES potions
+    # for those players come back via the legacy migration in field [34].
+    if($parts.Count -ge 40 -and ($ver -eq "6" -or $ver -eq "7")){
+        try {
+            $specialStr = $parts[37]
+            $specialArr = $specialStr -split ","
+            if($specialArr.Count -ge 4){
+                $espShop = Get-PotionShop | Where-Object { $_.Category -eq "Special" }
+                # Order in PotionShop: Health(0), Mana(1), Strength(2), Luck(3)
+                for($si = 0; $si -lt 4; $si++){
+                    $count = [int]$specialArr[$si]
+                    for($c = 0; $c -lt $count; $c++){
+                        [void]$script:Potions.Add($espShop[$si])
+                    }
+                }
+            }
+        } catch {
+            # Malformed — skip silently
+        }
+    }
+
+    # ── Lifetime cleared / encumbered counters (field [38], v6+).
+    $script:DungeonsCleared = 0
+    $script:TotalEncumbered = 0
+    if($parts.Count -ge 40 -and ($ver -eq "6" -or $ver -eq "7")){
+        try {
+            $extraStr = $parts[38]
+            $extraArr = $extraStr -split ","
+            if($extraArr.Count -ge 1){ $script:DungeonsCleared = [int]$extraArr[0] }
+            if($extraArr.Count -ge 2){ $script:TotalEncumbered = [int]$extraArr[1] }
+        } catch {}
+    }
+
+    # ── v7-only fields ──
+    $script:Pet = $null
+    $script:NGPlusLevel = 0
+    $script:HiddenBossDefeated = $false
+    $script:Ingredients = @{}
+    $script:Bestiary    = @{}
+    $script:ActiveFoodBuff = $null
+    if($ver -eq "7" -and $parts.Count -ge 44){
+        # [39] pet
+        try {
+            $petStr = $parts[39]
+            if($petStr -in @("Hound","Raven","Falcon")){
+                $petDescs = @{
+                    Hound  = "Reveals chests on the minimap regardless of fog"
+                    Raven  = "+5% gold from all sources"
+                    Falcon = "Minimap reveal radius increased (5 -> 8)"
+                }
+                $script:Pet = @{ Type=$petStr; Desc=$petDescs[$petStr] }
+            }
+        } catch {}
+        # [40] NG+ level + hidden boss flag
+        try {
+            $ngArr = $parts[40] -split ","
+            if($ngArr.Count -ge 1){ $script:NGPlusLevel = [int]$ngArr[0] }
+            if($ngArr.Count -ge 2){ $script:HiddenBossDefeated = ([int]$ngArr[1] -eq 1) }
+        } catch {}
+        # [41] ingredients
+        try {
+            $ingArr = $parts[41] -split ","
+            if($ingArr.Count -ge 4){
+                $script:Ingredients = @{
+                    Mushroom = [int]$ingArr[0]
+                    Herb     = [int]$ingArr[1]
+                    Meat     = [int]$ingArr[2]
+                    Bone     = [int]$ingArr[3]
+                }
+            }
+        } catch {}
+        # [42] bestiary
+        try {
+            $bestStr = $parts[42]
+            if($bestStr){
+                foreach($pair in ($bestStr -split ";")){
+                    if(-not $pair){ continue }
+                    $kv = $pair -split ":"
+                    if($kv.Count -eq 2){
+                        $script:Bestiary[$kv[0]] = @{ Kills = [int]$kv[1]; FirstSeen = $false }
+                    }
+                }
+            }
+        } catch {}
+        # [43] talents — semicolon-joined list of talent IDs
+        $script:Talents = @{}
+        try {
+            $talStr = $parts[43]
+            if($talStr){
+                foreach($tid in ($talStr -split ";")){
+                    if($tid){ $script:Talents[$tid] = 1 }
+                }
+            }
+        } catch {}
     }
 
     # ── Reset transient state ──
@@ -8007,8 +10642,10 @@ function Show-MainMenu {
                @{N="[8]";L="Guild Hall";         C="Green";      Desc="Hire companions"} ),
             @( @{N="[9]";L="View Stats";         C="White";      Desc="Abilities & gear"},
                @{N="[A]";L="Achievements";       C="DarkMagenta";Desc="Review milestones"} ),
-            @( @{N="[S]";L="Save Game";          C="DarkGreen";  Desc="Export save code"},
-               @{N="[Q]";L="Quit";               C="DarkRed";    Desc="Leave the town"} )
+            @( @{N="[B]";L="Bestiary";           C="DarkRed";    Desc="Creatures defeated"},
+               @{N="[S]";L="Save Game";          C="DarkGreen";  Desc="Export save code"} ),
+            @( @{N="[Q]";L="Quit";               C="DarkRed";    Desc="Leave the town"},
+               @{N=""   ;L="";                   C="DarkGray";   Desc=""} )
         )
         # Cell layout inside each column:
         #   " [N] Label" + spaces_to_labelW + "Desc" + padding_to_colW
@@ -8094,6 +10731,7 @@ function Show-MainMenu {
                     Write-Host ""
                     Wait-Key
                 } else {
+                    Show-MutatorChoice
                     Enter-Dungeon
                 }
             }
@@ -8126,6 +10764,7 @@ function Show-MainMenu {
                     Write-CL "  'You've already braved the Daily Dungeon today. Return tomorrow.'" "Yellow"
                     Wait-Key
                 } else {
+                    Show-MutatorChoice
                     $script:DailyDungeonActive = $true
                     Enter-Dungeon
                     $script:DailyDungeonActive = $false
@@ -8193,6 +10832,7 @@ function Show-MainMenu {
                         @{N="[1]"; Label="Quick Nap";    Color="Green";    Detail="15g  (50% HP/MP)"}
                         @{N="[2]"; Label="Full Rest";    Color="Cyan";     Detail="30g  (100% HP/MP)"}
                         @{N="[3]"; Label="Royal Suite";  Color="Magenta";  Detail="60g  (Full + ATK/DEF)"}
+                        @{N="[C]"; Label="Cooking Pot";  Color="Yellow";   Detail="Combine ingredients into buff foods"}
                         @{N="[0]"; Label="Leave";        Color="DarkGray"; Detail=""}
                     )
                     Write-CL "  ┌$mBar┐" "DarkGray"
@@ -8224,8 +10864,9 @@ function Show-MainMenu {
 
                     switch($restChoice){
                         "1" {
-                            if($script:Gold -ge 15){
-                                $script:Gold -= 15
+                            $cost = [int][math]::Ceiling(15 * (Get-ShopDiscount))
+                            if($script:Gold -ge $cost){
+                                $script:Gold -= $cost
                                 $healAmt = [math]::Floor($p.MaxHP * 0.5)
                                 $manaAmt = [math]::Floor($p.MaxMP * 0.5)
                                 $p.HP = [math]::Min($p.HP + $healAmt, $p.MaxHP)
@@ -8237,7 +10878,7 @@ function Show-MainMenu {
                                 Write-CL "  zzzZZZ..." "Cyan"
                                 Start-Sleep -Milliseconds 800
                                 Write-Host ""
-                                Write-CL "  Recovered $healAmt HP and $manaAmt MP!" "Green"
+                                Write-CL "  Recovered $healAmt HP and $manaAmt MP! (${cost}g)" "Green"
                                 Write-CL "  HP: $($p.HP)/$($p.MaxHP)  MP: $($p.MP)/$($p.MaxMP)" "White"
                             } else {
                                 Write-CL "  'Sorry friend, no coin, no pillow.'" "Red"
@@ -8245,12 +10886,13 @@ function Show-MainMenu {
                             Wait-Key
                         }
                         "2" {
-                            if($script:Gold -ge 30){
-                                $script:Gold -= 30
+                            $cost = [int][math]::Ceiling(30 * (Get-ShopDiscount))
+                            if($script:Gold -ge $cost){
+                                $script:Gold -= $cost
                                 $p.HP = $p.MaxHP
                                 $p.MP = $p.MaxMP
                                 Write-Host ""
-                                Write-CL "  You settle into a comfortable bed..." "DarkGray"
+                                Write-CL "  You settle into a comfortable bed... (${cost}g)" "DarkGray"
                                 Write-CL "  zzz..." "DarkCyan"
                                 Start-Sleep -Milliseconds 600
                                 Write-CL "  zzzZZZ..." "Cyan"
@@ -8265,18 +10907,19 @@ function Show-MainMenu {
                             Wait-Key
                         }
                         "3" {
+                            $cost = [int][math]::Ceiling(60 * (Get-ShopDiscount))
                             if($script:RoyalSuiteUses -ge 3){
                                 Write-CL "  'You've enjoyed our finest rooms before...'" "DarkGray"
                                 Write-CL "  'The enchantments no longer affect you, friend.'" "DarkGray"
                                 Write-CL "  (Royal Suite stat boost capped at 3 uses)" "DarkYellow"
                                 Wait-Key
                             }
-                            elseif($script:Gold -ge 60){
-                                $script:Gold -= 60
+                            elseif($script:Gold -ge $cost){
+                                $script:Gold -= $cost
                                 $p.HP = $p.MaxHP
                                 $p.MP = $p.MaxMP
                                 Write-Host ""
-                                Write-CL "  You sink into a luxurious feather bed..." "DarkGray"
+                                Write-CL "  You sink into a luxurious feather bed... (${cost}g)" "DarkGray"
                                 Write-CL "  A warm bath, fine wine, enchanted candles..." "DarkMagenta"
                                 Start-Sleep -Milliseconds 600
                                 Write-CL "  zzz..." "DarkCyan"
@@ -8300,6 +10943,7 @@ function Show-MainMenu {
                             }
                             Wait-Key
                         }
+                        {$_ -in @("C","c")} { Show-CookingStation }
                         "0" { }
                         default { }
                     }
@@ -8393,7 +11037,23 @@ function Show-MainMenu {
                     $nextLevel = if($abilTier -eq 0){5}elseif($abilTier -eq 1){10}else{15}
                     Write-CL "    (Next ability upgrade at level $nextLevel)" "DarkGray"
                 }
-                Wait-Key
+                Write-Host ""
+                # Talent points summary + jump to talent tree screen.
+                $availTalents = Get-AvailableTalentPoints
+                Write-CL "  ── TALENTS ──" "Yellow"
+                Write-C  "  Available talent points: " "DarkGray"
+                $tpCol = if($availTalents -gt 0){"Green"}else{"DarkGray"}
+                Write-CL "$availTalents" $tpCol
+                $spent = if($script:Talents){$script:Talents.Count}else{0}
+                Write-C  "  Talents purchased: " "DarkGray"
+                Write-CL "$spent" "Cyan"
+                Write-Host ""
+                Write-CL "  [T] Open Talent Tree    [Enter] Back" "White"
+                Write-C  "  > " "Yellow"
+                $statsKey = Read-Host
+                if($statsKey -eq "T" -or $statsKey -eq "t"){
+                    Show-TalentTree
+                }
             }
 
             "6" { Show-QuestBoard }
@@ -8401,6 +11061,130 @@ function Show-MainMenu {
 
             "T" { Show-TrainingGrounds }
             "A" { Show-AchievementsMenu }
+            "B" { Show-Bestiary }
+            "N" {
+                # New Game Plus: gated on lifetime DungeonsCleared >= 25.
+                # Keeps gold, achievements, training, bestiary, talents,
+                # NGPlus level (incremented), and HiddenBoss favor. Resets
+                # player level/XP/gear and DungeonsCleared. Enemies scale
+                # +20% per NG+ level via the existing combat hook.
+                if($script:DungeonsCleared -lt 25){
+                    Write-Host ""
+                    Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkGray"
+                    Write-CL "  ║              N E W   G A M E   +                ║" "DarkGray"
+                    Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkGray"
+                    Write-Host ""
+                    Write-CL "  The Guild of SysAdmins requires 25 dungeon clears" "DarkGray"
+                    Write-CL "  before they'll consider you for ascension." "DarkGray"
+                    Write-CL "  Current clears: $($script:DungeonsCleared) / 25" "Yellow"
+                    Write-Host ""
+                    Wait-Key
+                } else {
+                    clr
+                    Write-Host ""
+                    Write-CL "  ╔══════════════════════════════════════════════════════════════╗" "Magenta"
+                    Write-CL "  ║                  A S C E N D   T H E   D E P T H S          ║" "Yellow"
+                    Write-CL "  ╚══════════════════════════════════════════════════════════════╝" "Magenta"
+                    Write-Host ""
+                    Write-CL "  You have proven yourself worthy. The Guild offers ascension:" "Gray"
+                    Write-Host ""
+                    Write-CL "  KEPT:    gold, achievements, training, bestiary, talents," "Yellow"
+                    Write-CL "           SysAdmin Favor, pet, ingredients" "Yellow"
+                    Write-CL "  RESET:   player level, XP, gear, dungeon level, clears counter" "Red"
+                    Write-CL "  GAINED:  NG+ tier increments to $($script:NGPlusLevel + 1)" "Cyan"
+                    Write-CL "           Enemies +20% HP and ATK per NG+ tier" "Cyan"
+                    Write-CL "           20% chance for boss/mini drops to be ASCENDED gear" "Magenta"
+                    Write-Host ""
+                    Write-C "  Ascend now? [y/n]: " "Yellow"
+                    $asc = Read-Host
+                    if($asc -eq 'y' -or $asc -eq 'Y'){
+                        # Perform ascension
+                        $script:NGPlusLevel++
+                        $script:DungeonLevel = 0
+                        $script:DungeonsCleared = 0
+                        $script:PlayerLevel = 1
+                        $script:XP = 0
+                        $script:XPToNext = 100
+                        $script:EquippedWeapon = $null
+                        $script:EquippedArmor = @{Helmet=$null;Chest=$null;Shield=$null;Amulet=$null;Boots=$null}
+                        $script:Inventory.Clear()
+                        # Talents persist on ascend by spec — they're a
+                        # multi-run progression layer, not a per-life buff.
+                        # We do NOT reset $script:Talents here.
+                        # Reset player to fresh class template (preserve permanent SysAdmin Favor bonus)
+                        $tpl = (Get-ClassTemplates)[$script:PlayerClass]
+                        $favorBonus = if($script:HiddenBossDefeated){5}else{0}
+                        $favorHP    = if($script:HiddenBossDefeated){25}else{0}
+                        $favorMP    = if($script:HiddenBossDefeated){15}else{0}
+                        $script:Player = @{
+                            Name      = $tpl.Name
+                            HP        = $tpl.HP + $favorHP
+                            MaxHP     = $tpl.MaxHP + $favorHP
+                            MP        = $tpl.MP + $favorMP
+                            MaxMP     = $tpl.MaxMP + $favorMP
+                            ATK       = $tpl.ATK + $favorBonus
+                            DEF       = $tpl.DEF + $favorBonus
+                            SPD       = $tpl.SPD + $favorBonus
+                            MAG       = $tpl.MAG + $favorBonus
+                            Abilities = $tpl.Abilities
+                        }
+
+                        # Reapply training-grounds stat purchases. The
+                        # Player object was just rebuilt from template,
+                        # which wiped the per-purchase deltas, so we walk
+                        # $TrainingPoints and credit each point. Per-point
+                        # gains MUST match the values in Show-TrainingGrounds.
+                        $p2 = $script:Player
+                        $tp = $script:TrainingPoints
+                        if($tp){
+                            $p2.ATK   += 2 * [int]$tp.ATK
+                            $p2.DEF   += 2 * [int]$tp.DEF
+                            $p2.SPD   += 1 * [int]$tp.SPD
+                            $p2.MAG   += 2 * [int]$tp.MAG
+                            $p2.MaxHP += 8 * [int]$tp.HP
+                            $p2.HP     = $p2.MaxHP
+                            $p2.MaxMP += 5 * [int]$tp.MP
+                            $p2.MP     = $p2.MaxMP
+                        }
+
+                        # Reapply HP/MP-granting talents at Lv 1. As the
+                        # player levels up again post-ascension, the per-
+                        # level bonuses don't auto-grow — that matches the
+                        # talent's behavior on first purchase (one-shot
+                        # delta tied to player level at purchase time).
+                        $hpDelta = 0; $mpDelta = 0
+                        if(Has-Talent "Knight_T1_A")     { $hpDelta += (5 * 1) }
+                        if(Has-Talent "Brawler_T1_C")    { $hpDelta += (8 * 1) }
+                        if(Has-Talent "Cleric_T1_A")     { $hpDelta += (4 * 1); $mpDelta += (4 * 1) }
+                        if(Has-Talent "Berserker_T1_B")  { $hpDelta += (5 * 1) }
+                        if(Has-Talent "Warlock_T1_B")    { $hpDelta += (5 * 1) }
+                        if(Has-Talent "Mage_T1_A")          { $mpDelta += (5 * 1) }
+                        if(Has-Talent "Necromancer_T1_A")   { $mpDelta += (5 * 1) }
+                        if(Has-Talent "Necromancer_T3_A"){
+                            # Lich's Pact: -20% MaxHP at acquire time.
+                            $reduction = [math]::Floor($p2.MaxHP * 0.20)
+                            $p2.MaxHP = [math]::Max($p2.MaxHP - $reduction, 30)
+                        }
+                        if($hpDelta -gt 0){
+                            $p2.MaxHP += $hpDelta
+                            $p2.HP     = $p2.MaxHP
+                        }
+                        if($mpDelta -gt 0){
+                            $p2.MaxMP += $mpDelta
+                            $p2.MP     = $p2.MaxMP
+                        }
+
+                        Write-Host ""
+                        Write-CL "  ╔══════════════════════════════════════════════════════════════╗" "Yellow"
+                        Write-CL "  ║                A S C E N D E D                              ║" "Yellow"
+                        Write-CL "  ╚══════════════════════════════════════════════════════════════╝" "Yellow"
+                        Write-CL "  You are now NG+$($script:NGPlusLevel)." "Cyan"
+                        Write-CL "  The Depths await — harder, richer, and stranger than before." "DarkGray"
+                        Write-Host ""
+                        Wait-Key
+                    }
+                }
+            }
 
             "8" {
                 Write-C "  Really quit? (y/n): " "Red"; $confirm = Read-Host
@@ -8474,6 +11258,105 @@ function Show-MainMenu {
 # launch menu, returns back to the launch menu when dismissed.
 function Show-Changelog {
     $pages = @(
+        @{Title="v1.4 — DEPTHS REWRITTEN"; Color="Yellow"; Lines=@(
+            "  PROCEDURAL VARIANTS & BESTIARY"
+            "    * Enemies now spawn with random VARIANTS (Veteran, Dire,"
+            "      Cursed, Swift, Toughened, Frenzied) — about 1 in 5"
+            "      enemies has tweaked stats and a prefix on its name."
+            "    * BESTIARY screen [B] in town tracks every enemy variant"
+            "      defeated, with kill counts and dungeon-tier groupings."
+            "    * Run summary appears on victory AND death — damage dealt,"
+            "      damage taken, gold, XP, kills, crits, potions, steps."
+            ""
+            "  TWO-HANDED WEAPONS"
+            "    * Five new 2H weapons: Greatsword, Archmage's Spire,"
+            "      Hunter's Longbow, War Maul, Death Scythe — heavy hits,"
+            "      no shield slot. Brawler is excluded by design."
+            "    * Equipping a 2H auto-stows your shield (with confirm);"
+            "      equipping a shield while 2H-wielding stows the weapon."
+            ""
+            "  PETS — THE KENNEL"
+            "    * Visit the Guild Hall and press [P] to open the Kennel."
+            "    * Three pets, each with one passive perk:"
+            "        Hound  (500g) — chests visible on minimap through fog"
+            "        Raven  (650g) — +5% gold from all sources"
+            "        Falcon (600g) — fog-of-war reveal radius 3 -> 5"
+            "    * Release a pet for 50% of its purchase price as refund."
+            ""
+            "  COOKING & INGREDIENTS"
+            "    * Enemies drop INGREDIENTS (Mushroom, Herb, Meat, Bone),"
+            "      12% per kill, guaranteed on bosses. 1 wt each."
+            "    * Visit the Inn and press [C] for the Cooking Pot. Four"
+            "      recipes turn ingredients into run-long buff foods:"
+            "        Hearty Stew     - +5 ATK"
+            "        Bone Broth      - +3 DEF"
+            "        Forager's Plate - +10% gold"
+            "        Hunter's Skewer - +15% XP"
+            "    * Active food buff persists for the dungeon run."
+            ""
+            "  FOUND NOTES"
+            "    * Chests have a 15% chance to drop a NOTE — fragments of"
+            "      previous adventurers' diaries"
+            ""
+            "  DUNGEON MUTATORS"
+            "    * Pick one of 3 random mutators at dungeon entry, or skip:"
+            "        Glass Cannon    - +50% dmg dealt and taken"
+            "        Pacifist's Path - 0 kill XP, 3x quest XP"
+            "        Cursed Loot     - drops at 50% durability, +50% stats"
+            "        Speedrun        - enemies +25% SPD, +50% combat gold"
+            "        Frugal Run      - no starting potions/picks, +75% gold"
+            "        Hardcore        - lose 50% gold on death, +30% rewards"
+            "    * Each mutator adds a +20-40% bonus to the gold/XP haul"
+            "      on dungeon clear."
+            ""
+            "  TALENT TREE"
+            "    * Each level grants 1 talent point, spent on the Stats"
+            "      page (press [T]). 9 talents per class in 3 tiers,"
+            "      gated at levels 1, 5, and 10."
+            "    * All 72 talents (8 classes x 9) are fully wired into"
+            "      combat, gear, dungeon flow, and death handling — no"
+            "      visual-only flavor talents."
+            "    * Two new combat menu actions appear when their talent"
+            "      is owned: [L] Lay on Hands (Cleric) and [O] Soul Tap"
+            "      (Warlock)."
+            "    * Knight Last Stand, Cleric Resurrection, and Berserker"
+            "      Final Stand intercept lethal damage once per dungeon."
+            "    * Necromancer Reaper auto-kills enemies below 25% HP."
+            "    * Ranger Multishot triggers a half-damage second strike"
+            "      20% of the time on basic attacks."
+            ""
+            "  HIDDEN BOSS — THE ORPHANED PROCESS"
+            "    * Clear a Daily Dungeon at full HP and zero potions used"
+            "      to summon a secret super-boss. Defeating it grants the"
+            "      'Guild of SysAdmin Favor' permanent buff (+5 to all"
+            "      stats, +25 HP, +15 MP) and a 15% discount at all shops."
+            ""
+            "  NEW GAME PLUS"
+            "    * Clear 25 dungeons to unlock [N] Ascend in the town menu."
+            "    * Ascending: keep gold, achievements, training, bestiary,"
+            "      talents, pet, ingredients, and SysAdmin Favor."
+            "    * Reset: player level, XP, gear, dungeon level, clears."
+            "    * Each NG+ tier scales enemies +20% HP and +20% ATK."
+            "    * 20% chance for boss/mini drops to be ASCENDED gear:"
+            "      +30% to base stats, marked with the Ascended prefix."
+            ""
+            "  UI POLISH"
+            "    * Inventory header now shows lockpick weight inline"
+            "      (e.g. 'Lockpicks: 5 (5wt)') — the redundant lockpicks"
+            "      row inside the potions box was removed."
+            "    * Active mutator, pet, food buff, and NG+ tier are now"
+            "      displayed in the dungeon HUD."
+            ""
+            "  FIXES"
+            "    * Character select now re-prompts on empty/invalid input"
+            "      instead of silently defaulting to Knight."
+            "    * Cooking ingredients have weight (1 each); excess drops"
+            "      are politely declined when carry weight is full."
+            "    * Brawler Iron Chin redesigned to '-30% damage from enemy"
+            "      crits' (the original spec required a player-stun"
+            "      mechanic the engine doesn't support)."
+            "    * Added Hubert."
+        )}
         @{Title="NEW FEATURES"; Color="Green"; Lines=@(
             "  COMBAT & ENEMIES"
             "    * Enemies can now CRITICAL HIT (4% base, scaling with"
@@ -8699,7 +11582,7 @@ function Start-Game {
     Write-Host ""
     Write-CL "             O   F     P O W E R S H E L L" "DarkYellow"
     Write-Host ""
-    Write-CL "                       Version 1.3" "DarkGray"
+    Write-CL "                       Version 1.4" "DarkGray"
     Write-Host ""
     Write-CL "         A first-person dungeon crawler" "DarkGray"
     Write-CL "         with turn-based RPG combat" "DarkGray"
@@ -8716,7 +11599,7 @@ function Start-Game {
         Write-Host ""
         Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
         Write-CL "  ║               DEPTHS OF POWERSHELL               ║" "Yellow"
-        Write-CL "  ║                   Version 1.3                    ║" "DarkGray"
+        Write-CL "  ║                   Version 1.4                    ║" "DarkGray"
         Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
         Write-Host ""
         Write-CL "  ┌─────────────────────────────────────────┐" "DarkGray"
@@ -8730,6 +11613,18 @@ function Start-Game {
         if($startChoice -eq "3"){
             Show-Changelog
             continue  # back to menu
+        }
+        # ── Hidden debug mode ──
+        # Typing the dev passphrase at the splash prompt skips character
+        # select entirely and drops the player in town as a fully-stocked
+        # Cleric with 9999 gold. Useful for play-testing late-game systems
+        # (talents, NG+, bestiary, mutators) without grinding to them.
+        # Not advertised anywhere in the UI.
+        if($startChoice -eq "80085noob"){
+            Start-DebugRun
+            return  # Start-DebugRun jumps straight into the town loop and
+                    # eventually returns control to the OS via Start-Game's
+                    # normal exit path; nothing more to do at this level.
         }
         $menuLoop = $false  # fall through to handling [1] or [2]
     }
@@ -8890,6 +11785,143 @@ function Start-Game {
 # Quick view of all active quests with progress bars. Called from the
 # dungeon's [J] key and the town square's quest board for at-a-glance
 # tracking. Read-only — accept/turn-in still happens at the board.
+# ─── BESTIARY ─────────────────────────────────────────────────────
+# Read-only screen listing every enemy type the player has defeated, with
+# per-variant kill counts. Sorted into Normal / Mini-Boss / Boss sections.
+# Accessible from the town square; no gameplay effect.
+function Show-Bestiary {
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "DarkRed"
+    Write-CL "  ║                       B E S T I A R Y                           ║" "Red"
+    Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "DarkRed"
+    Write-Host ""
+
+    if(-not $script:Bestiary -or $script:Bestiary.Count -eq 0){
+        Write-CL "  No creatures defeated yet. Venture into the dungeons!" "DarkGray"
+        Write-Host ""
+        Wait-Key
+        return
+    }
+
+    # Group entries by category from the key prefix. Keys use ~ as the
+    # internal delimiter so they round-trip through save/load cleanly.
+    $normals = @()
+    $minis   = @()
+    $bosses  = @()
+    foreach($k in $script:Bestiary.Keys){
+        $entry = @{ Key=$k; Count=$script:Bestiary[$k].Kills }
+        if($k.StartsWith("Boss~"))         { $bosses += $entry }
+        elseif($k.StartsWith("MiniBoss~")) { $minis  += $entry }
+        else                                { $normals += $entry }
+    }
+
+    # ── Normal enemies ──
+    if($normals.Count -gt 0){
+        Write-CL "  ── Normal Enemies ──" "Yellow"
+        $sorted = $normals | Sort-Object { $_.Key }
+        foreach($e in $sorted){
+            $parts = $e.Key -split '~'
+            $type = $parts[0]
+            $variant = if($parts.Count -gt 1){$parts[1]}else{""}
+            $name = if($variant){"$variant $type"}else{$type}
+            $colVar = switch($variant){
+                "Frenzied" { "Red" }
+                "Armored"  { "DarkGray" }
+                "Hulking"  { "DarkYellow" }
+                "Swift"    { "Cyan" }
+                "Sickly"   { "DarkGreen" }
+                "Brutal"   { "Magenta" }
+                default    { "White" }
+            }
+            $padName = $name.PadRight(28)
+            Write-C "    " "Black"
+            Write-C $padName $colVar
+            Write-C "  Slain: " "DarkGray"
+            Write-CL "$($e.Count)" "Yellow"
+        }
+        Write-Host ""
+    }
+
+    # ── Mini-bosses ──
+    if($minis.Count -gt 0){
+        Write-CL "  ── Mini-Bosses ──" "Yellow"
+        foreach($e in $minis){
+            $parts = $e.Key -split '~'
+            $name  = $parts[1]
+            $padName = $name.PadRight(28)
+            Write-C "    " "Black"
+            Write-C $padName "Magenta"
+            Write-C "  Slain: " "DarkGray"
+            Write-CL "$($e.Count)" "Yellow"
+        }
+        Write-Host ""
+    }
+
+    # ── Bosses ──
+    if($bosses.Count -gt 0){
+        Write-CL "  ── Bosses ──" "Yellow"
+        foreach($e in $bosses){
+            $parts = $e.Key -split '~'
+            $name  = $parts[1]
+            $padName = $name.PadRight(28)
+            Write-C "    " "Black"
+            Write-C $padName "Red"
+            Write-C "  Slain: " "DarkGray"
+            Write-CL "$($e.Count)" "Yellow"
+        }
+        Write-Host ""
+    }
+
+    # Hidden boss flag, shown only if the player has actually beaten them
+    if($script:HiddenBossDefeated){
+        Write-CL "  ── ??? ──" "DarkMagenta"
+        Write-CL "    The Orphaned Process              Slain: 1" "Magenta"
+        Write-Host ""
+    }
+
+    $totalSpecies = $script:Bestiary.Count
+    Write-CL "  $totalSpecies distinct creatures recorded." "DarkGray"
+    Write-Host ""
+    Wait-Key
+}
+
+# ─── RUN SUMMARY ──────────────────────────────────────────────────
+# Quick stats screen shown at the end of a dungeon run (clear OR death).
+# Pure read-only display from $script:RunStats.
+function Show-RunSummary {
+    param([string]$Outcome = "Run Complete")
+    Write-Host ""
+    Write-CL "  ┌──────────────────────────────────────────────────────────────────┐" "DarkCyan"
+    $tit = "  R U N   S U M M A R Y"
+    $padT = 66 - $tit.Length
+    if($padT -lt 0){ $padT = 0 }
+    Write-C  "  │" "DarkCyan"; Write-C $tit "Cyan"; Write-CL "$(' ' * $padT)│" "DarkCyan"
+    Write-CL "  ├──────────────────────────────────────────────────────────────────┤" "DarkCyan"
+    $rs = $script:RunStats
+    $rows = @(
+        @{L="Outcome";        V=$Outcome}
+        @{L="Kills";          V="$($rs.KillsThisRun)"}
+        @{L="Critical Hits";  V="$($rs.CritsThisRun)"}
+        @{L="Damage Dealt";   V="$($rs.DamageDealt)"}
+        @{L="Damage Taken";   V="$($rs.DamageTaken)"}
+        @{L="Gold Earned";    V="$($rs.GoldEarned)g"}
+        @{L="XP Earned";      V="$($rs.XPEarned)"}
+        @{L="Potions Used";   V="$($rs.PotionsUsed)"}
+        @{L="Steps Taken";    V="$($rs.StepsTaken)"}
+    )
+    foreach($r in $rows){
+        $line = "  $($r.L.PadRight(20))$($r.V)"
+        $pad = 66 - $line.Length
+        if($pad -lt 0){ $pad = 0 }
+        Write-C "  │" "DarkCyan"
+        Write-C $line "White"
+        Write-CL "$(' ' * $pad)│" "DarkCyan"
+    }
+    Write-CL "  └──────────────────────────────────────────────────────────────────┘" "DarkCyan"
+    Write-Host ""
+}
+
 function Show-QuestLog {
     clr
     Write-Host ""
@@ -8985,7 +12017,7 @@ function Show-InventoryScreen {
         $curW = Get-CurrentCarryWeight
         $maxW = Get-MaxCarryWeight $script:Player
         $weightColor = if($curW -gt $maxW){"Red"}elseif($curW -gt ($maxW * 0.85)){"Yellow"}else{"Green"}
-        Write-CL "   Lv$($script:PlayerLevel)  |  Gold: $($script:Gold)g  |  Lockpicks: $($script:Lockpicks)" "DarkGray"
+        Write-CL "   Lv$($script:PlayerLevel)  |  Gold: $($script:Gold)g  |  Lockpicks: $($script:Lockpicks) ($($script:Lockpicks)wt)" "DarkGray"
         Write-C  "   Carry: " "DarkGray"
         Write-CL "$curW / $maxW" $weightColor
         if($script:RepairKits -gt 0){
@@ -9094,6 +12126,7 @@ function Show-InventoryScreen {
                     "Weapon" { "[Wpn]" }
                     "Armor"  { "[Arm]" }
                     "Potion" { "[Pot]" }
+                    "Note"   { "[Note]" }
                     default  { "[Loot]" }
                 }
                 $iName = "$($i+1). $($it.Name) $kindTag"
@@ -9178,8 +12211,51 @@ function Show-InventoryScreen {
                 Write-C (" " * $pad) "Black"
                 Write-CL "║" "DarkGreen"
             }
+            # Lockpicks no longer get their own row here — they're shown
+            # at the top of the inventory screen with their total weight,
+            # so duplicating them inside the potions box is just visual noise.
             Write-CL ("  ╚" + $barH + "╝") "DarkGreen"
             Write-Host ""
+        }
+        # Note: the lockpick count is shown at the top of the inventory
+        # screen alongside its weight; we no longer render a standalone
+        # lockpicks-only box here.
+
+        # ── Cooking ingredients section ──
+        # Each ingredient weighs 1; rolled up into one box.
+        if($script:Ingredients){
+            $ingTotal = 0
+            foreach($k in $script:Ingredients.Keys){
+                $ingTotal += [int]$script:Ingredients[$k]
+            }
+            if($ingTotal -gt 0){
+                Write-CL ("  ╔" + $barH + "╗") "DarkRed"
+                $iHdr = " I N G R E D I E N T S  ($ingTotal)"
+                Write-C "  ║" "DarkRed"
+                Write-C (Pad-Box $iHdr) "Yellow"
+                Write-CL "║" "DarkRed"
+                Write-CL ("  ╠" + $barH + "╣") "DarkRed"
+                foreach($ing in @("Mushroom","Herb","Meat","Bone")){
+                    $ct = if($script:Ingredients.ContainsKey($ing)){[int]$script:Ingredients[$ing]}else{0}
+                    if($ct -le 0){ continue }
+                    $iName = "  $ing x$ct"
+                    $iWt   = "${ct}wt"
+                    Write-C "  ║" "DarkRed"
+                    Write-C " " "Black"
+                    Write-C $iName.PadRight(36) "Yellow"
+                    Write-C " " "Black"
+                    Write-C $iWt.PadLeft(5) "DarkGray"
+                    Write-C " " "Black"
+                    Write-C "---".PadLeft(8) "DarkGray"
+                    $used = 1 + 36 + 1 + 5 + 1 + 8
+                    $pad = $BoxW - $used
+                    if($pad -lt 0){$pad = 0}
+                    Write-C (" " * $pad) "Black"
+                    Write-CL "║" "DarkRed"
+                }
+                Write-CL ("  ╚" + $barH + "╝") "DarkRed"
+                Write-Host ""
+            }
         }
 
 
@@ -9378,13 +12454,18 @@ function Show-Tutorial {
             ""
             "  From here you can:"
             "   * Enter a dungeon (gain XP, gold, loot)"
+            "   * Run the DAILY DUNGEON — once per day, double rewards"
             "   * Visit the Market to buy gear, armor, potions, lockpicks"
             "   * Repair damaged equipment at the Blacksmith"
-            "   * Rest at the Weary Lantern Inn to recover HP/MP"
+            "   * Rest at the Weary Lantern Inn — and use the Cooking Pot"
+            "     to combine ingredients into run-long buff foods"
             "   * Train at the Training Grounds (boost stats for gold)"
             "   * Accept quests for bonus rewards (up to 5 active)"
-            "   * Hire companions from the Guild Hall"
-            "   * Manage gear and inventory ([3] Inventory)"
+            "   * Hire companions and adopt PETS at the Guild Hall"
+            "   * Manage gear and inventory"
+            "   * View Stats — and spend TALENT POINTS in the Talent Tree"
+            "   * Browse the BESTIARY of every enemy variant defeated"
+            "   * After 25 dungeon clears: ASCEND for New Game Plus"
             ""
             "  You select actions by typing their number or letter."
         )}
@@ -9401,6 +12482,16 @@ function Show-Tutorial {
             ""
             "  Movement is gently throttled to about 7 steps per second so"
             "  holding a key doesn't zoom you across the map."
+            ""
+            "  KEY-PRESS QUIRK (PowerShell limitation):"
+            "    Because PowerShell reads keys through a console buffer"
+            "    rather than a true keyboard event loop, you may need to"
+            "    HOLD a key briefly (about a quarter second) for it to"
+            "    register reliably. This applies to movement (W/A/S/D),"
+            "    [P]otion, [Q]uit, and [I]nventory inside the dungeon."
+            "    Tap-and-it-doesn't-respond is a buffer-read race, not a"
+            "    bug — a slightly longer press fixes it. There's no way"
+            "    to bypass this from within PowerShell itself."
             ""
             "  PERFORMANCE TIP: For the smoothest rendering, resize your"
             "  terminal to at least 80x32 (or maximize it). The game will"
@@ -9557,7 +12648,92 @@ function Show-Tutorial {
             "  Rewards scale with dungeon level and target count, so deeper"
             "  dungeons offer more lucrative bounties."
         )}
-        @{Title="9. SAVING YOUR PROGRESS"; Lines=@(
+        @{Title="9. DUNGEON MUTATORS"; Lines=@(
+            "  Before you descend, a Guild SysAdmin offers three random"
+            "  MUTATORS — risk/reward modifiers that change the rules of"
+            "  the run. Pick one or skip with [0]."
+            ""
+            "  THE SIX MUTATORS:"
+            "    Glass Cannon    — +50% damage dealt and taken"
+            "    Pacifist's Path — 0 XP from kills, 3x quest XP"
+            "    Cursed Loot     — gear drops at 50% durability, +50% stats"
+            "    Speedrun        — enemies +25% SPD, +50% combat gold"
+            "    Frugal Run      — no starting potions/lockpicks, +75% gold"
+            "    Hardcore        — lose 50% gold on death, +30% all rewards"
+            ""
+            "  Each mutator adds a +20-40% bonus to the gold/XP haul on"
+            "  dungeon clear. Mutators clear when you exit the dungeon."
+            ""
+            "  TIP: Frugal Run stashes your potions and picks at the door"
+            "  and returns them when the dungeon ends — clear or die."
+        )}
+        @{Title="10. PETS & COOKING"; Lines=@(
+            "  THE KENNEL (Guild Hall, [P]):"
+            "    Three pets, each with one passive perk:"
+            "      Hound  (500g) — chests visible on minimap through fog"
+            "      Raven  (650g) — +5% gold from all sources"
+            "      Falcon (600g) — fog-of-war reveal radius increased"
+            "    You can own one pet at a time. Release for 50% refund."
+            ""
+            "  COOKING POT (Weary Lantern Inn, [C]):"
+            "    Enemies drop INGREDIENTS — Mushroom, Herb, Meat, Bone."
+            "    12% drop chance per kill, guaranteed on bosses. Each"
+            "    weighs 1, so don't hoard. Combine at the pot:"
+            "      Hearty Stew     - +5 ATK for the run"
+            "      Bone Broth      - +3 DEF for the run"
+            "      Forager's Plate - +10% gold for the run"
+            "      Hunter's Skewer - +15% XP for the run"
+            "    Only one food buff active at a time. Wears off on"
+            "    dungeon end (clear or death)."
+        )}
+        @{Title="11. THE TALENT TREE"; Lines=@(
+            "  Every level grants 1 TALENT POINT. Spend points at the"
+            "  Stats page (press [T] from the stats screen)."
+            ""
+            "  Each class has 9 talents in 3 tiers:"
+            "    Tier 1 — unlocks at Lv 1   (entry-level passive boosts)"
+            "    Tier 2 — unlocks at Lv 5   (combat triggers and modifiers)"
+            "    Tier 3 — unlocks at Lv 10  (class-defining ultimates)"
+            ""
+            "  EXAMPLES — vary by class:"
+            "    Knight Crusader:    +25% damage to bosses"
+            "    Knight Last Stand:  survive lethal damage at 1 HP (1/run)"
+            "    Mage Mana Shield:   -20% damage taken when MP > 50%"
+            "    Ranger Multishot:   20% chance for a second arrow"
+            "    Cleric Resurrection: revive at 50% HP on death (1/run)"
+            "    Warlock Soul Drain: abilities heal 30% of damage dealt"
+            ""
+            "  NEW COMBAT ACTIONS unlocked by talents:"
+            "    [L] Lay on Hands — Cleric T3, full heal once per dungeon"
+            "    [O] Soul Tap     — Warlock T2, spend 5 HP for +10 damage"
+            ""
+            "  Talents persist across save/load AND through New Game"
+            "  Plus ascensions — they're a long-term progression layer."
+        )}
+        @{Title="12. HIDDEN BOSS & NEW GAME +"; Lines=@(
+            "  THE ORPHANED PROCESS (hidden boss):"
+            "    A secret super-boss spawns when you clear a DAILY"
+            "    DUNGEON at full HP with ZERO potions used. Tough but"
+            "    rewarding — defeat it for the GUILD OF SYSADMIN FAVOR:"
+            "      +5 to all stats permanent"
+            "      +25 Max HP, +15 Max MP"
+            "      15% discount at all shops, forever"
+            "    Lifetime achievement — once defeated, the favor sticks."
+            ""
+            "  NEW GAME PLUS:"
+            "    Clear 25 dungeons total to unlock [N] Ascend in town."
+            "    On ascension you KEEP: gold, achievements, training,"
+            "    bestiary, talents, pet, ingredients, and SysAdmin Favor."
+            "    You RESET: player level, XP, gear, dungeon level, and"
+            "    the dungeons-cleared counter."
+            ""
+            "    Each NG+ tier scales enemies +20% HP and +20% ATK."
+            "    20% of boss/mini drops in NG+ become ASCENDED gear:"
+            "    +30% to base stats, marked with the Ascended prefix."
+            ""
+            "  Ascending is permanent — no going back to your old level."
+        )}
+        @{Title="13. SAVING YOUR PROGRESS"; Lines=@(
             "  From the Town Square, press [S] to generate a SAVE CODE."
             ""
             "  The code is a long Base64 string — copy it somewhere safe!"
