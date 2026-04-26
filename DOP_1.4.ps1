@@ -50,6 +50,7 @@ $script:Achievements     = @{}     # name -> $true when unlocked
 $script:DailyDungeonDate = ""      # stores yyyy-MM-dd of last daily run
 $script:DailyDungeonDone = $false
 $script:TutorialSeen     = $false
+$script:DebugMode        = $false   # set by Start-DebugRun; gates save
 $script:TotalKills       = 0       # lifetime (separate from $script:KillCount for quests)
 $script:BossesDefeated   = 0       # lifetime dungeon bosses
 $script:WeaponsOwned     = @{}     # weapon name -> $true (for collection tracking)
@@ -4051,10 +4052,14 @@ function Start-Combat {
         }
         $lootPile += (Init-ItemWeight $a "Armor")
     }
-    # Potion drop: regular 12%, mini-boss 25%, boss 40%
+    # Potion drop: regular 12%, mini-boss 25%, boss 40%.
+    # Extra Strong potions (Category="Special") are EXCLUDED here — they
+    # only drop from end-of-dungeon loot rolls (see the exit-tile handler)
+    # and from boss-kills via a separate roll below. Normal enemies
+    # cannot drop Extra Strong potions on death.
     $potionDropChance = if($e.IsBoss){40}elseif($e.IsMiniBoss){25}else{12}
     if((Get-Random -Max 100) -lt $potionDropChance){
-        $potShop = Get-PotionShop
+        $potShop = @(Get-PotionShop | Where-Object { $_.Category -ne "Special" })
         if($potShop -and $potShop.Count -gt 0){
             $potTemplate = $potShop | Get-Random
             $potCopy = @{}
@@ -4067,6 +4072,21 @@ function Start-Combat {
             }
             $potCopy.Weight = 1
             $lootPile += $potCopy
+        }
+    }
+    # Boss-only Extra Strong drop: 35% chance for the slain boss to leave
+    # behind a single Extra Strong potion, in addition to the normal loot.
+    # This is the second valid spawn point per design (the first being
+    # end-of-dungeon clear roll); normal enemies don't roll for ES potions.
+    if($e.IsBoss -and (Get-Random -Max 100) -lt 35){
+        $espShop = @(Get-PotionShop | Where-Object { $_.Category -eq "Special" })
+        if($espShop -and $espShop.Count -gt 0){
+            $espTemplate = $espShop | Get-Random
+            $espCopy = @{}
+            foreach($k in $espTemplate.Keys){ $espCopy[$k] = $espTemplate[$k] }
+            $espCopy.Kind   = "Potion"
+            $espCopy.Weight = 1
+            $lootPile += $espCopy
         }
     }
     # Cooking ingredients: 12% chance per kill, bosses guaranteed.
@@ -4848,7 +4868,7 @@ function Show-Market {
                     # Column widths (interior — dashes in border = spaces in data)
                     # Row = "│" + cw1 + "│" + cw2 + "│" + cw3 + "│" + cw4 + "│" + cw5 + "│" + cw6 + "│"
                     $cw1 = 5   # #
-                    $cw2 = 18  # Weapon
+                    $cw2 = 22  # Weapon (room for " [2H]" suffix on 2-handed weapons)
                     $cw3 = 8   # ATK
                     $cw4 = 9   # Price
                     $cw5 = 10  # Perk
@@ -4864,10 +4884,49 @@ function Show-Market {
                     Write-CL $headerRow "DarkGray"
                     Write-CL $mid "DarkGray"
 
-                    for($i=0;$i -lt $filtered.Count;$i++){
-                        $w = $filtered[$i]
-                        $idxCell   = Pad-Cell ("$($i+1)") $cw1
-                        $nameCell  = Pad-Cell $w.Name $cw2
+                    # Split into 1H and 2H sections, sort each section by
+                    # ascending price. The 2H section gets a small banner
+                    # row so it's visually obvious. Each weapon name in
+                    # the 2H section is suffixed with [2H] to reinforce.
+                    $oneHand = @($filtered | Where-Object { -not $_.TwoHanded } | Sort-Object Price)
+                    $twoHand = @($filtered | Where-Object { $_.TwoHanded }      | Sort-Object Price)
+                    # Concatenate so indices in the displayed list match the
+                    # buy-by-number flow. Keep the divider as a non-purchasable
+                    # marker — handle the "skip divider" logic below.
+                    $rendered = New-Object System.Collections.ArrayList
+                    foreach($w in $oneHand){ [void]$rendered.Add(@{Item=$w; Divider=$false}) }
+                    if($twoHand.Count -gt 0){
+                        [void]$rendered.Add(@{Item=$null; Divider=$true})
+                        foreach($w in $twoHand){ [void]$rendered.Add(@{Item=$w; Divider=$false}) }
+                    }
+
+                    # Track per-row buy index (skipping divider) so the
+                    # number column matches what the player types.
+                    $buyNum = 0
+                    # We also build a flat lookup so [#] -> weapon resolves quickly.
+                    $buyMap = @{}
+                    for($i=0;$i -lt $rendered.Count;$i++){
+                        $row = $rendered[$i]
+                        if($row.Divider){
+                            # Render divider row spanning all 6 columns.
+                            $bannerInner = "── TWO-HANDED ──"
+                            $totalInner  = $cw1 + $cw2 + $cw3 + $cw4 + $cw5 + $cw6 + 5  # 5 internal pipes
+                            $bPad = $totalInner - $bannerInner.Length
+                            if($bPad -lt 0){$bPad = 0}
+                            $leftP  = [math]::Floor($bPad / 2)
+                            $rightP = $bPad - $leftP
+                            Write-C "  │" "DarkGray"
+                            Write-C ((' ' * $leftP) + $bannerInner + (' ' * $rightP)) "DarkYellow"
+                            Write-CL "│" "DarkGray"
+                            continue
+                        }
+                        $w = $row.Item
+                        $buyNum++
+                        $buyMap[$buyNum] = $w
+                        $idxCell   = Pad-Cell ("$buyNum") $cw1
+                        # Tag 2H weapons inline for instant scan-ability.
+                        $displayName = if($w.TwoHanded){"$($w.Name) [2H]"}else{$w.Name}
+                        $nameCell  = Pad-Cell $displayName $cw2
                         $atkCell   = Pad-Cell ("+$($w.ATK)") $cw3
                         $priceCell = Pad-Cell ("$($w.Price)g") $cw4
 
@@ -4884,11 +4943,14 @@ function Show-Market {
                         $affordable = if($script:Gold -ge $w.Price){"Green"}else{"DarkGray"}
                         $perkColor  = switch($w.Perk){"Bleed"{"DarkRed"}"Burn"{"DarkYellow"}"Poison"{"DarkGreen"}"Drain"{"Magenta"}"Stun"{"Yellow"}default{"DarkGray"}}
                         $bonusColor = if($isMatch){"Green"}else{"DarkGray"}
+                        # 2H weapon names use a slightly different shade
+                        # so they pop visually even at a glance.
+                        $nameColor  = if($w.TwoHanded){"Yellow"}else{"Cyan"}
 
                         Write-C "  │" "DarkGray"
                         Write-C $idxCell $affordable
                         Write-C "│" "DarkGray"
-                        Write-C $nameCell "Cyan"
+                        Write-C $nameCell $nameColor
                         Write-C "│" "DarkGray"
                         Write-C $atkCell "White"
                         Write-C "│" "DarkGray"
@@ -4903,11 +4965,13 @@ function Show-Market {
                     Write-Host ""
                     Write-CL "  Bonus column shows extra ATK when YOUR class matches." "DarkGray"
                     Write-CL "  Perks trigger randomly on basic attacks." "DarkGray"
+                    Write-CL "  [2H] weapons block the Shield slot when equipped." "DarkGray"
                     Write-Host ""
                     Write-C "  Buy # (0=back): " "Yellow"; $bi=Read-Host
-                    $widx=[int]$bi - 1
-                    if($widx -ge 0 -and $widx -lt $filtered.Count){
-                        $w = $filtered[$widx]
+                    $widx = 0
+                    [int]::TryParse([string]$bi, [ref]$widx) | Out-Null
+                    if($widx -ge 1 -and $buyMap.ContainsKey($widx)){
+                        $w = $buyMap[$widx]
                         $effPrice = [int][math]::Ceiling($w.Price * (Get-ShopDiscount))
                         if($script:Gold -ge $effPrice){
                             $script:Gold -= $effPrice
@@ -5173,35 +5237,43 @@ function Show-Market {
             #  SELL LOOT
             # ═══════════════════════════════════════════
             "4" {
-                clr
-                Write-CL "" "Magenta"
-                Write-CL "  ╔════════════════════════════════════════════╗" "DarkMagenta"
-                Write-CL "  ║           S E L L   L O O T                ║" "Magenta"
-                Write-CL "  ╚════════════════════════════════════════════╝" "DarkMagenta"
-                Write-Host ""
-                Write-C "  Gold: " "DarkGray"; Write-CL "$($script:Gold)g" "Yellow"
-                Write-Host ""
+                # Loop until the player explicitly exits with [0] Back.
+                # Previously each sale dropped them back to the market
+                # root, which made multi-item liquidation tedious.
+                $sellLoop = $true
+                while($sellLoop){
+                    clr
+                    Write-CL "" "Magenta"
+                    Write-CL "  ╔════════════════════════════════════════════╗" "DarkMagenta"
+                    Write-CL "  ║           S E L L   L O O T                ║" "Magenta"
+                    Write-CL "  ╚════════════════════════════════════════════╝" "DarkMagenta"
+                    Write-Host ""
+                    Write-C "  Gold: " "DarkGray"; Write-CL "$($script:Gold)g" "Yellow"
+                    Write-Host ""
 
-                # Build a unified sellable list. Each entry tracks Source
-                # ("Inv", "Pot", "Throw") and SourceIdx so we can remove from
-                # the correct backing list when a sale completes.
-                $sellList = New-Object System.Collections.ArrayList
-                for($i=0; $i -lt $script:Inventory.Count; $i++){
-                    [void]$sellList.Add(@{ Item=$script:Inventory[$i]; Source="Inv"; SourceIdx=$i })
-                }
-                for($i=0; $i -lt $script:Potions.Count; $i++){
-                    [void]$sellList.Add(@{ Item=$script:Potions[$i]; Source="Pot"; SourceIdx=$i })
-                }
-                for($i=0; $i -lt $script:ThrowablePotions.Count; $i++){
-                    [void]$sellList.Add(@{ Item=$script:ThrowablePotions[$i]; Source="Throw"; SourceIdx=$i })
-                }
+                    # Build a unified sellable list. Each entry tracks Source
+                    # ("Inv", "Pot", "Throw") and SourceIdx so we can remove from
+                    # the correct backing list when a sale completes.
+                    $sellList = New-Object System.Collections.ArrayList
+                    for($i=0; $i -lt $script:Inventory.Count; $i++){
+                        [void]$sellList.Add(@{ Item=$script:Inventory[$i]; Source="Inv"; SourceIdx=$i })
+                    }
+                    for($i=0; $i -lt $script:Potions.Count; $i++){
+                        [void]$sellList.Add(@{ Item=$script:Potions[$i]; Source="Pot"; SourceIdx=$i })
+                    }
+                    for($i=0; $i -lt $script:ThrowablePotions.Count; $i++){
+                        [void]$sellList.Add(@{ Item=$script:ThrowablePotions[$i]; Source="Throw"; SourceIdx=$i })
+                    }
 
-                if($sellList.Count -eq 0){
-                    Write-CL "  ┌─────────────────────────────────┐" "DarkGray"
-                    Write-CL "  │  Your bags are empty...         │" "DarkGray"
-                    Write-CL "  └─────────────────────────────────┘" "DarkGray"
-                    Wait-Key
-                } else {
+                    if($sellList.Count -eq 0){
+                        Write-CL "  ┌─────────────────────────────────┐" "DarkGray"
+                        Write-CL "  │  Your bags are empty...         │" "DarkGray"
+                        Write-CL "  └─────────────────────────────────┘" "DarkGray"
+                        Wait-Key
+                        $sellLoop = $false
+                        continue
+                    }
+
                     Write-CL "  ┌─────┬──────────────────────┬──────────┐" "DarkGray"
                     Write-CL "  │  #  │ Item                 │ Value    │" "DarkGray"
                     Write-CL "  ├─────┼──────────────────────┼──────────┤" "DarkGray"
@@ -5234,8 +5306,12 @@ function Show-Market {
                     Write-Host ""
                     Write-CL "  Total sell value: ${totalVal}g" "Yellow"
                     Write-Host ""
-                    Write-CL "  [A] Sell ALL    [#] Sell one    [0] Back" "White"
+                    Write-CL "  [A] Sell ALL          [#] Sell one item by number" "White"
+                    Write-CL "  [L] Sell all LOOT     [0] Back" "White"
+                    Write-CL "      (Loot mode keeps weapons, armor, potions, throwables," "DarkGray"
+                    Write-CL "       notes, and ingredients — sells everything else.)" "DarkGray"
                     Write-C "  > " "Yellow"; $si=Read-Host
+
                     if($si -eq 'A' -or $si -eq 'a'){
                         $script:Gold += $totalVal
                         $script:Inventory.Clear()
@@ -5244,7 +5320,47 @@ function Show-Market {
                         Write-CL "  Sold everything for ${totalVal}g!" "Green"
                         Write-CL "  Gold: $($script:Gold)g" "Yellow"
                         Wait-Key
-                    } else {
+                    }
+                    elseif($si -eq 'L' -or $si -eq 'l'){
+                        # Sell-all-loot: liquidate generic loot items only.
+                        # We KEEP: weapons, armor (might want to equip),
+                        # potions/throwables (consumables), notes (lore),
+                        # ingredients (cooking). Anything in $script:Inventory
+                        # whose Kind is not in {Weapon, Armor, Note,
+                        # Ingredient, Potion, Throwable} is sold.
+                        # Potions and throwables live in their own bags so
+                        # they're untouched by definition. Ingredients live
+                        # in $script:Ingredients (not the bag) so they're
+                        # also untouched.
+                        $protectedKinds = @("Weapon","Armor","Note","Ingredient","Potion","Throwable")
+                        $lootGold = 0
+                        $lootCount = 0
+                        # Iterate from the back so RemoveAt indices stay valid.
+                        for($i = $script:Inventory.Count - 1; $i -ge 0; $i--){
+                            $it = $script:Inventory[$i]
+                            $kind = if($it.Kind){[string]$it.Kind}else{"Loot"}
+                            if($protectedKinds -notcontains $kind){
+                                $lootGold += (Get-ItemSellValue $it)
+                                $script:Inventory.RemoveAt($i)
+                                $lootCount++
+                            }
+                        }
+                        if($lootCount -eq 0){
+                            Write-CL "  No generic loot to sell — all your bag items are protected." "DarkYellow"
+                            Write-CL "  (Weapons, armor, potions, notes, and ingredients are kept.)" "DarkGray"
+                        } else {
+                            $script:Gold += $lootGold
+                            $itemWord = if($lootCount -eq 1){"item"}else{"items"}
+                            Write-CL "  Sold $lootCount loot $itemWord for ${lootGold}g." "Green"
+                            Write-CL "  (Weapons, armor, potions, notes, and ingredients kept.)" "DarkGray"
+                            Write-CL "  Gold: $($script:Gold)g" "Yellow"
+                        }
+                        Wait-Key
+                    }
+                    elseif($si -eq '0'){
+                        $sellLoop = $false
+                    }
+                    else {
                         $sidx=[int]$si - 1
                         if($sidx -ge 0 -and $sidx -lt $sellList.Count){
                             $entry = $sellList[$sidx]
@@ -5261,7 +5377,7 @@ function Show-Market {
                             Wait-Key
                         }
                     }
-                }
+                } # end while sellLoop
             }
 
             # ═══════════════════════════════════════════
@@ -5549,7 +5665,7 @@ function Show-LootScreen {
         Write-C "+$selectedW" $weightColor
         Write-CL "]" "DarkGray"
         if($afterW -gt $maxW){
-            Write-CL "  -- selection exceeds carry weight --" "Red"
+            Write-CL "  -- selection will OVER-ENCUMBER you (you can still take it) --" "DarkYellow"
         }
         Write-Host ""
 
@@ -5671,15 +5787,28 @@ function Show-LootScreen {
                 _LootShowDetailCard $Items[$cursor]
             }
             "ENTER" {
-                # Block if over weight
+                # Over-weight selections are now ALLOWED — the player may
+                # voluntarily over-encumber themselves to keep precious
+                # loot. We warn once, then proceed if they confirm. The
+                # over-encumbered penalty (movement + stat) applies as
+                # normal afterward.
                 $finalAfter = $curW + $selectedW
                 if($finalAfter -gt $maxW){
                     Write-Host ""
-                    Write-CL "  Cannot confirm — selection exceeds carry weight!" "Red"
-                    Write-CL "  Press any key, then unmark some items." "DarkGray"
+                    Write-CL "  ! Warning: selection puts you OVER the carry cap." "DarkYellow"
+                    Write-CL "    Current $curW + selected $selectedW = $finalAfter (max $maxW)." "DarkGray"
+                    Write-CL "    You will be ENCUMBERED — movement blocked in dungeons until you drop weight." "DarkYellow"
+                    Write-Host ""
+                    Write-C "  Take anyway? (y/n): " "Yellow"
                     try { while($Host.UI.RawUI.KeyAvailable){ $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") } } catch {}
-                    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-                    continue
+                    $confirm = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+                    Write-Host ""
+                    if($confirm.Character -ne 'y' -and $confirm.Character -ne 'Y'){
+                        # Treat as a cancel — return to picker so the
+                        # player can unmark items.
+                        continue
+                    }
+                    # Else fall through to route + stow.
                 }
                 # Route + stow
                 $result = _LootRouteAndStow $Items $marked
@@ -7854,7 +7983,7 @@ function Get-MutatorPool {
         @{ Id="Pacifist";     Name="Pacifist's Path"; Desc="No XP from kills, +200% quest XP";   Color="Cyan"    ; RewardMul=1.20 }
         @{ Id="CursedLoot";   Name="Cursed Loot";     Desc="Gear drops at 50% durability, +50% stats"; Color="DarkMagenta"; RewardMul=1.25 }
         @{ Id="Speedrun";     Name="Speedrun";        Desc="Enemies +25% SPD, +50% gold from kills"; Color="Yellow"; RewardMul=1.20 }
-        @{ Id="Frugal";       Name="Frugal Run";      Desc="No starting potions/lockpicks, +75% gold"; Color="DarkYellow"; RewardMul=1.40 }
+        @{ Id="Frugal";       Name="Frugal Run";      Desc="No potions, only 1 lockpick, +75% gold"; Color="DarkYellow"; RewardMul=1.40 }
         @{ Id="Hardcore";     Name="Hardcore";        Desc="Death loses 50% gold, +30% all rewards"; Color="DarkRed"  ; RewardMul=1.30 }
     )
 }
@@ -8011,14 +8140,19 @@ function Enter-Dungeon {
     }
 
     # Frugal Run mutator: stash all potions, throwables, and lockpicks
-    # for the run. Restored automatically on dungeon end (clear or death).
+    # for the run, but leave the player ONE lockpick to work with — total
+    # zero picks felt punishing without any tactical option for chests.
+    # Restored automatically on dungeon end (clear or death).
     if(Has-Mutator "Frugal"){
         $script:FrugalStashedPotions    = @($script:Potions.ToArray())
         $script:FrugalStashedThrowables = @($script:ThrowablePotions.ToArray())
-        $script:FrugalStashedLockpicks  = $script:Lockpicks
+        # Stash the original count minus 1 so the math reverses cleanly:
+        # at end, Lockpicks (which is 1 right now) + stash (= original - 1)
+        # = original count.
+        $script:FrugalStashedLockpicks  = [math]::Max($script:Lockpicks - 1, 0)
         $script:Potions.Clear()
         $script:ThrowablePotions.Clear()
-        $script:Lockpicks = 0
+        $script:Lockpicks = if($script:Lockpicks -ge 1){1}else{$script:Lockpicks}
     } else {
         $script:FrugalStashedPotions    = $null
         $script:FrugalStashedThrowables = $null
@@ -8276,7 +8410,6 @@ function Enter-Dungeon {
 
                             Write-Host ""
                             Write-CL "  ── Treasure Haul ──" "Magenta"
-                            Write-CL "  (clear-bonus loot bypasses carry weight)" "DarkGray"
                             $lootCount = 3 * $dailyMultiplier
                             for($ti=0;$ti -lt $lootCount;$ti++){
                                 $treasure = Init-ItemWeight (New-RandomLoot ($script:DungeonLevel + 1)) "Loot"
@@ -8456,10 +8589,11 @@ function Enter-Dungeon {
                                     $chestPile += $pickBundle
                                 }
 
-                                # Found notes (v1.5): 15% chance to include a journal
-                                # entry from the previous adventurer's pile of regrets.
-                                # Pure flavor — no mechanics. Read in inventory ("V").
-                                if((Get-Random -Max 100) -lt 15){
+                                # Found notes: 18% chance per opened chest to
+                                # include a journal entry from a previous
+                                # adventurer's pile of regrets. Pure flavor,
+                                # no mechanics. Read in inventory ("V").
+                                if((Get-Random -Max 100) -lt 18){
                                     $notePool = Get-NotePool
                                     $note = $notePool | Get-Random
                                     $noteItem = @{
@@ -8817,23 +8951,87 @@ function Enter-Dungeon {
                 $script:DungeonLevel = 0
             }
             "2" {
-                $script:Player.HP = $script:Player.MaxHP
-                $script:Player.MP = $script:Player.MaxMP
-                $script:Gold = 50
+                # Items lost, gold kept. Level/XP/stats reset to class
+                # baseline so the player starts fresh-but-funded. Talents
+                # and achievements persist (multi-life progression). The
+                # potion belt gets a free Small Health Potion to start.
+                $tpl = (Get-ClassTemplates)[$script:PlayerClass]
+                $favorBonus = if($script:HiddenBossDefeated){5}else{0}
+                $favorHP    = if($script:HiddenBossDefeated){25}else{0}
+                $favorMP    = if($script:HiddenBossDefeated){15}else{0}
+                $script:Player = @{
+                    Name      = $tpl.Name
+                    HP        = $tpl.HP + $favorHP
+                    MaxHP     = $tpl.MaxHP + $favorHP
+                    MP        = $tpl.MP + $favorMP
+                    MaxMP     = $tpl.MaxMP + $favorMP
+                    ATK       = $tpl.ATK + $favorBonus
+                    DEF       = $tpl.DEF + $favorBonus
+                    SPD       = $tpl.SPD + $favorBonus
+                    MAG       = $tpl.MAG + $favorBonus
+                    Abilities = $tpl.Abilities
+                }
+                # Reapply training-grounds stat purchases (training is a
+                # permanent investment, separate from level progression).
+                $p2 = $script:Player
+                $tp = $script:TrainingPoints
+                if($tp){
+                    $p2.ATK   += 2 * [int]$tp.ATK
+                    $p2.DEF   += 2 * [int]$tp.DEF
+                    $p2.SPD   += 1 * [int]$tp.SPD
+                    $p2.MAG   += 2 * [int]$tp.MAG
+                    $p2.MaxHP += 8 * [int]$tp.HP
+                    $p2.HP     = $p2.MaxHP
+                    $p2.MaxMP += 5 * [int]$tp.MP
+                    $p2.MP     = $p2.MaxMP
+                }
+                # Reapply HP/MP-granting talents at Lv 1 baseline so the
+                # level-1 player still benefits from purchased talents.
+                $hpDelta = 0; $mpDelta = 0
+                if(Has-Talent "Knight_T1_A")     { $hpDelta += (5 * 1) }
+                if(Has-Talent "Brawler_T1_C")    { $hpDelta += (8 * 1) }
+                if(Has-Talent "Cleric_T1_A")     { $hpDelta += (4 * 1); $mpDelta += (4 * 1) }
+                if(Has-Talent "Berserker_T1_B")  { $hpDelta += (5 * 1) }
+                if(Has-Talent "Warlock_T1_B")    { $hpDelta += (5 * 1) }
+                if(Has-Talent "Mage_T1_A")          { $mpDelta += (5 * 1) }
+                if(Has-Talent "Necromancer_T1_A")   { $mpDelta += (5 * 1) }
+                if(Has-Talent "Necromancer_T3_A"){
+                    $reduction = [math]::Floor($p2.MaxHP * 0.20)
+                    $p2.MaxHP = [math]::Max($p2.MaxHP - $reduction, 30)
+                }
+                if($hpDelta -gt 0){
+                    $p2.MaxHP += $hpDelta
+                    $p2.HP     = $p2.MaxHP
+                }
+                if($mpDelta -gt 0){
+                    $p2.MaxMP += $mpDelta
+                    $p2.MP     = $p2.MaxMP
+                }
+
+                # Wipe items (gear + bag), keep gold.
+                $script:EquippedWeapon = $null
+                $script:EquippedArmor = @{Helmet=$null;Chest=$null;Shield=$null;Amulet=$null;Boots=$null}
                 $script:Inventory.Clear()
                 $script:Potions.Clear()
                 $script:ThrowablePotions.Clear()
                 [void]$script:Potions.Add(@{Name="Small Health Potion";Type="Heal";Power=30;Price=25;Desc="Restore 30 HP"})
+
+                # Reset level/XP progression to baseline.
+                $script:PlayerLevel = 1
+                $script:XP          = 0
+                $script:XPToNext    = 100
+
+                # Per-run state cleared.
                 $script:DungeonLevel = [math]::Max($script:DungeonLevel - 1, 0)
-                $script:EquippedWeapon = $null
-                $script:EquippedArmor = @{Helmet=$null;Chest=$null;Shield=$null;Amulet=$null;Boots=$null}
                 $script:KillCount = 0
                 $script:HasBossKey = $false
                 $script:BossDefeated = $false
+
                 Write-Host ""
                 Write-CL "  You awaken at the town square, battered but alive..." "Yellow"
-                Write-CL "  Your gold and items are gone, but your experience remains." "DarkGray"
-                Write-CL "  Level: $($script:PlayerLevel)  |  Starting Gold: 50g" "DarkGray"
+                Write-CL "  Your gear is gone. Your gold remains. Your levels are forfeit." "DarkGray"
+                Write-CL "  Talents and achievements persist." "DarkGray"
+                Write-CL "  Level: $($script:PlayerLevel)  |  Gold: $($script:Gold)g" "DarkGray"
                 Wait-Key
             }
 
@@ -9086,6 +9284,9 @@ function Show-CharacterSelect {
     $script:ResurrectionUsed = $false
     $script:FinalStandUsed   = $false
     $script:LayOnHandsUsed   = $false
+    # Any normal character creation clears the debug flag — debug mode
+    # only persists for the run it was activated in.
+    $script:DebugMode = $false
 
     Write-Host ""
     Write-CL "  You are a $className. Your journey begins..." "Green"
@@ -9182,6 +9383,11 @@ function Start-DebugRun {
     $script:LayOnHandsUsed   = $false
     # Skip the tutorial offer — debug runs assume the dev knows the game.
     $script:TutorialSeen = $true
+    # Debug-mode flag: enables the [Debug Mode Active] HUD banner in town
+    # and disables Save Game so a debug-spawned god-start can't be turned
+    # into a permanent save file. Cleared by Show-CharacterSelect (which
+    # is the only path back to a clean run).
+    $script:DebugMode = $true
 
     Write-CL "  Ready. Press a key to enter town." "Green"
     Wait-Key
@@ -9646,16 +9852,34 @@ function Get-WeaponShop {
         @{Name="Phoenix Edge";     ATK=25; Price=1800; WeaponType="Dagger"; ClassAffinity="Ranger";      AffinityBonus=5; Perk="Burn";  PerkChance=40}
         @{Name="Worldbreaker Maul";ATK=28; Price=2100; WeaponType="Hammer"; ClassAffinity="Brawler";     AffinityBonus=5; Perk="Stun";  PerkChance=35}
 
-        # ── TWO-HANDED WEAPONS (v1.5) ──
+        # ── TWO-HANDED WEAPONS (v1.4) ──
         # Trade your shield slot for serious damage. The TwoHanded=$true
         # field is detected at equip time: equipping a 2H auto-stows your
         # shield, and equipping a shield while wielding 2H stows the
-        # weapon. Brawler is intentionally excluded (already strong).
+        # weapon. Brawler is intentionally excluded (already strong with
+        # natural fist scaling and Bigger Fists). Each non-Brawler class
+        # has TWO 2H options: an early/mid-tier and a high-tier.
+        # Knight
         @{Name="Greatsword";        ATK=38; Price=800;  WeaponType="Sword";  ClassAffinity="Knight";      AffinityBonus=8;  Perk="Bleed";  PerkChance=40; TwoHanded=$true; Weight=8}
+        @{Name="Sunsteel Claymore"; ATK=46; Price=1700; WeaponType="Sword";  ClassAffinity="Knight";      AffinityBonus=10; Perk="Burn";   PerkChance=40; TwoHanded=$true; Weight=9}
+        # Mage
         @{Name="Archmage's Spire";  ATK=32; Price=900;  WeaponType="Staff";  ClassAffinity="Mage";        AffinityBonus=8;  Perk="Burn";   PerkChance=40; TwoHanded=$true; MAGBonus=12; Weight=7}
+        @{Name="Stormcaller Rod";   ATK=38; Price=1900; WeaponType="Staff";  ClassAffinity="Mage";        AffinityBonus=10; Perk="Stun";   PerkChance=45; TwoHanded=$true; MAGBonus=18; Weight=7}
+        # Ranger
         @{Name="Hunter's Longbow";  ATK=33; Price=750;  WeaponType="Bow";    ClassAffinity="Ranger";      AffinityBonus=8;  Perk="Poison"; PerkChance=40; TwoHanded=$true; Weight=6}
+        @{Name="Wyrmscale Bow";     ATK=42; Price=1750; WeaponType="Bow";    ClassAffinity="Ranger";      AffinityBonus=10; Perk="Bleed";  PerkChance=45; TwoHanded=$true; Weight=7}
+        # Cleric
         @{Name="War Maul";          ATK=36; Price=850;  WeaponType="Mace";   ClassAffinity="Cleric";      AffinityBonus=8;  Perk="Stun";   PerkChance=40; TwoHanded=$true; Weight=9}
-        @{Name="Death Scythe";      ATK=40; Price=1100; WeaponType="Scythe"; ClassAffinity="Necromancer"; AffinityBonus=10; Perk="Drain";  PerkChance=45; TwoHanded=$true; MAGBonus=10; Weight=8}
+        @{Name="Sanctified Hammer"; ATK=44; Price=1850; WeaponType="Mace";   ClassAffinity="Cleric";      AffinityBonus=10; Perk="Burn";   PerkChance=45; TwoHanded=$true; MAGBonus=8; Weight=10}
+        # Necromancer
+        @{Name="Soulshear";         ATK=40; Price=1100; WeaponType="Scythe"; ClassAffinity="Necromancer"; AffinityBonus=10; Perk="Drain";  PerkChance=45; TwoHanded=$true; MAGBonus=10; Weight=8}
+        @{Name="Bone Reaper";       ATK=48; Price=2050; WeaponType="Scythe"; ClassAffinity="Necromancer"; AffinityBonus=12; Perk="Drain";  PerkChance=50; TwoHanded=$true; MAGBonus=14; Weight=9}
+        # Berserker (uses Hammer/Sword affinity — Berserker likes Sword in Get-WeaponClassMatch)
+        @{Name="Bloodied Greataxe"; ATK=42; Price=950;  WeaponType="Sword";  ClassAffinity="Berserker";   AffinityBonus=9;  Perk="Bleed";  PerkChance=50; TwoHanded=$true; Weight=9}
+        @{Name="Skullcleaver";      ATK=52; Price=2000; WeaponType="Sword";  ClassAffinity="Berserker";   AffinityBonus=12; Perk="Bleed";  PerkChance=55; TwoHanded=$true; Weight=10}
+        # Warlock (uses Staff/Wand affinity — give them a 2H staff variant)
+        @{Name="Hexcaster Stave";   ATK=34; Price=900;  WeaponType="Staff";  ClassAffinity="Warlock";     AffinityBonus=8;  Perk="Drain";  PerkChance=45; TwoHanded=$true; MAGBonus=10; Weight=7}
+        @{Name="Soulrender Spire";  ATK=42; Price=1950; WeaponType="Staff";  ClassAffinity="Warlock";     AffinityBonus=10; Perk="Drain";  PerkChance=50; TwoHanded=$true; MAGBonus=16; Weight=8}
     )
 }
 
@@ -10341,6 +10565,9 @@ function Load-Game {
     $script:DungeonTreasures = 0
     $script:RescueTarget = $null
     $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
+    # Loading any save clears the debug flag — debug-spawned runs can't
+    # save, so any save that exists is a legitimate run.
+    $script:DebugMode = $false
 
     return @{ Success = $true; Error = "" }
 }
@@ -10563,6 +10790,15 @@ function Show-MainMenu {
         Write-CL '   ~      ~    ^^  ~~ ~  ~~ ^^ ~~  ~  ^^  ~~   ~~  ^^ ~    ~~    ^^   ~~        ' "DarkBlue"
         Write-Host ""
 
+        # ── Debug-mode banner ──
+        # Only renders when the run was started via the splash-menu dev
+        # passphrase. Bright green so it can't be missed; the wording
+        # also explains why Save Game is disabled.
+        if($script:DebugMode){
+            Write-CL "                          [Debug Mode Active — Save Disabled]                       " "Green"
+            Write-Host ""
+        }
+
         # ── Player status block (83-char width matching banner/grid) ──
         $hpPct = $p.HP / $p.MaxHP
         $hpColor = if($hpPct -gt 0.5){"Green"}elseif($hpPct -gt 0.25){"Yellow"}else{"Red"}
@@ -10636,7 +10872,7 @@ function Show-MainMenu {
         $rows = @(
             @( @{N="[3]";L="Visit the Market";   C="Cyan";       Desc="Buy & sell gear"},
                @{N="[4]";L="View Inventory";     C="Magenta";    Desc="Manage loot & gear"} ),
-            @( @{N="[5]";L="Weary Lantern Inn";  C="Yellow";     Desc="Rest & recover"},
+            @( @{N="[5]";L="Weary Lantern Inn";  C="Yellow";     Desc="Recover/Cook"},
                @{N="[6]";L="Training Grounds";   C="Red";        Desc="Hone your skills"} ),
             @( @{N="[7]";L="Quest Board";        C="DarkYellow"; Desc="Accept bounties"},
                @{N="[8]";L="Guild Hall";         C="Green";      Desc="Hire companions"} ),
@@ -10818,51 +11054,68 @@ function Show-MainMenu {
                 Write-Host ""
 
                 if($p.HP -eq $p.MaxHP -and $p.MP -eq $p.MaxMP){
+                    # Player is fully rested. Greet them about that, but
+                    # still let them use the cooking pot — cooking is
+                    # independent of rest. Rest options will fast-fail
+                    # with a friendly "you look rested" line.
                     Write-CL "  The innkeeper looks at you:" "DarkGray"
                     Write-CL "  'You look well rested already, friend!'" "Yellow"
-                    Write-Host ""
-                    Wait-Key
+                    Write-CL "  '...but the cooking pot is always available, if you've brought ingredients.'" "DarkGray"
                 } else {
                     Write-CL "  The innkeeper greets you warmly:" "DarkGray"
                     Write-CL "  'Welcome, weary traveler! What'll it be?'" "Yellow"
-                    Write-Host ""
-                    # Menu box (interior 54 chars). Each line: " [N] Label<pad>-  DetailText<pad-end> │"
-                    $mBar = "─" * 54
-                    $options = @(
-                        @{N="[1]"; Label="Quick Nap";    Color="Green";    Detail="15g  (50% HP/MP)"}
-                        @{N="[2]"; Label="Full Rest";    Color="Cyan";     Detail="30g  (100% HP/MP)"}
-                        @{N="[3]"; Label="Royal Suite";  Color="Magenta";  Detail="60g  (Full + ATK/DEF)"}
-                        @{N="[C]"; Label="Cooking Pot";  Color="Yellow";   Detail="Combine ingredients into buff foods"}
-                        @{N="[0]"; Label="Leave";        Color="DarkGray"; Detail=""}
-                    )
-                    Write-CL "  ┌$mBar┐" "DarkGray"
-                    foreach($opt in $options){
-                        $head    = " $($opt.N) $($opt.Label)"
-                        $headPad = 22 - $head.Length
-                        if($headPad -lt 1){$headPad = 1}
-                        $midSep  = if($opt.Detail){"-  "}else{"   "}
-                        $midLen  = 3
-                        $tailLen = 54 - $head.Length - $headPad - $midLen - $opt.Detail.Length - 1
-                        if($tailLen -lt 0){$tailLen = 0}
+                }
+                Write-Host ""
+                # Menu box (interior 54 chars). Each line: " [N] Label<pad>-  DetailText<pad-end> │"
+                $mBar = "─" * 54
+                $options = @(
+                    @{N="[1]"; Label="Quick Nap";    Color="Green";    Detail="15g  (50% HP/MP)"}
+                    @{N="[2]"; Label="Full Rest";    Color="Cyan";     Detail="30g  (100% HP/MP)"}
+                    @{N="[3]"; Label="Royal Suite";  Color="Magenta";  Detail="60g  (Full + ATK/DEF)"}
+                    @{N="[C]"; Label="Cooking Pot";  Color="Yellow";   Detail="Combine ingredients into buff foods"}
+                    @{N="[0]"; Label="Leave";        Color="DarkGray"; Detail=""}
+                )
+                Write-CL "  ┌$mBar┐" "DarkGray"
+                foreach($opt in $options){
+                    $head    = " $($opt.N) $($opt.Label)"
+                    $headPad = 22 - $head.Length
+                    if($headPad -lt 1){$headPad = 1}
+                    $midSep  = if($opt.Detail){"-  "}else{"   "}
+                    $midLen  = 3
+                    $tailLen = 54 - $head.Length - $headPad - $midLen - $opt.Detail.Length - 1
+                    if($tailLen -lt 0){$tailLen = 0}
 
-                        Write-C "  │" "DarkGray"
-                        Write-C " $($opt.N)" "White"
-                        Write-C " $($opt.Label)" $opt.Color
-                        Write-C (" " * $headPad) "Black"
-                        if($opt.Detail){
-                            Write-C $midSep "DarkGray"
-                            Write-C $opt.Detail "White"
-                        } else {
-                            Write-C (" " * $midLen) "Black"
-                        }
-                        Write-C (" " * $tailLen) "Black"
-                        Write-CL " │" "DarkGray"
+                    Write-C "  │" "DarkGray"
+                    Write-C " $($opt.N)" "White"
+                    Write-C " $($opt.Label)" $opt.Color
+                    Write-C (" " * $headPad) "Black"
+                    if($opt.Detail){
+                        Write-C $midSep "DarkGray"
+                        Write-C $opt.Detail "White"
+                    } else {
+                        Write-C (" " * $midLen) "Black"
                     }
-                    Write-CL "  └$mBar┘" "DarkGray"
-                    Write-Host ""
-                    Write-C "  > " "Yellow"; $restChoice = Read-Host
+                    Write-C (" " * $tailLen) "Black"
+                    Write-CL " │" "DarkGray"
+                }
+                Write-CL "  └$mBar┘" "DarkGray"
+                Write-Host ""
+                Write-C "  > " "Yellow"; $restChoice = Read-Host
 
-                    switch($restChoice){
+                # If the player is at full HP/MP, the three rest options
+                # are no-ops. Bail out early with a flavor line so they
+                # don't waste gold on a heal that does nothing. The
+                # cooking pot ([C]) and leave ([0]) bypass this check.
+                $playerFull = ($p.HP -eq $p.MaxHP -and $p.MP -eq $p.MaxMP)
+                if($playerFull -and ($restChoice -eq "1" -or $restChoice -eq "2" -or $restChoice -eq "3")){
+                    Write-Host ""
+                    Write-CL "  'You're already in fighting shape, friend.'" "Yellow"
+                    Write-CL "  '(Try the cooking pot if you've got ingredients.)'" "DarkGray"
+                    Wait-Key
+                    continue
+                }
+
+                switch($restChoice){
                         "1" {
                             $cost = [int][math]::Ceiling(15 * (Get-ShopDiscount))
                             if($script:Gold -ge $cost){
@@ -10947,7 +11200,6 @@ function Show-MainMenu {
                         "0" { }
                         default { }
                     }
-                }
             }
 
             "5" {
@@ -11199,6 +11451,21 @@ function Show-MainMenu {
             }
 
             "9" {
+                # Debug mode locks out Save so a god-start spawned via
+                # the dev passphrase can't be turned into a save file.
+                if($script:DebugMode){
+                    clr
+                    Write-Host ""
+                    Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkRed"
+                    Write-CL "  ║          S A V E   D I S A B L E D                 ║" "Red"
+                    Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkRed"
+                    Write-Host ""
+                    Write-CL "  Save is unavailable in Debug Mode." "Yellow"
+                    Write-CL "  Start a regular run from the splash menu to save progress." "DarkGray"
+                    Write-Host ""
+                    Wait-Key
+                    continue
+                }
                 clr
                 Write-CL "" "White"
                 Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkYellow"
@@ -11270,7 +11537,7 @@ function Show-Changelog {
             ""
             "  TWO-HANDED WEAPONS"
             "    * Five new 2H weapons: Greatsword, Archmage's Spire,"
-            "      Hunter's Longbow, War Maul, Death Scythe — heavy hits,"
+            "      Hunter's Longbow, War Maul, Soulshear — heavy hits,"
             "      no shield slot. Brawler is excluded by design."
             "    * Equipping a 2H auto-stows your shield (with confirm);"
             "      equipping a shield while 2H-wielding stows the weapon."
@@ -11304,7 +11571,7 @@ function Show-Changelog {
             "        Pacifist's Path - 0 kill XP, 3x quest XP"
             "        Cursed Loot     - drops at 50% durability, +50% stats"
             "        Speedrun        - enemies +25% SPD, +50% combat gold"
-            "        Frugal Run      - no starting potions/picks, +75% gold"
+            "        Frugal Run      - no potions, only 1 pick, +75% gold"
             "        Hardcore        - lose 50% gold on death, +30% rewards"
             "    * Each mutator adds a +20-40% bonus to the gold/XP haul"
             "      on dungeon clear."
@@ -12043,6 +12310,8 @@ function Show-InventoryScreen {
             $magStr  = if($w.MAGBonus){" [MAG+$($w.MAGBonus)]"}else{""}
             $durStr  = " " + (Format-Durability $w)  # leading space separator
             $durColr = Get-DurabilityColor $w
+            $wepWt   = Get-ItemWeight $w
+            $wtStr   = " ${wepWt}wt"
             # Render colored segments inline, then compute remaining pad
             $emitted = 0
             Write-C "  ║" "DarkYellow"
@@ -12052,6 +12321,7 @@ function Show-InventoryScreen {
             if($perkStr){ Write-C $perkStr "DarkRed"; $emitted += $perkStr.Length }
             if($magStr){  Write-C $magStr "Magenta";  $emitted += $magStr.Length }
             if($durStr.Trim()){ Write-C $durStr $durColr; $emitted += $durStr.Length }
+            Write-C $wtStr "DarkGray"; $emitted += $wtStr.Length
             $remaining = $BoxW - $emitted
             if($remaining -lt 0){ $remaining = 0 }
             Write-C (" " * $remaining) "Black"
@@ -12089,7 +12359,10 @@ function Show-InventoryScreen {
                 $dStr = " " + (Format-Durability $piece)
                 $dClr = Get-DurabilityColor $piece
                 Write-C $dStr $dClr
-                $used = 1 + 10 + $pText.Length + $dStr.Length
+                $aWt = Get-ItemWeight $piece
+                $aWtStr = " ${aWt}wt"
+                Write-C $aWtStr "DarkGray"
+                $used = 1 + 10 + $pText.Length + $dStr.Length + $aWtStr.Length
             } else {
                 Write-C "(empty)" "DarkGray"
                 $used = 1 + 10 + 7
@@ -12580,10 +12853,12 @@ function Show-Tutorial {
             "  level, so inventory choices stay meaningful from start to end."
             ""
             "  WEIGHT-FREE ITEMS:"
-            "    * Equipped weapon and armor"
             "    * Gold and Repair Kits"
             ""
             "  WEIGHTED ITEMS (count toward your cap):"
+            "    * Equipped weapon and armor — every piece you wear adds"
+            "      its own weight (helmet 3, chest 5, shield 4, amulet 1,"
+            "      boots 2, weapons 4-9 by type)"
             "    * Loot items — gems, scales, idols, etc. (varies by item;"
             "      includes a +2 weight surcharge that makes the 90 cap bite)"
             "    * Spare weapons and armor in your bag (boss/miniboss drops)"
@@ -12591,6 +12866,7 @@ function Show-Tutorial {
             "    * Extra Strong potions (Health/Mana/Strength/Luck) — 1 weight"
             "      each, found as rare end-of-dungeon drops; convert to gold"
             "      if bag is full"
+            "    * Cooking ingredients — 1 weight each"
             "    * Lockpicks — 1 weight each"
             ""
             "  WHEN YOU'RE OVER ENCUMBERED:"
@@ -12658,14 +12934,15 @@ function Show-Tutorial {
             "    Pacifist's Path — 0 XP from kills, 3x quest XP"
             "    Cursed Loot     — gear drops at 50% durability, +50% stats"
             "    Speedrun        — enemies +25% SPD, +50% combat gold"
-            "    Frugal Run      — no starting potions/lockpicks, +75% gold"
+            "    Frugal Run      — no potions, only 1 lockpick, +75% gold"
             "    Hardcore        — lose 50% gold on death, +30% all rewards"
             ""
             "  Each mutator adds a +20-40% bonus to the gold/XP haul on"
             "  dungeon clear. Mutators clear when you exit the dungeon."
             ""
-            "  TIP: Frugal Run stashes your potions and picks at the door"
-            "  and returns them when the dungeon ends — clear or die."
+            "  TIP: Frugal Run stashes your potions and most lockpicks at"
+            "  the door (you keep ONE pick for emergencies) and returns"
+            "  everything when the dungeon ends — clear or die."
         )}
         @{Title="10. PETS & COOKING"; Lines=@(
             "  THE KENNEL (Guild Hall, [P]):"
