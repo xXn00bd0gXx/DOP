@@ -51,3 +51,15 @@ Requires PowerShell 5.1+ and an 80×32 terminal window.
 ---
 
 Pick whichever fits the site, or mix sections. If you'd like a tagline, "A first-person dungeon crawler that runs anywhere PowerShell does" works well as a one-liner.
+
+Bugs:
+
+- Player regains HP/MP when entering and dungeon from town square. Player is able to enter and exit dungeon several times to restore hp/mp.
+- gold value displayed for potions + throwables in inventory screen but no way to sell.
+- equipped armor should have weight
+- Current enemy, mini-boss, boss scaling is too aggressive. It's very difficult for players to clear dungeons, do a small nerf on the scaling so it's slightly easier. Also, when factoring an player stats into the scaling, ignore stat boost from training, so that the player can give them selves a larger advantage. 
+- achivment 'deepest dive' doesn't make sense cause dungeons no longer have levels, could be replaced with Clear 20 dungeons
+- lock pick weight isn't displayed in the inventory screen, only when dropping items.
+
+
+NXwyfDd8NzE5fDExMzV8NTQ3fDE2MHwxNjB8NzB8NzB8MzR8MjZ8MTh8MTV8MHwzMXwyfDI0fDMsOCwxNCwwLDI1fDAsMCwwLDEsMSwwLDF8MCwwLDEsMXwwfDB8MHwzMXwwfDExMDAwMDAwMDAwMDAwMDAwMDAwMDAxMDAwMDAwMDAwMDAwfDAsMCwwLDAsMCwwfDB8MjAyNi0wNC0yNnwwfDF8NXwxNy8yMCwyMC8yMSwxNi8xOCwxNS8xNSwtMSwxNC8xNXwwLDB8QWdncmVzc2l2ZXw1LDMsOCwwLDE1LDIsOHw0NDMy
