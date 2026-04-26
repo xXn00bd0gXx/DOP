@@ -54,13 +54,15 @@ Pick whichever fits the site, or mix sections. If you'd like a tagline, "A first
 
 Bugs:
 
-- Player regains HP/MP when entering and dungeon from town square. Player is able to enter and exit dungeon several times to restore hp/mp.
-- gold value displayed for potions + throwables in inventory screen but no way to sell.
-- equipped armor should have weight
-- Current enemy, mini-boss, boss scaling is too aggressive. It's very difficult for players to clear dungeons, do a small nerf on the scaling so it's slightly easier. Also, when factoring an player stats into the scaling, ignore stat boost from training, so that the player can give them selves a larger advantage. 
-- achivment 'deepest dive' doesn't make sense cause dungeons no longer have levels, could be replaced with Clear 20 dungeons
-- lock pick weight isn't displayed in the inventory screen, only when dropping items.
-- doesn't seem that the restriction of two encounters per dungeon is working, please investigate.
-- add new random encounter, Underground Gambler, asks player to engage in a quick hand of black jack. If player agrees they are able to engage in one hand of black jack and set a custom betting amount (using their gold to wager), including doing a max bet for all there gold. Blackjack mini game should be complete with art and animations, inluding standard black jack rule set, like splits and pushes, dealer standing on 17.
-
-NXwyfDd8NzE5fDExMzV8NTQ3fDE2MHwxNjB8NzB8NzB8MzR8MjZ8MTh8MTV8MHwzMXwyfDI0fDMsOCwxNCwwLDI1fDAsMCwwLDEsMSwwLDF8MCwwLDEsMXwwfDB8MHwzMXwwfDExMDAwMDAwMDAwMDAwMDAwMDAwMDAxMDAwMDAwMDAwMDAwfDAsMCwwLDAsMCwwfDB8MjAyNi0wNC0yNnwwfDF8NXwxNy8yMCwyMC8yMSwxNi8xOCwxNS8xNSwtMSwxNC8xNXwwLDB8QWdncmVzc2l2ZXw1LDMsOCwwLDE1LDIsOHw0NDMy
+Weight-Free Items text in tutorial page 6 needs updated because equipped items now have weight 
+Change so you retain gold on death, so that hardcore dungeon mutator makes sense, check logic
+Weary Lantern Inn - No option to use cooking area if already at full hp/mp, also update town square menu to read Recover/Cook
+2H weapons should be shown separately from 1H weapons, clarification some sort of marker that shows the weapons are 2H and also make sure items are still sorted by price in the shop. Noticed new 2H at bottom of list even though they weren't the most expensive. Also add more 2H weapons for each class except brawler.
+Check that equipped items have weight, weight for actively equipped items isn't shown.  
+Extra strong potion spawn logic doesn't seem to work as intended, extra strong potions should only spawn when clearing a dungeon or from killing the boss.
+How can the player become over encumbered if loot screens don't allow you to select loot options that put you over your carry weight. Replace with a warning that you will exceed carry weight but don't stop the player from looting.
+sell loot screen returns player to market after selling, should loop so player can keep selling. Also add new options for selling all items market as [loot] so that the player can quickly sell everything that isn't armor or potions.
+Frugal run mutation - start with 1 lockpick instead of 0
+Remove (clear-bonus loot bypasses carry weight) from dungeon cleared, but keep warning if player is now over encumbered after getting bonus loot from dungeon clear.
+Check that the lore notes are actual in the loot drop pool, haven't seen any while play testing.
+Didn't get time to play test talents, check logic to make sure all talents work and apply stat buffs properly 
