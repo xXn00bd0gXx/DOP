@@ -132,7 +132,7 @@ $script:FinalStandBuffs  = $null    # @{ATK; DEF; SPD; MAG} or $null
 $script:Settings = @{
     Difficulty = "Medium"
     AutoLoot   = $false
-    AutoResize = $true
+    AutoResize = $false
 }
 # Permanent shop discount granted by defeating the Orphaned Process.
 # Applied multiplicatively to all shop purchase prices.
@@ -11417,7 +11417,7 @@ function Show-OptionsMenu {
         $arStr = if($arOn){"ON "}else{"OFF"}
         $arColor = if($arOn){"Green"}else{"DarkGray"}
         Write-C "  [3] Auto-Resize: " "White"; Write-C $arStr $arColor
-        Write-CL "  (resize terminal to ~100x40 on game launch)" "DarkGray"
+        Write-CL "  (Experimental: resize terminal to ~100x40 on game launch, may crash some terminals)" "DarkGray"
 
         Write-Host ""
         Write-CL "  [0] Back" "DarkGray"
