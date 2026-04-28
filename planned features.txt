@@ -1,3 +1,21 @@
-Planned for 1.5:
-
-Bugs Reported in 1.4:
+List of bugs and changes, consider carefully and ask any clarifying questions needed to execute. Check for bugs, edge cases, and inconsistences. Ensure everything remains compliant with powershell 5.1, no modules, and netsec safe.
+- press any key on journal, replace with press enter. Also change quest log to quest journal on journal screen
+- blackjack press any key on hand loss, replace with press enter
+- check pacifist logic, all mutators bonus shouldn't apply to end of dungeon. Frugal still has mana pots, maybe change to 1 HP pot 1 MP pot. Exiting dungeon that has been started with mutator denies all loot, gold, and xp from that run. Display this warning on mutator screen and quit dungeon screen. 
+- cant read notes from inventory, either separate or add button to view lore notes in inventory
+- when maxed out royal suite uses prompts user to press any key twice.
+- broken lock screen error causes screen tearing/trouble going to next screen
+- increase boss scaling by ~10%
+- explain saving to player in save screen (that they should put the save code in a notepad text file, and use CTRL+V to paste the code in on the load save game screen)
+- Change market "loot mode" text to "sell all loot option" update sell all loot tip to be green so it stands out to user more.
+- Wandering Merchant should show if gear being sold is better than current gear equipped 
+- buff ranger
+- Add new tier of talents and cap talent points after unlocking everything. Make sure all are wired.
+- Make sure market items are listed in order of least to most expensive
+- Add dutchman's sword sell warning.
+- add settings tab with difficulty(easy, medium, hard) and auto loot options, terminal auto resize for better rendering. Settings should be saved. Difficulty effects enemy scaling, medium is current game difficulty and the default on start. Could use "O" for settings, and call it options. Only add terminal auto resize if it's netsec safe.
+- Add flying dutchman mode, similar to debug mode. Player gets to play as unique flying dutchman character, with special abilities, starting with high stats, the dutchman's sword, and 9999 gold, no saving. Flying dutchman mode password is Dutch26
+- change new games plus to clearing 25 dungeons instead of level 25
+- update change log, clear previous changes and only include this updates changes. do not put flying dutchman mode in change log.
+- update tutorial
+- bump version to 1.4.1
