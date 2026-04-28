@@ -51,6 +51,7 @@ $script:DailyDungeonDate = ""      # stores yyyy-MM-dd of last daily run
 $script:DailyDungeonDone = $false
 $script:TutorialSeen     = $false
 $script:DebugMode        = $false   # set by Start-DebugRun; gates save
+$script:DutchmanMode     = $false   # set by Start-FlyingDutchmanRun; also gates save
 $script:TotalKills       = 0       # lifetime (separate from $script:KillCount for quests)
 $script:BossesDefeated   = 0       # lifetime dungeon bosses
 $script:WeaponsOwned     = @{}     # weapon name -> $true (for collection tracking)
@@ -115,16 +116,81 @@ $script:Talents = @{}            # @{ "Knight_T1_A" = 1; ... }
 $script:LastStandUsed    = $false   # Knight Last Stand
 $script:ResurrectionUsed = $false   # Cleric Resurrection
 $script:FinalStandUsed   = $false   # Berserker Final Stand
-$script:LayOnHandsUsed   = $false   # Cleric Lay on Hands
+$script:LayOnHandsUsed   = 0       # Cleric Lay on Hands counter (T4 allows 2)
 # Berserker Final Stand: stores the delta applied at proc time so
 # Reset-MutatorOnEnd can revert it at dungeon end. Without this, the
 # +50% stats would compound across dungeons.
 $script:FinalStandBuffs  = $null    # @{ATK; DEF; SPD; MAG} or $null
+
+# ── Settings (saved inside the save code, not on disk) ──
+# Difficulty: "Easy" -25% enemy HP/ATK, "Medium" baseline, "Hard" +25%.
+# AutoLoot: when $true the loot screen auto-takes everything that fits.
+# AutoResize: when $true the game tries to resize the console window on start.
+# These are persisted as part of $script:Settings inside the v8 save
+# format (see Save-Game / Load-Game). Defaults below are applied to a
+# fresh character; loading a save overwrites them with the saved values.
+$script:Settings = @{
+    Difficulty = "Medium"
+    AutoLoot   = $false
+    AutoResize = $true
+}
 # Permanent shop discount granted by defeating the Orphaned Process.
 # Applied multiplicatively to all shop purchase prices.
 function Get-ShopDiscount {
     if($script:HiddenBossDefeated){ return 0.85 }   # 15% off
     return 1.0
+}
+
+# Difficulty -> enemy stat multiplier. Easy = 0.75, Medium = 1.0, Hard = 1.25.
+# Applied to enemy HP/MaxHP and ATK in Start-Combat (see scaling block).
+function Get-DifficultyMul {
+    switch($script:Settings.Difficulty){
+        "Easy" { return 0.75 }
+        "Hard" { return 1.25 }
+        default { return 1.0 }
+    }
+}
+
+# Best-effort terminal resize. PS5.1 has [Console]::SetWindowSize and
+# [Console]::SetBufferSize natively; both are safe and don't shell out.
+# Failures (window manager refusing the resize, sandboxed host, etc.)
+# are swallowed silently.
+function Try-AutoResizeTerminal {
+    if(-not $script:Settings.AutoResize){ return }
+    try {
+        $targetW = 100
+        $targetH = 40
+        $maxW = [Console]::LargestWindowWidth
+        $maxH = [Console]::LargestWindowHeight
+        if($targetW -gt $maxW){ $targetW = $maxW }
+        if($targetH -gt $maxH){ $targetH = $maxH }
+        # Buffer must be >= window dimensions. The trick: when shrinking
+        # the window, you must shrink the WINDOW first so the buffer
+        # shrink doesn't fail (buffer can't be smaller than window).
+        # When growing, grow the BUFFER first so the window grow doesn't
+        # fail (window can't be larger than buffer).
+        $curW = [Console]::WindowWidth
+        $curH = [Console]::WindowHeight
+        $curBufH = [Console]::BufferHeight
+        $newBufH = [Math]::Max($curBufH, $targetH + 100)
+        if($targetW -le $curW -and $targetH -le $curH){
+            # Shrink path: window first, then buffer.
+            [Console]::SetWindowSize($targetW, $targetH)
+            [Console]::SetBufferSize($targetW, $newBufH)
+        } else {
+            # Grow (or mixed) path: buffer first, then window. We grow
+            # buffer width up to target without shrinking buffer height.
+            [Console]::SetBufferSize([Math]::Max($targetW, [Console]::BufferWidth), $newBufH)
+            [Console]::SetWindowSize($targetW, $targetH)
+            # Snap buffer width down to the window width for a clean
+            # no-horizontal-scroll experience.
+            try { [Console]::SetBufferSize($targetW, $newBufH) } catch {}
+        }
+    } catch {
+        # Some hosts (ConPTY in some terminal apps, Windows Terminal at
+        # certain settings) don't permit window resize. That's fine —
+        # we just leave the user's existing window.
+    }
 }
 # ── Pet (v1.5): one of "Hound", "Raven", "Falcon" or $null. ──
 # Pets are bought at the Guild Hall and provide a single passive perk:
@@ -428,6 +494,14 @@ function Write-CL { param([string]$Text,[string]$Color="White",[string]$BG="")
     }
 }
 function Wait-Key { Write-Host ""; Write-C "[Press any key]" "DarkGray"; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
+# Like Wait-Key but specifically waits for Enter. Used in screens where
+# the player is expected to read text and press Enter to dismiss — feels
+# more deliberate than tapping any key.
+function Wait-Enter {
+    Write-Host ""
+    Write-C "[Press Enter]" "DarkGray"
+    $null = Read-Host
+}
 function clr {
     Clear-Host
     # Any non-dungeon clear invalidates the buffered dungeon state, so the
@@ -1016,9 +1090,16 @@ function Get-WeaponClassBonus {
     if(-not $script:EquippedWeapon){ return 0 }
     if(Test-ItemBroken $script:EquippedWeapon){ return 0 }
     $w = $script:EquippedWeapon
+    # Ranger bow buff: when a Ranger wields a Bow weapon, the affinity
+    # bonus is increased by 1 ATK (a small flat buff to reinforce the
+    # class fantasy without overshadowing other classes' weapons).
+    $rangerBowBonus = 0
+    if($script:PlayerClass -eq "Ranger" -and $w.WeaponType -eq "Bow"){
+        $rangerBowBonus = 1
+    }
     # Direct class match (Knight+Knight-affinity sword, Mage+Mage-affinity staff, etc.)
     if($w.ClassAffinity -eq $script:PlayerClass){
-        return $w.AffinityBonus
+        return [int]$w.AffinityBonus + $rangerBowBonus
     }
     # Shared-affinity fallbacks: new classes inherit bonuses from a related class
     # because the shop doesn't carry "Berserker"/"Warlock" tagged weapons.
@@ -1030,9 +1111,10 @@ function Get-WeaponClassBonus {
         default     { $null }
     }
     if($sharedAffinity -and $w.ClassAffinity -eq $sharedAffinity){
-        return $w.AffinityBonus
+        return [int]$w.AffinityBonus + $rangerBowBonus
     }
-    return 0
+    # Ranger gets the bow bonus even on bows they don't have direct affinity with
+    return $rangerBowBonus
 }
 
 # True if a weapon's affinity matches the player's class (directly or via shared).
@@ -1533,8 +1615,8 @@ function New-Boss {
         $pool = Get-ArmorShop | Where-Object { $_.Price -ge $tierMin -and $_.Price -le $tierMax }
         if($pool.Count -gt 0){ $armorDrop = $pool | Get-Random }
     }
-    @{ Name=$n;DisplayName=">>> $n [DUNGEON BOSS] <<<";HP=[math]::Floor(210*$hpScale);MaxHP=[math]::Floor(210*$hpScale)
-       ATK=[math]::Floor(20*$atkScale);DEF=[math]::Floor(14*$hpScale);SPD=[math]::Floor(11*$atkScale);MAG=[math]::Floor(14*$atkScale)
+    @{ Name=$n;DisplayName=">>> $n [DUNGEON BOSS] <<<";HP=[math]::Floor(231*$hpScale);MaxHP=[math]::Floor(231*$hpScale)
+       ATK=[math]::Floor(22*$atkScale);DEF=[math]::Floor(14*$hpScale);SPD=[math]::Floor(11*$atkScale);MAG=[math]::Floor(14*$atkScale)
        XP=[math]::Floor(400*$hpScale);Gold=(Get-Random -Min 100 -Max 250) + $Lvl * 40
        IsBoss=$true;IsMiniBoss=$false;Loot=(New-RandomLoot ($Lvl+2));Stunned=$false;DropsKey=$false
        WeaponDrop=$weaponDrop; ArmorDrop=$armorDrop
@@ -1942,13 +2024,13 @@ function Render-Screen {
                 "  /    \  "
             )
             4=@(
-                " {><oo><} ",
-                " |BOSS!!!| ",
-                "/  @  @  \ ",
-                "|  /\/\  | ",
-                "|  |XX|  | ",
-                " \ \--/ / ",
-                " /|    |\ "
+                "  ______  ",
+                " /######\ ",
+                " |##||##| ",
+                " |##||##| ",
+                " |#=()=#| ",
+                " |##||##| ",
+                " \######/ "
             )
             5=@(
                 "  ______  ",
@@ -2528,6 +2610,15 @@ function Start-Combat {
         $e.MaxHP = [math]::Floor($e.MaxHP * $ngMul)
         $e.ATK   = [math]::Floor($e.ATK * $ngMul)
     }
+    # ── Difficulty scaling (Settings) ──
+    # Easy 0.75, Medium 1.0, Hard 1.25. Stacks multiplicatively. Floors
+    # to 1 so Easy never produces 0-HP/0-ATK enemies.
+    $diffMul = Get-DifficultyMul
+    if($diffMul -ne 1.0){
+        $e.HP    = [math]::Max([math]::Floor($e.HP    * $diffMul), 1)
+        $e.MaxHP = [math]::Max([math]::Floor($e.MaxHP * $diffMul), 1)
+        $e.ATK   = [math]::Max([math]::Floor($e.ATK   * $diffMul), 1)
+    }
 
     $defBuff   = 0; $atkBuff = 0
     $defendCooldown = 0   # turns until Defend can be used again (0 = ready)
@@ -2563,7 +2654,8 @@ function Start-Combat {
     # (See Enter-Dungeon for the per-run reset.)
     # Cleric Lay on Hands: one free full heal per dungeon (used flag).
     # Necromancer Death Pact / Berserker Rampage: stacking ATK buffs from
-    # killing blows. Stacks max at 5 / 3 respectively, decay each turn.
+    # killing blows. Stacks persist within a fight; reset between fights.
+    # Caps: Death Pact 5, Rampage 3 (or 6 with Berserker T4 Eternal Rage).
     $rampageStacks  = 0
     $deathPactStacks = 0
     # Status effects on enemy (local to this fight)
@@ -2857,8 +2949,13 @@ function Start-Combat {
         $defLabel = if($defendCooldown -gt 0){"Defend(${defendCooldown}t)"}else{"Defend"}
         Write-CL "   [1] Attack  [2] Ability  [3] Potion  [4] Throw($throwCount)  [5] $defLabel  [6] Flee" "White"
         $extraOptions = @()
-        if(Has-Talent "Cleric_T3_B" -and -not $script:LayOnHandsUsed){
-            $extraOptions += "[L] Lay on Hands"
+        if(Has-Talent "Cleric_T3_B"){
+            # T4 Holy Fury allows 2 uses per dungeon, baseline allows 1.
+            $maxLoH = if(Has-Talent "Cleric_T4_A"){2}else{1}
+            if([int]$script:LayOnHandsUsed -lt $maxLoH){
+                $remaining = $maxLoH - [int]$script:LayOnHandsUsed
+                $extraOptions += "[L] Lay on Hands ($remaining left)"
+            }
         }
         if(Has-Talent "Warlock_T2_B"){
             $extraOptions += "[O] Soul Tap"
@@ -2879,13 +2976,28 @@ function Start-Combat {
 
         switch($choice){
             "1" {
-                # Necromancer Reaper: enemies below 25% HP are killed
+                # Necromancer Reaper: enemies below threshold HP are killed
                 # automatically by basic attack. Skips hit roll, perks,
-                # crits, and all damage math.
-                if(Has-Talent "Necromancer_T3_C" -and $e.HP -le ($e.MaxHP * 0.25) -and $e.HP -gt 0){
+                # crits, and all damage math. T4 Lord of the Dead bumps
+                # the threshold from 25% to 40% AND heals the player for
+                # 15 HP per Reaper kill.
+                $reaperThresh = 0
+                if(Has-Talent "Necromancer_T4_A"){
+                    $reaperThresh = 0.40
+                } elseif(Has-Talent "Necromancer_T3_C"){
+                    $reaperThresh = 0.25
+                }
+                if($reaperThresh -gt 0 -and $e.HP -le ($e.MaxHP * $reaperThresh) -and $e.HP -gt 0){
                     [void]$combatLog.Add(@{Text=">> REAPER. Their thread is harvested.";Color="DarkMagenta"})
                     $script:RunStats.DamageDealt += $e.HP
                     $e.HP = 0
+                    if(Has-Talent "Necromancer_T4_A"){
+                        $heal = [math]::Min(15, $script:Player.MaxHP - $script:Player.HP)
+                        if($heal -gt 0){
+                            $script:Player.HP += $heal
+                            [void]$combatLog.Add(@{Text="   Lord of the Dead — drained $heal HP.";Color="Magenta"})
+                        }
+                    }
                 }
                 elseif((Get-Random -Max 100) -ge $playerHitChance){
                     [void]$combatLog.Add(@{Text=">> You attack but MISS!";Color="DarkGray"})
@@ -2903,11 +3015,23 @@ function Start-Combat {
                     if(Has-Talent "Ranger_T2_A" -and ($e.HP -ge ($e.MaxHP * 0.75))){
                         $playerDmg = [math]::Floor($playerDmg * 1.15)
                     }
-                    if(Has-Talent "Brawler_T2_A" -and $script:Player.HP -lt ($script:Player.MaxHP * 0.50)){
-                        $playerDmg = [math]::Floor($playerDmg * 1.20)
+                    # Brawler T2_A Pugilist (was 20%) and T4 Iron Avalanche
+                    # share the "below 50% HP" condition. T4 supersedes T2_A
+                    # by going to 50% bonus instead of 20%.
+                    if($script:Player.HP -lt ($script:Player.MaxHP * 0.50)){
+                        if(Has-Talent "Brawler_T4_A"){
+                            $playerDmg = [math]::Floor($playerDmg * 1.50)
+                        }
+                        elseif(Has-Talent "Brawler_T2_A"){
+                            $playerDmg = [math]::Floor($playerDmg * 1.20)
+                        }
                     }
                     if(Has-Talent "Berserker_T2_A" -and $script:Player.HP -lt ($script:Player.MaxHP * 0.40)){
                         $playerDmg = [math]::Floor($playerDmg * 1.30)
+                    }
+                    # Knight Avatar of Light (T4): +15% damage dealt
+                    if(Has-Talent "Knight_T4_A"){
+                        $playerDmg = [math]::Floor($playerDmg * 1.15)
                     }
                     # Weapon-type +% mastery talents
                     if($script:EquippedWeapon){
@@ -2996,14 +3120,25 @@ function Start-Combat {
                         }
                     }
 
-                    # Ranger Multishot: 20% chance to attack a second time.
+                    # Ranger Multishot: 25% chance to attack a second time.
                     # Half damage, no perk procs, no durability loss to keep
                     # the proc cheap and the combat log readable.
-                    if(Has-Talent "Ranger_T3_B" -and (Get-Random -Max 100) -lt 20 -and $e.HP -gt 0){
-                        $extraDmg = [math]::Max([math]::Floor($playerDmg * 0.5), 1)
-                        $e.HP -= $extraDmg
-                        $script:RunStats.DamageDealt += $extraDmg
-                        [void]$combatLog.Add(@{Text="   Multishot! Second arrow flies for $extraDmg.";Color="Green"})
+                    # Volley (T4) supersedes: 50% chance, FULL damage.
+                    if($e.HP -gt 0){
+                        $msChance = 0
+                        $msMul    = 0.5
+                        if(Has-Talent "Ranger_T4_A"){
+                            $msChance = 50; $msMul = 1.0
+                        } elseif(Has-Talent "Ranger_T3_B"){
+                            $msChance = 25; $msMul = 0.5
+                        }
+                        if($msChance -gt 0 -and (Get-Random -Max 100) -lt $msChance){
+                            $extraDmg = [math]::Max([math]::Floor($playerDmg * $msMul), 1)
+                            $e.HP -= $extraDmg
+                            $script:RunStats.DamageDealt += $extraDmg
+                            $tag = if(Has-Talent "Ranger_T4_A"){"Volley"}else{"Multishot"}
+                            [void]$combatLog.Add(@{Text="   $tag! Second arrow flies for $extraDmg.";Color="Green"})
+                        }
                     }
 
                     # Weapon perk proc. Some talents bump the perk chance
@@ -3104,7 +3239,16 @@ function Start-Combat {
                             $p.HP -= $hpCost
                             [void]$combatLog.Add(@{Text=">> Sacrificed $hpCost HP!";Color="DarkMagenta"})
                         } else {
-                            $p.MP -= $ab.Cost
+                            # Mage Archmage Ascendant (T4): MP cost halved.
+                            $mpCost = [int]$ab.Cost
+                            if(Has-Talent "Mage_T4_A"){
+                                $mpCost = [math]::Max([math]::Floor($mpCost * 0.5), 1)
+                            }
+                            # Warlock Bound to Eternity (T4): Soul Tap is free.
+                            # Soul Tap is handled separately as the [O] action,
+                            # so here we only need to handle ability MP cost
+                            # — Soul Tap doesn't go through this path.
+                            $p.MP -= $mpCost
                         }
 
                         # Set this ability's cooldown. Use the CD field from the
@@ -3171,6 +3315,10 @@ function Start-Combat {
                                 if(Has-Talent "Mage_T3_A" -and $ab.Type -eq "Magic"){
                                     $playerDmg = [math]::Floor($playerDmg * 1.30)
                                 }
+                                # Mage Archmage Ascendant (T4): +40% on Magic
+                                if(Has-Talent "Mage_T4_A" -and $ab.Type -eq "Magic"){
+                                    $playerDmg = [math]::Floor($playerDmg * 1.40)
+                                }
                                 # Stacking buffs from kills
                                 if($rampageStacks -gt 0){ $playerDmg += (5 * $rampageStacks) }
                                 if($deathPactStacks -gt 0){
@@ -3213,9 +3361,11 @@ function Start-Combat {
                                         [void]$combatLog.Add(@{Text="   Spell Echo: $refund MP refunded";Color="Cyan"})
                                     }
                                 }
-                                # Warlock Soul Drain: ability damage heals for 30%.
+                                # Warlock Soul Drain: ability damage heals
+                                # for 30% (T3) or 60% (T4 Bound to Eternity).
                                 if(Has-Talent "Warlock_T3_B"){
-                                    $drain = [math]::Floor($playerDmg * 0.30)
+                                    $drainMul = if(Has-Talent "Warlock_T4_A"){0.60}else{0.30}
+                                    $drain = [math]::Floor($playerDmg * $drainMul)
                                     $drain = [math]::Min($drain, $p.MaxHP - $p.HP)
                                     if($drain -gt 0){
                                         $p.HP += $drain
@@ -3294,6 +3444,10 @@ function Start-Combat {
                                     # Cleric Healer's Touch: heal potions +30%
                                     if(Has-Talent "Cleric_T2_A"){
                                         $power = [math]::Floor($power * 1.30)
+                                    }
+                                    # Cleric Holy Fury (T4): +50% on top
+                                    if(Has-Talent "Cleric_T4_A"){
+                                        $power = [math]::Floor($power * 1.50)
                                     }
                                     $healed = [math]::Min($power, $p.MaxHP - $p.HP)
                                     $p.HP += $healed
@@ -3415,49 +3569,59 @@ function Start-Combat {
                 $acted = $false
             }
             "L" {
-                # Cleric Lay on Hands: full heal, once per dungeon. Costs
-                # the player's turn but full HP recovery is worth it.
+                # Cleric Lay on Hands: full heal, once per dungeon (or
+                # twice with Holy Fury T4). Costs the player's turn but
+                # full HP recovery is worth it.
                 if(-not (Has-Talent "Cleric_T3_B")){
                     [void]$combatLog.Add(@{Text=">> You don't have that talent.";Color="DarkGray"})
                     $acted = $false
-                } elseif($script:LayOnHandsUsed){
-                    [void]$combatLog.Add(@{Text=">> Lay on Hands already used this dungeon.";Color="DarkGray"})
-                    $acted = $false
                 } else {
-                    $heal = $p.MaxHP - $p.HP
-                    $p.HP = $p.MaxHP
-                    $script:LayOnHandsUsed = $true
-                    [void]$combatLog.Add(@{Text=">> LAY ON HANDS — restored $heal HP.";Color="Green"})
+                    $maxLoH = if(Has-Talent "Cleric_T4_A"){2}else{1}
+                    if([int]$script:LayOnHandsUsed -ge $maxLoH){
+                        [void]$combatLog.Add(@{Text=">> Lay on Hands exhausted for this dungeon.";Color="DarkGray"})
+                        $acted = $false
+                    } else {
+                        $heal = $p.MaxHP - $p.HP
+                        $p.HP = $p.MaxHP
+                        $script:LayOnHandsUsed = [int]$script:LayOnHandsUsed + 1
+                        [void]$combatLog.Add(@{Text=">> LAY ON HANDS — restored $heal HP.";Color="Green"})
+                    }
                 }
             }
             "O" {
                 # Warlock Soul Tap: spend 5 HP to deal +10 damage on this
                 # turn's basic attack. Sets a flag the basic attack reads.
+                # T4 Bound to Eternity makes Soul Tap free (no HP cost).
                 if(-not (Has-Talent "Warlock_T2_B")){
                     [void]$combatLog.Add(@{Text=">> You don't have that talent.";Color="DarkGray"})
                     $acted = $false
-                } elseif($p.HP -le 5){
-                    [void]$combatLog.Add(@{Text=">> Not enough HP to Soul Tap (need >5).";Color="Red"})
-                    $acted = $false
                 } else {
-                    # Deduct HP, deal direct damage with hit roll
-                    $p.HP -= 5
-                    if((Get-Random -Max 100) -ge $playerHitChance){
-                        [void]$combatLog.Add(@{Text=">> Soul Tap MISSES! Lost 5 HP for nothing.";Color="DarkGray"})
+                    $tapCost = if(Has-Talent "Warlock_T4_A"){0}else{5}
+                    if($tapCost -gt 0 -and $p.HP -le $tapCost){
+                        [void]$combatLog.Add(@{Text=">> Not enough HP to Soul Tap (need >$tapCost).";Color="Red"})
+                        $acted = $false
                     } else {
-                        $rawTap = $totalATK + 10 - [math]::Floor($e.DEF * 0.5)
-                        $tapDmg = [math]::Max($rawTap + (Get-Random -Min -2 -Max 4), 1)
-                        # Crit roll
-                        $tapCrit = ((Get-Random -Max 100) -lt $playerCritChance)
-                        if($tapCrit){
-                            if(Has-Talent "Ranger_T3_A"){ $tapDmg *= 3 } else { $tapDmg *= 2 }
-                        }
-                        $e.HP -= $tapDmg
-                        $script:RunStats.DamageDealt += $tapDmg
-                        if($tapCrit){
-                            [void]$combatLog.Add(@{Text=">> SOUL TAP CRIT! $tapDmg damage. (-5 HP)";Color="Yellow"})
+                        # Deduct HP, deal direct damage with hit roll
+                        if($tapCost -gt 0){ $p.HP -= $tapCost }
+                        if((Get-Random -Max 100) -ge $playerHitChance){
+                            $missMsg = if($tapCost -gt 0){">> Soul Tap MISSES! Lost $tapCost HP for nothing."}else{">> Soul Tap MISSES!"}
+                            [void]$combatLog.Add(@{Text=$missMsg;Color="DarkGray"})
                         } else {
-                            [void]$combatLog.Add(@{Text=">> Soul Tap: $tapDmg damage. (-5 HP)";Color="DarkMagenta"})
+                            $rawTap = $totalATK + 10 - [math]::Floor($e.DEF * 0.5)
+                            $tapDmg = [math]::Max($rawTap + (Get-Random -Min -2 -Max 4), 1)
+                            # Crit roll
+                            $tapCrit = ((Get-Random -Max 100) -lt $playerCritChance)
+                            if($tapCrit){
+                                if(Has-Talent "Ranger_T3_A"){ $tapDmg *= 3 } else { $tapDmg *= 2 }
+                            }
+                            $e.HP -= $tapDmg
+                            $script:RunStats.DamageDealt += $tapDmg
+                            $costTag = if($tapCost -gt 0){" (-$tapCost HP)"}else{" (free!)"}
+                            if($tapCrit){
+                                [void]$combatLog.Add(@{Text=">> SOUL TAP CRIT! $tapDmg damage.$costTag";Color="Yellow"})
+                            } else {
+                                [void]$combatLog.Add(@{Text=">> Soul Tap: $tapDmg damage.$costTag";Color="DarkMagenta"})
+                            }
                         }
                     }
                 }
@@ -3470,11 +3634,16 @@ function Start-Combat {
         # to 0 HP. We check just once before the poison tick so we don't
         # double-fire on the same kill.
         if($acted -and $e.HP -le 0){
-            # Berserker Rampage: +1 stack (max 3) — adds to $rampageStacks
-            # which the next basic/ability attack will read.
-            if(Has-Talent "Berserker_T3_A" -and $rampageStacks -lt 3){
-                $rampageStacks++
-                [void]$combatLog.Add(@{Text="   Rampage: stack $rampageStacks/3";Color="DarkRed"})
+            # Berserker Rampage: +1 stack — adds to $rampageStacks which
+            # the next basic/ability attack will read. Baseline cap is 3,
+            # T4 Eternal Rage doubles cap to 6 AND prevents end-of-turn
+            # decay (handled separately below).
+            if(Has-Talent "Berserker_T3_A"){
+                $rampageMax = if(Has-Talent "Berserker_T4_A"){6}else{3}
+                if($rampageStacks -lt $rampageMax){
+                    $rampageStacks++
+                    [void]$combatLog.Add(@{Text="   Rampage: stack $rampageStacks/$rampageMax";Color="DarkRed"})
+                }
             }
             # Necromancer Death Pact: +1 stack (max 5)
             if(Has-Talent "Necromancer_T3_B" -and $deathPactStacks -lt 5){
@@ -3670,6 +3839,11 @@ function Start-Combat {
                         # Warlock Doompact: +25% damage taken (was applied as ATK boost in same tier)
                         if(Has-Talent "Warlock_T3_A"){
                             $eDmg = [math]::Floor($eDmg * 1.25)
+                        }
+                        # Knight Avatar of Light (T4): -25% all damage taken.
+                        # Stacks multiplicatively with other reductions.
+                        if(Has-Talent "Knight_T4_A"){
+                            $eDmg = [math]::Floor($eDmg * 0.75)
                         }
                         # Ensure damage doesn't drop below 1
                         if($eDmg -lt 1){ $eDmg = 1 }
@@ -3939,15 +4113,18 @@ function Start-Combat {
             $xpGain += $foodXP
         }
     }
-    # Pacifist's Path mutator: kills grant zero XP. Quest turn-ins give
-    # double instead.
+    # Pacifist's Path mutator: kills grant zero XP. Quests completed
+    # while this mutator is active have their XP reward tripled at the
+    # moment of completion (see Update-QuestProgress); the turn-in
+    # screen pays out the boosted reward when the player visits the
+    # Quest Board in town.
     if(Has-Mutator "Pacifist"){
         $xpGain = 0
     }
-    # Hardcore mutator: +30% XP from kills (stacks with Bard/Cooking).
-    if(Has-Mutator "Hardcore"){
-        $xpGain = [math]::Floor($xpGain * 1.30)
-    }
+    # Hardcore mutator XP bonus used to fire per-kill, but mutator
+    # reward bonuses now apply ONLY at end-of-dungeon clear via the
+    # Get-MutatorRewardMul multiplier. Per-kill XP is baseline so a
+    # quit-forfeiture rollback maps cleanly to actual earned XP.
     $script:XP += $xpGain
     $script:RunStats.XPEarned += $xpGain
     if($xpGain -gt 0){
@@ -3988,22 +4165,12 @@ function Start-Combat {
             Write-CL "  + $foodGold Gold (well-fed)" "DarkYellow"
         }
     }
-    # Mutator gold modifiers (applied last so they multiply the final tally):
-    if(Has-Mutator "Speedrun"){
-        $sBonus = [math]::Floor($goldGain * 0.50)
-        $goldGain += $sBonus
-        if($sBonus -gt 0){ Write-CL "  + $sBonus Gold (Speedrun)" "Yellow" }
-    }
-    if(Has-Mutator "Frugal"){
-        $fBonus = [math]::Floor($goldGain * 0.75)
-        $goldGain += $fBonus
-        if($fBonus -gt 0){ Write-CL "  + $fBonus Gold (Frugal Run)" "DarkYellow" }
-    }
-    if(Has-Mutator "Hardcore"){
-        $hBonus = [math]::Floor($goldGain * 0.30)
-        $goldGain += $hBonus
-        if($hBonus -gt 0){ Write-CL "  + $hBonus Gold (Hardcore)" "Red" }
-    }
+    # Mutator gold modifiers used to fire per-kill, but that put padded
+    # gold in the player's bag before they reached the end of the run —
+    # which then conflicted with the mutator-active quit-forfeiture rule.
+    # Mutator reward bonuses now apply ONLY at the end-of-dungeon clear
+    # multiplier (Get-MutatorRewardMul). Per-kill drops are baseline.
+
     # Gold goes through the loot screen now — flows better visually with the
     # rest of the drops. Always free weight, but listed alongside loot items.
 
@@ -5035,9 +5202,11 @@ function Show-Market {
                     if($sIdx -lt 0 -or $sIdx -ge $slots.Count){ continue }
                     $chosenSlot = $slots[$sIdx]
 
-                    # Show armor for that slot
+                    # Show armor for that slot, sorted by price ascending so
+                    # the cheapest options are at the top — matches the
+                    # weapon shop ordering and the player's expectation.
                     $allArmor = Get-ArmorShop
-                    $slotArmor = @($allArmor | Where-Object { $_.Slot -eq $chosenSlot })
+                    $slotArmor = @($allArmor | Where-Object { $_.Slot -eq $chosenSlot } | Sort-Object Price)
 
                     clr
                     Write-CL "  ╔════════════════════════════════════════════════════════╗" "DarkCyan"
@@ -5133,17 +5302,22 @@ function Show-Market {
                     Write-C "  Throwables: " "DarkGray"; Write-CL "$($script:ThrowablePotions.Count) / 5" "DarkYellow"
                     Write-Host ""
 
+                    # Potions and throwables, each section sorted by price
+                    # ascending. The split between sections is at index 7
+                    # (the first Throwable entry). Order matters for the
+                    # divider rendering below — keep the seven Potions
+                    # first, then the four Throwables.
                     $potionShop = @(
                         @{Name="Small Health Potion"; Type="Heal";    Power=30; Price=25;  Desc="Restore 30 HP";     Icon="[HP+]";  Category="Potion"}
-                        @{Name="Large Health Potion"; Type="Heal";    Power=70; Price=60;  Desc="Restore 70 HP";     Icon="[HP++]"; Category="Potion"}
                         @{Name="Mana Potion";         Type="Mana";    Power=30; Price=30;  Desc="Restore 30 MP";     Icon="[MP+]";  Category="Potion"}
                         @{Name="Large Mana Potion";   Type="Mana";    Power=60; Price=55;  Desc="Restore 60 MP";     Icon="[MP++]"; Category="Potion"}
+                        @{Name="Large Health Potion"; Type="Heal";    Power=70; Price=60;  Desc="Restore 70 HP";     Icon="[HP++]"; Category="Potion"}
                         @{Name="Strength Elixir";     Type="ATKBuff"; Power=8;  Price=75;  Desc="ATK+8 in battle";   Icon="[ATK]";  Category="Potion"}
                         @{Name="Iron Skin Elixir";    Type="DEFBuff"; Power=8;  Price=75;  Desc="DEF+8 in battle";   Icon="[DEF]";  Category="Potion"}
                         @{Name="Potion of Luck";      Type="Luck";    Power=20; Price=90;  Desc="+20% crit, 3 turns"; Icon="[LCK]";  Category="Potion"}
+                        @{Name="Frost Bomb";          Type="ThrowSlow";  Power=20; Price=55; Desc="20 dmg + Slow";   Icon="[SLW]"; Category="Throwable"}
                         @{Name="Acid Flask";          Type="Throw";   Power=40; Price=60;  Desc="Deal 40 damage";    Icon="[DMG]";  Category="Throwable"}
                         @{Name="Poison Flask";        Type="ThrowPoison"; Power=25; Price=70; Desc="25 dmg + Poison"; Icon="[PSN]"; Category="Throwable"}
-                        @{Name="Frost Bomb";          Type="ThrowSlow";  Power=20; Price=55; Desc="20 dmg + Slow";   Icon="[SLW]"; Category="Throwable"}
                         @{Name="Bomb";                Type="Throw";   Power=75; Price=140; Desc="Deal 75 damage";    Icon="[BMB]";  Category="Throwable"}
                     )
 
@@ -5307,9 +5481,9 @@ function Show-Market {
                     Write-CL "  Total sell value: ${totalVal}g" "Yellow"
                     Write-Host ""
                     Write-CL "  [A] Sell ALL          [#] Sell one item by number" "White"
-                    Write-CL "  [L] Sell all LOOT     [0] Back" "White"
-                    Write-CL "      (Loot mode keeps weapons, armor, potions, throwables," "DarkGray"
-                    Write-CL "       notes, and ingredients — sells everything else.)" "DarkGray"
+                    Write-CL "  [L] Sell All Loot     [0] Back" "White"
+                    Write-CL "      Sell All Loot option keeps weapons, armor, potions," "Green"
+                    Write-CL "      throwables, notes, and ingredients — sells the rest." "Green"
                     Write-C "  > " "Yellow"; $si=Read-Host
 
                     if($si -eq 'A' -or $si -eq 'a'){
@@ -5365,6 +5539,24 @@ function Show-Market {
                         if($sidx -ge 0 -and $sidx -lt $sellList.Count){
                             $entry = $sellList[$sidx]
                             $it = $entry.Item
+                            # Dutchman's Blade is a unique encounter drop
+                            # that can't be re-acquired in a normal run.
+                            # Confirm before letting the player sell it
+                            # — easy to misclick on a sorted bag.
+                            $isUniqueSword = ($it.Name -eq "Dutchman's Blade")
+                            if($isUniqueSword){
+                                Write-Host ""
+                                Write-CL "  ! WARNING: Dutchman's Blade is unique and CANNOT be" "DarkYellow"
+                                Write-CL "    re-acquired. Once sold, it's gone for this run." "DarkYellow"
+                                Write-Host ""
+                                Write-C "  Sell anyway? (y/n): " "Yellow"
+                                $duConfirm = Read-Host
+                                if($duConfirm -ne 'y' -and $duConfirm -ne 'Y'){
+                                    Write-CL "  Cancelled." "DarkGray"
+                                    Wait-Key
+                                    continue
+                                }
+                            }
                             $sv = Get-ItemSellValue $it
                             $script:Gold += $sv
                             Write-CL "  Sold $($it.Name) for ${sv}g!" "Green"
@@ -5477,7 +5669,6 @@ function Show-LootScreen {
     $itemCount = $Items.Count
     $marked = New-Object 'bool[]' $itemCount   # default false; user opts in
     $cursor = 0                                # which row is highlighted
-
     function _LootRouteAndStow {
         param($Items, $marked)
         $taken = @()
@@ -5637,6 +5828,38 @@ function Show-LootScreen {
             $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
     } catch {}
+
+    # ── Auto-Loot setting bypass ──
+    # When the player has Auto-Loot ON, this screen auto-marks every
+    # item that fits within the carry-weight cap and routes them
+    # directly. Items are picked in their natural order until adding
+    # the next would exceed max weight; remaining items are left.
+    # Potion-belt and throwable-bag overflow follows the same rules
+    # as the manual flow.
+    if($script:Settings -and $script:Settings.AutoLoot){
+        $maxW = Get-MaxCarryWeight $script:Player
+        $curW = Get-CurrentCarryWeight
+        $room = $maxW - $curW
+        if($room -lt 0){ $room = 0 }
+        $autoMarked = New-Object 'bool[]' $itemCount
+        for($i=0; $i -lt $itemCount; $i++){
+            $iw = Get-ItemWeight $Items[$i]
+            if($iw -le $room){
+                $autoMarked[$i] = $true
+                $room -= $iw
+            }
+        }
+        $autoResult = _LootRouteAndStow $Items $autoMarked
+        if($autoResult.Rejected.Count -gt 0){
+            Write-Host ""
+            Write-CL "  Auto-loot took what fit. These didn't make it:" "Yellow"
+            foreach($r in $autoResult.Rejected){
+                Write-CL "    ! $($r.Name)" "DarkYellow"
+            }
+            Wait-Key
+        }
+        return $autoResult.Taken
+    }
 
     while($true){
         clr
@@ -6490,7 +6713,11 @@ function Start-Blackjack {
             }
             if($pVal -gt 21){
                 Write-CL "  BUST!" "Red"
-                Start-Sleep -Milliseconds 1200
+                Write-Host ""
+                # Wait for the player to press Enter so they can read the
+                # bust before the dealer turn starts. Replaces the 1.2s
+                # auto-advance, which was too fast to register.
+                Read-Host "  [Press Enter to continue]" | Out-Null
                 $playerStanding = $true
                 break
             }
@@ -6781,6 +7008,65 @@ function Start-RandomEncounter {
             }
             $salePrice = [math]::Floor($origPrice * 0.4)
             Write-CL "  Offer: $($item.Name) [$itemKind]" "Cyan"
+
+            # ── Compare against currently equipped gear ──
+            # For weapons: compare ATK + AffinityBonus (when class matches).
+            # For armor: compare DEF for the same slot.
+            # Potions don't compare — there's no equipped potion to weigh.
+            $cmpTag  = ""
+            $cmpClr  = "DarkGray"
+            if($itemKind -eq "Weapon"){
+                $offerAtk   = [int]$item.ATK
+                if(Test-WeaponClassMatch $item){
+                    $offerAtk += [int]$item.AffinityBonus
+                }
+                $currentAtk = 0
+                if($script:EquippedWeapon){
+                    $currentAtk = [int]$script:EquippedWeapon.ATK
+                    if(Test-WeaponClassMatch $script:EquippedWeapon){
+                        $currentAtk += [int]$script:EquippedWeapon.AffinityBonus
+                    }
+                }
+                if($currentAtk -eq 0){
+                    $cmpTag = " (you have no weapon equipped)"
+                    $cmpClr = "Yellow"
+                } elseif($offerAtk -gt $currentAtk){
+                    $cmpTag = "  ▲ better than current ATK $currentAtk -> $offerAtk"
+                    $cmpClr = "Green"
+                } elseif($offerAtk -lt $currentAtk){
+                    $cmpTag = "  ▼ worse than current ATK $currentAtk -> $offerAtk"
+                    $cmpClr = "Red"
+                } else {
+                    $cmpTag = "  = same ATK as current ($currentAtk)"
+                    $cmpClr = "DarkGray"
+                }
+            }
+            elseif($itemKind -eq "Armor"){
+                $slot = [string]$item.Slot
+                $offerDef   = [int]$item.DEF
+                $current = $null
+                if($slot -and $script:EquippedArmor -and $script:EquippedArmor.ContainsKey($slot)){
+                    $current = $script:EquippedArmor[$slot]
+                }
+                $currentDef = if($current){[int]$current.DEF}else{0}
+                if(-not $current){
+                    $cmpTag = " (you have no $slot equipped)"
+                    $cmpClr = "Yellow"
+                } elseif($offerDef -gt $currentDef){
+                    $cmpTag = "  ▲ better than current DEF $currentDef -> $offerDef"
+                    $cmpClr = "Green"
+                } elseif($offerDef -lt $currentDef){
+                    $cmpTag = "  ▼ worse than current DEF $currentDef -> $offerDef"
+                    $cmpClr = "Red"
+                } else {
+                    $cmpTag = "  = same DEF as current ($currentDef)"
+                    $cmpClr = "DarkGray"
+                }
+            }
+            if($cmpTag){
+                Write-CL $cmpTag $cmpClr
+            }
+
             Write-C "  Normal price: " "DarkGray"; Write-CL "$($origPrice)g" "DarkYellow"
             Write-C "  Today's price: " "DarkGray"; Write-CL "$($salePrice)g (60% off!)" "Yellow"
             Write-Host ""
@@ -7510,7 +7796,20 @@ function Start-Lockpicking {
             & $renderFrame
         }
         & $renderFrame
-        Start-Sleep -Seconds 1
+        # Holding the screen briefly with Start-Sleep used to flash the
+        # final message past too fast — players reported screen tearing
+        # and trouble reading what happened. If the player ran out of
+        # picks (vs winning or aborting), give them an explicit prompt
+        # so they can dismiss the result on their own time.
+        if(-not $script:lpWon -and -not $script:lpAborted){
+            # All picks broken path — print the final status line below
+            # the rendered frame and wait for Enter.
+            Write-Host ""
+            Write-CL "  All your picks are broken. The lock stays shut." "DarkRed"
+            Wait-Enter
+        } else {
+            Start-Sleep -Seconds 1
+        }
     } finally {
         try { [Console]::CursorVisible = $wasVisible } catch {}
         # Drain any queued keys from the minigame so they don't leak into the dungeon loop
@@ -7553,6 +7852,7 @@ function Get-TalentsForClass {
                 @{ Id="Knight_T3_A"; Name="Crusader";        Tier=3; Desc="+25% damage to bosses" }
                 @{ Id="Knight_T3_B"; Name="Last Stand";      Tier=3; Desc="Survive lethal damage with 1 HP (once per dungeon)" }
                 @{ Id="Knight_T3_C"; Name="Guardian";        Tier=3; Desc="-10% damage taken when shield is equipped" }
+                @{ Id="Knight_T4_A"; Name="Avatar of Light";  Tier=4; Desc="ULT: -25% all damage taken, +15% all damage dealt" }
             )
         }
         "Mage" {
@@ -7566,6 +7866,7 @@ function Get-TalentsForClass {
                 @{ Id="Mage_T3_A"; Name="Archmage";        Tier=3; Desc="+30% magic damage" }
                 @{ Id="Mage_T3_B"; Name="Mana Surge";      Tier=3; Desc="Crit hits restore 10 MP" }
                 @{ Id="Mage_T3_C"; Name="Time Slip";       Tier=3; Desc="Ability cooldowns -1 turn" }
+                @{ Id="Mage_T4_A"; Name="Archmage Ascendant"; Tier=4; Desc="ULT: All abilities cost 50% MP, +40% magic damage" }
             )
         }
         "Brawler" {
@@ -7579,6 +7880,7 @@ function Get-TalentsForClass {
                 @{ Id="Brawler_T3_A"; Name="Berserk";       Tier=3; Desc="+40% crit chance below 25% HP" }
                 @{ Id="Brawler_T3_B"; Name="Unbreakable";   Tier=3; Desc="-15% damage taken (always)" }
                 @{ Id="Brawler_T3_C"; Name="Knockout";      Tier=3; Desc="Crits have 30% chance to stun" }
+                @{ Id="Brawler_T4_A"; Name="Iron Avalanche"; Tier=4; Desc="ULT: +50% damage below 50% HP (was +20%)" }
             )
         }
         "Ranger" {
@@ -7590,8 +7892,9 @@ function Get-TalentsForClass {
                 @{ Id="Ranger_T2_B"; Name="Toxic Tips";     Tier=2; Desc="Poison perk procs +25% more often" }
                 @{ Id="Ranger_T2_C"; Name="Quickdraw";      Tier=2; Desc="First attack each fight is a guaranteed crit" }
                 @{ Id="Ranger_T3_A"; Name="Deadshot";       Tier=3; Desc="Crits deal 3x damage (was 2x)" }
-                @{ Id="Ranger_T3_B"; Name="Multishot";      Tier=3; Desc="20% chance to attack twice" }
+                @{ Id="Ranger_T3_B"; Name="Multishot";      Tier=3; Desc="25% chance to attack twice" }
                 @{ Id="Ranger_T3_C"; Name="Trapfinder";     Tier=3; Desc="+1 free lockpick on dungeon entry" }
+                @{ Id="Ranger_T4_A"; Name="Volley";          Tier=4; Desc="ULT: Multishot procs at 50% (was 25%) and full damage" }
             )
         }
         "Cleric" {
@@ -7605,6 +7908,7 @@ function Get-TalentsForClass {
                 @{ Id="Cleric_T3_A"; Name="Divine Aegis";   Tier=3; Desc="-20% damage taken from magic" }
                 @{ Id="Cleric_T3_B"; Name="Lay on Hands";   Tier=3; Desc="One free full heal per dungeon" }
                 @{ Id="Cleric_T3_C"; Name="Resurrection";   Tier=3; Desc="On death, revive at 50% HP (once per dungeon)" }
+                @{ Id="Cleric_T4_A"; Name="Holy Fury";       Tier=4; Desc="ULT: All healing +50%, Lay on Hands twice/dungeon" }
             )
         }
         "Necromancer" {
@@ -7618,6 +7922,7 @@ function Get-TalentsForClass {
                 @{ Id="Necromancer_T3_A"; Name="Lich's Pact";  Tier=3; Desc="+30% damage but -20% max HP" }
                 @{ Id="Necromancer_T3_B"; Name="Death Pact";   Tier=3; Desc="On killing blow, +5% damage next fight (stacking, max 5)" }
                 @{ Id="Necromancer_T3_C"; Name="Reaper";       Tier=3; Desc="Killing an enemy below 25% HP is automatic" }
+                @{ Id="Necromancer_T4_A"; Name="Lord of the Dead"; Tier=4; Desc="ULT: Reaper threshold 40% (was 25%), kills heal 15 HP" }
             )
         }
         "Berserker" {
@@ -7631,6 +7936,7 @@ function Get-TalentsForClass {
                 @{ Id="Berserker_T3_A"; Name="Rampage";        Tier=3; Desc="Kills grant +5 ATK for 3 turns (stacking, max 3)" }
                 @{ Id="Berserker_T3_B"; Name="Pain Tolerance"; Tier=3; Desc="Damage taken converts 25% to ATK buff next turn" }
                 @{ Id="Berserker_T3_C"; Name="Final Stand";    Tier=3; Desc="At 1 HP, +50% all stats (once per dungeon)" }
+                @{ Id="Berserker_T4_A"; Name="Eternal Rage";    Tier=4; Desc="ULT: Rampage stacks max 6 (was 3)" }
             )
         }
         "Warlock" {
@@ -7644,6 +7950,7 @@ function Get-TalentsForClass {
                 @{ Id="Warlock_T3_A"; Name="Doompact";       Tier=3; Desc="+25% damage but +25% damage taken" }
                 @{ Id="Warlock_T3_B"; Name="Soul Drain";     Tier=3; Desc="All abilities heal you for 30% damage dealt" }
                 @{ Id="Warlock_T3_C"; Name="Eternal Bargain";Tier=3; Desc="Kills below 20% HP restore 25 HP and 15 MP" }
+                @{ Id="Warlock_T4_A"; Name="Bound to Eternity"; Tier=4; Desc="ULT: Soul Drain heals 60% (was 30%), Soul Tap free" }
             )
         }
         default { @() }
@@ -7696,22 +8003,40 @@ function Has-Talent {
 
 # How many talent points the player has unspent.
 # Total = PlayerLevel; Spent = count of purchased talents.
+# After all class talents are owned, available drops to 0 even if the
+# player has continued levelling — there's nothing left to buy.
 function Get-AvailableTalentPoints {
     $total = [int]$script:PlayerLevel
     $spent = if($script:Talents){$script:Talents.Count}else{0}
     $avail = $total - $spent
     if($avail -lt 0){ $avail = 0 }
+    # Class-specific cap: count talents available for the current class
+    # and subtract what's already owned. The result is the max number
+    # of points the player can ever spend, so cap $avail to that.
+    $classTalents = @(Get-TalentsForClass $script:PlayerClass)
+    $totalSlots   = $classTalents.Count
+    $ownedForClass = 0
+    if($script:Talents){
+        foreach($t in $classTalents){
+            if($script:Talents.ContainsKey($t.Id)){ $ownedForClass++ }
+        }
+    }
+    $remainingSlots = $totalSlots - $ownedForClass
+    if($remainingSlots -lt 0){ $remainingSlots = 0 }
+    if($avail -gt $remainingSlots){ $avail = $remainingSlots }
     return $avail
 }
 
 # Tier gating: returns the minimum player level required to spend in
-# this tier. Tier 1 = level 1; Tier 2 = level 5; Tier 3 = level 10.
+# this tier. Tier 1 = level 1; Tier 2 = level 5; Tier 3 = level 10;
+# Tier 4 (capstone ultimates) = level 15.
 function Get-TalentTierMinLevel {
     param([int]$Tier)
     switch($Tier){
         1 { return 1 }
         2 { return 5 }
         3 { return 10 }
+        4 { return 15 }
         default { return 1 }
     }
 }
@@ -7736,24 +8061,27 @@ function Show-TalentTree {
         Write-C  "  Player Level: " "DarkGray"; Write-C "$($script:PlayerLevel)" "White"
         Write-C  "    Available Talent Points: " "DarkGray"; Write-CL "$avail" "Yellow"
         Write-Host ""
-        Write-CL "  Tier gates: T1 @ Lv1   T2 @ Lv5   T3 @ Lv10" "DarkGray"
+        Write-CL "  Tier gates: T1 @ Lv1   T2 @ Lv5   T3 @ Lv10   T4 @ Lv15" "DarkGray"
         Write-Host ""
 
-        # Group talents by tier
-        for($tier=1; $tier -le 3; $tier++){
+        # Group talents by tier (4 tiers; Tier 4 is a single capstone
+        # ULT per class with id pattern Class_T4_A, key "41").
+        for($tier=1; $tier -le 4; $tier++){
             $tierMin = Get-TalentTierMinLevel $tier
-            $tierLabel = "── Tier $tier (Lv $tierMin+) ──"
-            $tierColor = if($script:PlayerLevel -ge $tierMin){"Yellow"}else{"DarkGray"}
+            $tierLabel = if($tier -eq 4){"── Tier 4 ULT (Lv $tierMin+) ──"}else{"── Tier $tier (Lv $tierMin+) ──"}
+            $tierColor = if($script:PlayerLevel -ge $tierMin){if($tier -eq 4){"Magenta"}else{"Yellow"}}else{"DarkGray"}
             Write-CL "  $tierLabel" $tierColor
             $idx = 0
+            $tierHadAny = $false
             foreach($t in $talents){
                 if($t.Tier -ne $tier){ continue }
+                $tierHadAny = $true
                 $idx++
                 $owned = Has-Talent $t.Id
                 $unlocked = ($script:PlayerLevel -ge $tierMin)
-                $key = "$tier$idx"   # e.g. "1A" -> 11, 12, 13, 21, ...
+                $key = "$tier$idx"   # e.g. "1A" -> 11, 12, 13, 21, ..., "41"
                 $status = if($owned){"[X]"}elseif($unlocked -and $avail -gt 0){"[ ]"}else{"[-]"}
-                $col = if($owned){"Green"}elseif($unlocked -and $avail -gt 0){"White"}else{"DarkGray"}
+                $col = if($owned){"Green"}elseif($unlocked -and $avail -gt 0){if($tier -eq 4){"Magenta"}else{"White"}}else{"DarkGray"}
                 Write-C "    [$key] " $col
                 Write-C $status $col
                 Write-C "  $($t.Name)" $col
@@ -7761,12 +8089,15 @@ function Show-TalentTree {
                 if($padN -lt 1){ $padN = 1 }
                 Write-CL ("$(' ' * $padN) — $($t.Desc)") "DarkGray"
             }
+            if(-not $tierHadAny){
+                Write-CL "    (no talents in this tier for this class)" "DarkGray"
+            }
             Write-Host ""
         }
 
         Write-CL "    [0] Back" "White"
         Write-Host ""
-        Write-CL "  Spend points by entering the talent code (e.g., 11 = Tier1 first)." "DarkGray"
+        Write-CL "  Spend points by entering the talent code (e.g., 11 = Tier1 first, 41 = ULT)." "DarkGray"
         Write-Host ""
         Write-C  "  > " "Yellow"
         $sel = Read-Host
@@ -7785,7 +8116,10 @@ function Show-TalentTree {
         $idxN     = 0
         if(-not [int]::TryParse($tierChar, [ref]$tierN)){ continue }
         if(-not [int]::TryParse($idxChar,  [ref]$idxN )){ continue }
-        if($tierN -lt 1 -or $tierN -gt 3 -or $idxN -lt 1 -or $idxN -gt 3){ continue }
+        # Tier 1-3 have 3 talents each; Tier 4 has 1 capstone.
+        if($tierN -lt 1 -or $tierN -gt 4){ continue }
+        if($tierN -le 3 -and ($idxN -lt 1 -or $idxN -gt 3)){ continue }
+        if($tierN -eq 4 -and $idxN -ne 1){ continue }
 
         # Find the talent
         $tierTalents = @($talents | Where-Object { $_.Tier -eq $tierN })
@@ -7980,11 +8314,11 @@ function Start-HiddenBossEncounter {
 function Get-MutatorPool {
     @(
         @{ Id="GlassCannon";  Name="Glass Cannon";    Desc="+50% damage dealt and taken";        Color="Red"     ; RewardMul=1.30 }
-        @{ Id="Pacifist";     Name="Pacifist's Path"; Desc="No XP from kills, +200% quest XP";   Color="Cyan"    ; RewardMul=1.20 }
+        @{ Id="Pacifist";     Name="Pacifist's Path"; Desc="No XP from kills, 3x quest XP";       Color="Cyan"    ; RewardMul=1.20 }
         @{ Id="CursedLoot";   Name="Cursed Loot";     Desc="Gear drops at 50% durability, +50% stats"; Color="DarkMagenta"; RewardMul=1.25 }
-        @{ Id="Speedrun";     Name="Speedrun";        Desc="Enemies +25% SPD, +50% gold from kills"; Color="Yellow"; RewardMul=1.20 }
-        @{ Id="Frugal";       Name="Frugal Run";      Desc="No potions, only 1 lockpick, +75% gold"; Color="DarkYellow"; RewardMul=1.40 }
-        @{ Id="Hardcore";     Name="Hardcore";        Desc="Death loses 50% gold, +30% all rewards"; Color="DarkRed"  ; RewardMul=1.30 }
+        @{ Id="Speedrun";     Name="Speedrun";        Desc="Enemies +25% SPD"; Color="Yellow"; RewardMul=1.20 }
+        @{ Id="Frugal";       Name="Frugal Run";      Desc="No potions, only 1 lockpick"; Color="DarkYellow"; RewardMul=1.40 }
+        @{ Id="Hardcore";     Name="Hardcore";        Desc="Death loses 50% gold"; Color="DarkRed"  ; RewardMul=1.30 }
     )
 }
 
@@ -8025,6 +8359,10 @@ function Show-MutatorChoice {
     Write-CL "  amplify the gold/XP at the end if you clear it." "Gray"
     Write-Host ""
     Write-CL "  Pick one or skip." "DarkGray"
+    Write-Host ""
+    Write-CL "  ! WARNING: While a mutator is active, abandoning the dungeon" "DarkYellow"
+    Write-CL "    forfeits ALL loot, gold, and XP earned during the run." "DarkYellow"
+    Write-CL "    Mutator runs are commit-or-die." "DarkYellow"
     Write-Host ""
 
     for($i=0; $i -lt $offers.Count; $i++){
@@ -8126,7 +8464,7 @@ function Enter-Dungeon {
     $script:LastStandUsed     = $false   # Knight T3_B
     $script:ResurrectionUsed  = $false   # Cleric  T3_C
     $script:FinalStandUsed    = $false   # Berserker T3_C
-    $script:LayOnHandsUsed    = $false   # Cleric  T3_B
+    $script:LayOnHandsUsed    = 0   # Cleric  T3_B
 
     # Ranger Trapfinder: +1 free lockpick on dungeon entry
     if(Has-Talent "Ranger_T3_C"){
@@ -8144,14 +8482,21 @@ function Enter-Dungeon {
     # zero picks felt punishing without any tactical option for chests.
     # Restored automatically on dungeon end (clear or death).
     if(Has-Mutator "Frugal"){
+        # Frugal Run: stash potions/throwables/picks at the door. Leave
+        # the player with 1 Small Health Potion + 1 Mana Potion + 1
+        # lockpick — bare-bones tactical floor for the run. On dungeon
+        # end, restore the stashed items in full so the player gets
+        # back exactly what they came in with.
         $script:FrugalStashedPotions    = @($script:Potions.ToArray())
         $script:FrugalStashedThrowables = @($script:ThrowablePotions.ToArray())
-        # Stash the original count minus 1 so the math reverses cleanly:
-        # at end, Lockpicks (which is 1 right now) + stash (= original - 1)
-        # = original count.
         $script:FrugalStashedLockpicks  = [math]::Max($script:Lockpicks - 1, 0)
         $script:Potions.Clear()
         $script:ThrowablePotions.Clear()
+        # Issue the bare-bones loadout. These two potions are NEW objects,
+        # not pulled from the stash, so the stash restore at end-of-run
+        # gives back the player's original consumables intact.
+        [void]$script:Potions.Add(@{Name="Small Health Potion"; Type="Heal"; Power=30; Price=25; Desc="Restore 30 HP"; Icon="[HP+]"; Category="Potion"; Kind="Potion"; Weight=1})
+        [void]$script:Potions.Add(@{Name="Mana Potion";         Type="Mana"; Power=30; Price=30; Desc="Restore 30 MP"; Icon="[MP+]"; Category="Potion"; Kind="Potion"; Weight=1})
         $script:Lockpicks = if($script:Lockpicks -ge 1){1}else{$script:Lockpicks}
     } else {
         $script:FrugalStashedPotions    = $null
@@ -8539,6 +8884,17 @@ function Enter-Dungeon {
                             $script:Lockpicks -= $result.PicksUsed
                             if($script:Lockpicks -lt 0){ $script:Lockpicks = 0 }
 
+                            # Invalidate the dungeon partial-render cache.
+                            # The lockpick screen used direct cursor writes,
+                            # so the buffered frame state is now stale and
+                            # the next partial-diff repaint would tear. We
+                            # don't call clr here because the success path
+                            # has its own clr below; we just clear the
+                            # cache so the next dungeon frame is a full
+                            # repaint regardless of which branch we take.
+                            $script:BufferedFirstFrame = $true
+                            $script:PrevFrame = $null
+
                             if($result.Success){
                                 # ── Success: award loot, higher tumbler count = better rewards ──
                                 clr
@@ -8601,7 +8957,7 @@ function Enter-Dungeon {
                                         Kind      = "Note"
                                         IsNote    = $true
                                         Body      = $note.Body
-                                        Weight    = 1
+                                        Weight    = 0
                                         Value     = 5
                                         Desc      = "A weathered scrap of writing. (View to read)"
                                     }
@@ -8783,6 +9139,9 @@ function Enter-Dungeon {
                                         if(Has-Talent "Cleric_T2_A"){
                                             $power = [math]::Floor($power * 1.30)
                                         }
+                                        if(Has-Talent "Cleric_T4_A"){
+                                            $power = [math]::Floor($power * 1.50)
+                                        }
                                         $healed = [math]::Min($power, $p.MaxHP - $p.HP)
                                         $p.HP += $healed
                                         $script:StatusMsg = "Used $($pot.Name)! Restored $healed HP! ($($p.HP)/$($p.MaxHP))"
@@ -8821,7 +9180,65 @@ function Enter-Dungeon {
                 Show-QuestLog
             }
 
+            "F" {
+                # Debug-only: force a random encounter of your choice.
+                # Skipped silently for non-debug runs so the F key is
+                # an inert no-op. Useful for play-testing because random
+                # encounters are otherwise gated behind step-roll RNG
+                # and per-dungeon caps.
+                if($script:DebugMode){
+                    clr
+                    Write-Host ""
+                    Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkMagenta"
+                    Write-CL "  ║         D E B U G   —   F O R C E   E N C       ║" "Magenta"
+                    Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkMagenta"
+                    Write-Host ""
+                    Write-CL "  Pick an encounter to force on this tile:" "Yellow"
+                    Write-Host ""
+                    Write-CL "    [1] Wandering Merchant" "Cyan"
+                    Write-CL "    [2] Singing Bard       (heals HP/MP)" "Cyan"
+                    Write-CL "    [3] Roving Alchemist   (potion trade)" "Cyan"
+                    Write-CL "    [4] Hooded Gambler     (blackjack)" "Cyan"
+                    Write-CL "    [5] Flying Dutchman    (cursed sword)" "DarkRed"
+                    Write-CL "    [6] Wandering Smith    (free repair)" "DarkYellow"
+                    Write-Host ""
+                    Write-CL "    [0] Cancel" "DarkGray"
+                    Write-Host ""
+                    Write-C "  > " "Yellow"; $encPick = Read-Host
+                    $encType = switch($encPick){
+                        "1" { "Merchant"     }
+                        "2" { "Bard"         }
+                        "3" { "Alchemist"    }
+                        "4" { "Gambler"      }
+                        "5" { "Dutchman"     }
+                        "6" { "RepairSmith"  }
+                        default { $null }
+                    }
+                    if($encType){
+                        Start-RandomEncounter -Type $encType
+                    }
+                    # Force a full repaint after the encounter — encounter
+                    # screens use direct Write-CL calls, not the dungeon
+                    # frame buffer.
+                    $script:BufferedFirstFrame = $true
+                    $script:PrevFrame = $null
+                }
+            }
+
             "Q" {
+                # When a mutator is active, abandoning the dungeon forfeits
+                # ALL gold/XP earned this run plus all loot. This is harsher
+                # than the normal random-loss flee penalty and reflects the
+                # mutator's risk/reward bargain: take the mutator buff for
+                # bigger payouts on a clear, but if you bail, you bail
+                # empty-handed.
+                $hasMut = ($null -ne $script:DungeonMutator)
+                if($hasMut){
+                    Write-Host ""
+                    Write-CL "  ! WARNING: A mutator is active. Quitting forfeits ALL" "DarkYellow"
+                    Write-CL "    loot, gold, and XP earned this run." "DarkYellow"
+                    Write-Host ""
+                }
                 Write-C "  Abandon dungeon? (y/n): " "Red"
                 $confirm = Read-Host
                 if($confirm -ne 'y'){
@@ -8842,7 +9259,28 @@ function Enter-Dungeon {
                     Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkRed"
                     Write-Host ""
 
-                    if($script:Inventory.Count -gt 0){
+                    if($hasMut){
+                        # Total forfeiture branch.
+                        # We void: this run's earned gold (deducted from total),
+                        # this run's earned XP (deducted, with re-leveling math
+                        # held), and the entire dungeon loot bag.
+                        $vGold = [int]$script:RunStats.GoldEarned
+                        $vXP   = [int]$script:RunStats.XPEarned
+                        $script:Gold = [math]::Max($script:Gold - $vGold, 0)
+                        # XP rollback: just remove run XP. We don't unlevel —
+                        # if the player leveled up mid-run, they keep the
+                        # level (you can't take a stat boost back cleanly),
+                        # but the leftover progress within the current level
+                        # is wiped to zero.
+                        $script:XP = [math]::Max($script:XP - $vXP, 0)
+                        $itemCount = $script:Inventory.Count
+                        $script:Inventory.Clear()
+                        Write-CL "  Mutator active — total forfeiture:" "DarkRed"
+                        Write-CL "    Lost ${vGold}g earned this run." "Red"
+                        Write-CL "    Lost ${vXP} XP earned this run." "Red"
+                        Write-CL "    Lost $itemCount loot item(s)." "Red"
+                    }
+                    elseif($script:Inventory.Count -gt 0){
                         $lossPct = (Get-Random -Min 15 -Max 51) / 100.0
                         $loseCount = [math]::Max([math]::Ceiling($script:Inventory.Count * $lossPct), 1)
 
@@ -8869,12 +9307,14 @@ function Enter-Dungeon {
                         Write-CL "  You had nothing to lose... but your dignity." "DarkGray"
                     }
 
-                    # Also lose a small percentage of gold
-                    $goldLossPct = (Get-Random -Min 5 -Max 16) / 100.0
-                    $goldLost = [math]::Floor($script:Gold * $goldLossPct)
-                    if($goldLost -gt 0){
-                        $script:Gold -= $goldLost
-                        Write-CL "  Dropped ${goldLost}g in your panic!" "DarkYellow"
+                    # Non-mutator quit also takes a small percentage of gold.
+                    if(-not $hasMut){
+                        $goldLossPct = (Get-Random -Min 5 -Max 16) / 100.0
+                        $goldLost = [math]::Floor($script:Gold * $goldLossPct)
+                        if($goldLost -gt 0){
+                            $script:Gold -= $goldLost
+                            Write-CL "  Dropped ${goldLost}g in your panic!" "DarkYellow"
+                        }
                     }
 
                     Write-Host ""
@@ -8955,6 +9395,58 @@ function Enter-Dungeon {
                 # baseline so the player starts fresh-but-funded. Talents
                 # and achievements persist (multi-life progression). The
                 # potion belt gets a free Small Health Potion to start.
+
+                # Flying Dutchman pseudo-class isn't in the regular
+                # template table. If we're in Dutchman mode, just respawn
+                # the player with the same Dutchman baseline rather than
+                # crashing on a $null template lookup.
+                if($script:DutchmanMode){
+                    $script:Player = @{
+                        Name      = "Flying Dutchman"
+                        HP        = 200; MaxHP = 200
+                        MP        = 80;  MaxMP = 80
+                        ATK       = 30
+                        DEF       = 18
+                        SPD       = 14
+                        MAG       = 16
+                        Abilities = @(
+                            @{Name="Phantom Strike"; Cost=12; Type="Physical"; Power=45; Effect="None";   Cooldown=2}
+                            @{Name="Curse";          Cost=14; Type="Magic";    Power=30; Effect="Drain";  Cooldown=3}
+                            @{Name="Maelstrom";      Cost=22; Type="Magic";    Power=60; Effect="None";   Cooldown=4}
+                            @{Name="Soul Anchor";    Cost=18; Type="Heal";     Power=80; Effect="ATKBuff";Cooldown=5}
+                        )
+                    }
+                    # Refresh the cursed weapon to full durability (the
+                    # original is unique and can't be repaired the normal
+                    # way, but death is its own kind of repair).
+                    $script:EquippedWeapon = @{
+                        Name="Dutchman's Blade"; ATK=100; Price=10000; WeaponType="Sword"
+                        ClassAffinity="None"; AffinityBonus=0
+                        Perk="Drain"; PerkChance=80
+                        Kind="Weapon"
+                        Durability=200; MaxDurability=200
+                        TwoHanded=$false
+                        Weight=6
+                    }
+                    $script:EquippedArmor = @{Helmet=$null;Chest=$null;Shield=$null;Amulet=$null;Boots=$null}
+                    $script:Inventory.Clear()
+                    $script:Potions.Clear()
+                    $script:ThrowablePotions.Clear()
+                    [void]$script:Potions.Add(@{Name="Large Health Potion";Type="Heal";Power=70;Price=60;Desc="Restore 70 HP"})
+                    $script:PlayerLevel = 1
+                    $script:XP          = 0
+                    $script:XPToNext    = 100
+                    $script:DungeonLevel = [math]::Max($script:DungeonLevel - 1, 0)
+                    $script:KillCount = 0
+                    $script:HasBossKey = $false
+                    $script:BossDefeated = $false
+                    Write-Host ""
+                    Write-CL "  The Dutchman's curse drags you back to the wheel..." "Magenta"
+                    Write-CL "  Gear gone. Gold remains. The Blade is yours forever." "DarkGray"
+                    Wait-Key
+                    continue
+                }
+
                 $tpl = (Get-ClassTemplates)[$script:PlayerClass]
                 $favorBonus = if($script:HiddenBossDefeated){5}else{0}
                 $favorHP    = if($script:HiddenBossDefeated){25}else{0}
@@ -9283,10 +9775,12 @@ function Show-CharacterSelect {
     $script:LastStandUsed    = $false
     $script:ResurrectionUsed = $false
     $script:FinalStandUsed   = $false
-    $script:LayOnHandsUsed   = $false
-    # Any normal character creation clears the debug flag — debug mode
-    # only persists for the run it was activated in.
-    $script:DebugMode = $false
+    $script:LayOnHandsUsed   = 0
+    # Any normal character creation clears god-start flags — both
+    # Debug Mode and Flying Dutchman Mode only persist for the run
+    # they were activated in.
+    $script:DebugMode    = $false
+    $script:DutchmanMode = $false
 
     Write-Host ""
     Write-CL "  You are a $className. Your journey begins..." "Green"
@@ -9380,7 +9874,7 @@ function Start-DebugRun {
     $script:LastStandUsed    = $false
     $script:ResurrectionUsed = $false
     $script:FinalStandUsed   = $false
-    $script:LayOnHandsUsed   = $false
+    $script:LayOnHandsUsed   = 0
     # Skip the tutorial offer — debug runs assume the dev knows the game.
     $script:TutorialSeen = $true
     # Debug-mode flag: enables the [Debug Mode Active] HUD banner in town
@@ -9395,6 +9889,122 @@ function Start-DebugRun {
     # Jump into the main town loop. Show-MainMenu doesn't return until
     # the player quits the game, so this satisfies the splash-menu
     # caller, which uses `return` after invoking us.
+    Show-MainMenu
+}
+
+
+# ── Hidden Flying Dutchman mode ──
+# Activated by entering "Dutch26" at the splash menu's start prompt.
+# Player runs as the Flying Dutchman pseudo-class with overpowered
+# stats, the unique Dutchman's Blade equipped, 9999g, and four custom
+# abilities. Like Debug Mode this run cannot be saved — it's a
+# guaranteed-blast power fantasy.
+function Start-FlyingDutchmanRun {
+    clr
+    Write-Host ""
+    Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkMagenta"
+    Write-CL "  ║       F L Y I N G   D U T C H M A N             ║" "Magenta"
+    Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkMagenta"
+    Write-Host ""
+    Write-CL "  The cursed captain takes the helm..." "DarkGray"
+    Write-Host ""
+
+    # Pseudo-class — not in the regular class roster, so talents and
+    # affinity bonuses don't apply. Stats are tuned to "fun, not
+    # balanced" since this is a hidden run that can't be saved.
+    $script:PlayerClass = "Flying Dutchman"
+    $script:Player = @{
+        Name      = "Flying Dutchman"
+        HP        = 200; MaxHP = 200
+        MP        = 80;  MaxMP = 80
+        ATK       = 30
+        DEF       = 18
+        SPD       = 14
+        MAG       = 16
+        Abilities = @(
+            @{Name="Phantom Strike"; Cost=12; Type="Physical"; Power=45; Effect="None";   Cooldown=2}
+            @{Name="Curse";          Cost=14; Type="Magic";    Power=30; Effect="Drain";  Cooldown=3}
+            @{Name="Maelstrom";      Cost=22; Type="Magic";    Power=60; Effect="None";   Cooldown=4}
+            @{Name="Soul Anchor";    Cost=18; Type="Heal";     Power=80; Effect="ATKBuff";Cooldown=5}
+        )
+    }
+
+    # Equip Dutchman's Blade. Mirrors the encounter-drop weapon. We
+    # set Durability to MaxDurability so it doesn't break in the first
+    # boss fight.
+    $script:EquippedWeapon = @{
+        Name="Dutchman's Blade"; ATK=100; Price=10000; WeaponType="Sword"
+        ClassAffinity="None"; AffinityBonus=0
+        Perk="Drain"; PerkChance=80
+        Kind="Weapon"
+        Durability=200; MaxDurability=200
+        TwoHanded=$false
+        Weight=6
+    }
+    $script:EquippedArmor = @{
+        Helmet = $null; Chest = $null; Shield = $null; Amulet = $null; Boots = $null
+    }
+    $script:Gold = 9999
+    $script:Inventory.Clear()
+    $script:Potions.Clear()
+    $script:ThrowablePotions.Clear()
+    [void]$script:Potions.Add(@{Name="Large Health Potion";Type="Heal";Power=70;Price=60;Desc="Restore 70 HP"})
+    [void]$script:Potions.Add(@{Name="Large Mana Potion";Type="Mana";Power=60;Price=55;Desc="Restore 60 MP"})
+
+    # Same per-run reset as a clean character creation.
+    $script:DungeonLevel = 0
+    $script:PlayerLevel = 1
+    $script:XP = 0
+    $script:XPToNext = 100
+    $script:KillCount = 0
+    $script:Partner = $null
+    $script:Pet     = $null
+    $script:Ingredients = @{}
+    $script:ActiveFoodBuff = $null
+    $script:Quests.Clear()
+    $script:TrainingPoints = @{ ATK=0; DEF=0; SPD=0; MAG=0; HP=0; MP=0 }
+    $script:Streak = 0
+    $script:BestStreak = 0
+    $script:Achievements = @{}
+    $script:TotalKills = 0
+    $script:BossesDefeated = 0
+    $script:WeaponsOwned = @{ "Dutchman's Blade" = $true }
+    $script:ArmorOwned = @{}
+    $script:OwnsDutchmanBlade = $true
+    $script:CompletedQuests = 0
+    $script:DailyDungeonActive = $false
+    $script:Lockpicks = 10
+    $script:RepairKits = 3
+    $script:ExtraStrongPotions = 0
+    $script:DisturbedChests = @{}
+    $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
+    $script:Stance = "Balanced"
+    $script:TotalCrits = 0
+    $script:TotalLocksPicked = 0
+    $script:TotalBareKills = 0
+    $script:TotalUntouched = 0
+    $script:TotalStanceSwaps = 0
+    $script:TotalRepairs = 0
+    $script:TotalEncumbered = 0
+    $script:DungeonsCleared = 0
+    $script:NGPlusLevel = 0
+    $script:HiddenBossDefeated = $false
+    $script:Bestiary = @{}
+    $script:Talents = @{}
+    $script:LastStandUsed    = $false
+    $script:ResurrectionUsed = $false
+    $script:FinalStandUsed   = $false
+    $script:LayOnHandsUsed   = 0
+    $script:TutorialSeen = $true
+
+    # Dutchman flag: gates save (same as DebugMode), drives the HUD
+    # banner in town. Cleared on Show-CharacterSelect.
+    $script:DutchmanMode = $true
+    $script:DebugMode    = $false
+
+    Write-CL "  The Dutchman's curse hums in your pocket. Press a key." "Magenta"
+    Wait-Key
+
     Show-MainMenu
 }
 
@@ -9436,7 +10046,7 @@ function Get-ClassTemplates {
         }
         Ranger = @{
             Name="Ranger"; MaxHP=90; HP=90; MaxMP=50; MP=50
-            ATK=12; DEF=7; SPD=15; MAG=6
+            ATK=12; DEF=7; SPD=16; MAG=6
             Abilities=@(
                 @{Name="Quick Shot";   Cost=8;  Type="Physical"; Power=20; Effect="None";   Cooldown=2}
                 @{Name="Poison Arrow"; Cost=14; Type="Physical"; Power=18; Effect="Poison"; Cooldown=3}
@@ -9560,6 +10170,19 @@ function Update-QuestProgress {
             $q.Progress = [math]::Min($q.Progress + $Amount, $q.TargetCount)
             if($q.Progress -ge $q.TargetCount){
                 $q.Complete = $true
+                # Pacifist's Path mutator: when a quest is completed
+                # while the mutator is active, bake the 3x XP bonus
+                # into the stored reward right now. The turn-in screen
+                # at the Quest Board reads RewardXP as-is and pays
+                # whatever's stored. Doing it here (in-dungeon, mutator
+                # active) is the only place Has-Mutator returns true
+                # — by the time the player walks to town the mutator
+                # has been cleared by Reset-MutatorOnEnd. We mark the
+                # quest so the turn-in screen can label the bonus.
+                if(Has-Mutator "Pacifist" -and -not $q.PacifistBoosted){
+                    $q.RewardXP        = [int]$q.RewardXP * 3
+                    $q.PacifistBoosted = $true
+                }
                 $script:StatusMsg = "Quest complete: $($q.Desc)!"
             }
         }
@@ -9735,13 +10358,14 @@ if(-not $script:AvailableQuests -or $script:AvailableQuests.Count -eq 0){
                             $totalBardBonus += $bonus
                             $thisXP += $bonus
                         }
-                        # Pacifist's Path mutator: triple quest XP rewards
-                        if(Has-Mutator "Pacifist"){
-                            $thisXP *= 3
-                        }
+                        # Pacifist's Path: if this quest was completed
+                        # while Pacifist was active, RewardXP was already
+                        # tripled at completion time (see Update-QuestProgress).
+                        # The turn-in display just needs to label it.
+                        $pacTag = if($rq.PacifistBoosted){"  (Pacifist x3)"}else{""}
                         $totalXP += $thisXP
                         Write-CL "  ✓ $($rq.Desc)" "Green"
-                        Write-CL "    + $($rq.RewardGold)g, + $thisXP XP" "DarkGray"
+                        Write-CL "    + $($rq.RewardGold)g, + $thisXP XP$pacTag" "DarkGray"
                         $script:Quests.Remove($rq) | Out-Null
                     }
 
@@ -10045,7 +10669,7 @@ function Save-Game {
     $durStr = $durParts -join ","
 
     $saveStr = @(
-        "7"                          # [0]  format version (v7: pet, ingredients, food buff, hidden boss, NG+)
+        "8"                          # [0]  format version (v8: adds packed settings field)
         $classIdx                    # [1]  class
         $script:PlayerLevel          # [2]  level
         $script:XP                   # [3]  current XP
@@ -10123,6 +10747,18 @@ function Save-Game {
             }
             $tIds -join ";"
         )  # [43]
+        # ── v8 extension: settings (Difficulty,AutoLoot,AutoResize) ──
+        # Difficulty as "E"/"M"/"H"; bools as 1/0. Compact comma-joined.
+        $(
+            $diffCode = switch([string]$script:Settings.Difficulty){
+                "Easy"   { "E" }
+                "Hard"   { "H" }
+                default  { "M" }
+            }
+            $alStr = if($script:Settings.AutoLoot){"1"}else{"0"}
+            $arStr = if($script:Settings.AutoResize){"1"}else{"0"}
+            "$diffCode,$alStr,$arStr"
+        )  # [44]
     ) -join "|"
 
     # ── Checksum ──
@@ -10160,7 +10796,7 @@ function Load-Game {
     if($ver -eq "1" -or $ver -eq "2" -or $ver -eq "3"){
         return @{ Success = $false; Error = "This save is from an older version and can't be loaded. The inventory weight update requires a new character." }
     }
-    if($ver -ne "4" -and $ver -ne "5" -and $ver -ne "6" -and $ver -ne "7"){
+    if($ver -ne "4" -and $ver -ne "5" -and $ver -ne "6" -and $ver -ne "7" -and $ver -ne "8"){
         return @{ Success = $false; Error = "Unknown save format version '$ver'." }
     }
     # Accepted lengths (parts including checksum):
@@ -10169,12 +10805,14 @@ function Load-Game {
     #   v5:                38  (37 data + 1 checksum)
     #   v6:                40  (39 data + 1 checksum)
     #   v7:                45  (44 data + 1 checksum, includes talents)
+    #   v8:                46  (45 data + 1 checksum, adds settings)
     $expectedLen = $parts.Count
     $validLen = switch($ver){
         "4" { @(36, 37) -contains $expectedLen }
         "5" { $expectedLen -eq 38 }
         "6" { $expectedLen -eq 40 }
         "7" { $expectedLen -eq 45 }
+        "8" { $expectedLen -eq 46 }
     }
     if(-not $validLen){
         return @{ Success = $false; Error = "Save code is corrupted (wrong length for v$ver)." }
@@ -10460,7 +11098,7 @@ function Load-Game {
     # Order: Health, Mana, Strength, Luck. Adds the matching templates
     # to $script:Potions. v4/v5 saves don't have this field — ES potions
     # for those players come back via the legacy migration in field [34].
-    if($parts.Count -ge 40 -and ($ver -eq "6" -or $ver -eq "7")){
+    if($parts.Count -ge 40 -and ($ver -eq "6" -or $ver -eq "7" -or $ver -eq "8")){
         try {
             $specialStr = $parts[37]
             $specialArr = $specialStr -split ","
@@ -10482,7 +11120,7 @@ function Load-Game {
     # ── Lifetime cleared / encumbered counters (field [38], v6+).
     $script:DungeonsCleared = 0
     $script:TotalEncumbered = 0
-    if($parts.Count -ge 40 -and ($ver -eq "6" -or $ver -eq "7")){
+    if($parts.Count -ge 40 -and ($ver -eq "6" -or $ver -eq "7" -or $ver -eq "8")){
         try {
             $extraStr = $parts[38]
             $extraArr = $extraStr -split ","
@@ -10491,14 +11129,14 @@ function Load-Game {
         } catch {}
     }
 
-    # ── v7-only fields ──
+    # ── v7+ fields (also present in v8) ──
     $script:Pet = $null
     $script:NGPlusLevel = 0
     $script:HiddenBossDefeated = $false
     $script:Ingredients = @{}
     $script:Bestiary    = @{}
     $script:ActiveFoodBuff = $null
-    if($ver -eq "7" -and $parts.Count -ge 44){
+    if(($ver -eq "7" -or $ver -eq "8") -and $parts.Count -ge 44){
         # [39] pet
         try {
             $petStr = $parts[39]
@@ -10554,6 +11192,27 @@ function Load-Game {
         } catch {}
     }
 
+    # ── v8 settings (Difficulty, AutoLoot, AutoResize) ──
+    # Only present in v8+. Older saves leave the in-memory defaults
+    # untouched so a v7 load doesn't reset them mid-session.
+    if($ver -eq "8" -and $parts.Count -ge 45){
+        try {
+            $sStr = $parts[44]
+            $sArr = $sStr -split ","
+            if($sArr.Count -ge 1){
+                $script:Settings.Difficulty = switch([string]$sArr[0]){
+                    "E" { "Easy" }
+                    "H" { "Hard" }
+                    default { "Medium" }
+                }
+            }
+            if($sArr.Count -ge 2){ $script:Settings.AutoLoot   = ($sArr[1] -eq "1") }
+            if($sArr.Count -ge 3){ $script:Settings.AutoResize = ($sArr[2] -eq "1") }
+            # If the player saved with auto-resize on, honor it now.
+            if($script:Settings.AutoResize){ Try-AutoResizeTerminal }
+        } catch {}
+    }
+
     # ── Reset transient state ──
     $script:Inventory = [System.Collections.ArrayList]@()
     $script:Quests = [System.Collections.ArrayList]@()
@@ -10565,9 +11224,10 @@ function Load-Game {
     $script:DungeonTreasures = 0
     $script:RescueTarget = $null
     $script:LuckTurnsLeft = 0; $script:LuckBonus = 0
-    # Loading any save clears the debug flag — debug-spawned runs can't
-    # save, so any save that exists is a legitimate run.
-    $script:DebugMode = $false
+    # Loading any save clears god-start flags — Debug and Dutchman runs
+    # can't save, so any save that exists is a legitimate run.
+    $script:DebugMode    = $false
+    $script:DutchmanMode = $false
 
     return @{ Success = $true; Error = "" }
 }
@@ -10719,6 +11379,81 @@ function Show-TrainingGrounds {
     }
 }
 
+# ─── OPTIONS / SETTINGS MENU ──────────────────────────────────────
+# Settings are stored as part of the save code (v8 format). Changes
+# made here apply immediately to the running session. To persist them
+# across runs, generate a save from town and load that save next time.
+function Show-OptionsMenu {
+    $loop = $true
+    while($loop){
+        clr
+        Write-Host ""
+        Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "DarkCyan"
+        Write-CL "  ║                       O P T I O N S                              ║" "Cyan"
+        Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "DarkCyan"
+        Write-Host ""
+
+        $diff = [string]$script:Settings.Difficulty
+        $alOn = [bool]$script:Settings.AutoLoot
+        $arOn = [bool]$script:Settings.AutoResize
+
+        # Difficulty row
+        $diffColor = switch($diff){"Easy"{"Green"} "Hard"{"Red"} default{"Yellow"}}
+        Write-C "  [1] Difficulty:  " "White"; Write-C $diff $diffColor
+        $diffDesc = switch($diff){
+            "Easy"   { "  (enemies -25% HP/ATK)" }
+            "Hard"   { "  (enemies +25% HP/ATK)" }
+            default  { "  (baseline — the game as designed)" }
+        }
+        Write-CL $diffDesc "DarkGray"
+
+        # Auto-loot row
+        $alStr = if($alOn){"ON "}else{"OFF"}
+        $alColor = if($alOn){"Green"}else{"DarkGray"}
+        Write-C "  [2] Auto-Loot:   " "White"; Write-C $alStr $alColor
+        Write-CL "  (loot screen auto-takes everything that fits)" "DarkGray"
+
+        # Terminal resize row
+        $arStr = if($arOn){"ON "}else{"OFF"}
+        $arColor = if($arOn){"Green"}else{"DarkGray"}
+        Write-C "  [3] Auto-Resize: " "White"; Write-C $arStr $arColor
+        Write-CL "  (resize terminal to ~100x40 on game launch)" "DarkGray"
+
+        Write-Host ""
+        Write-CL "  [0] Back" "DarkGray"
+        Write-Host ""
+        Write-CL "  Settings are saved as part of your save code." "DarkGray"
+        Write-CL "  Generate a new save from the town menu [S] to persist them." "DarkGray"
+        Write-Host ""
+        Write-C "  > " "Yellow"; $optChoice = Read-Host
+
+        switch($optChoice){
+            "1" {
+                # Cycle Easy -> Medium -> Hard -> Easy
+                $script:Settings.Difficulty = switch($diff){
+                    "Easy"   { "Medium" }
+                    "Medium" { "Hard"   }
+                    "Hard"   { "Easy"   }
+                    default  { "Medium" }
+                }
+            }
+            "2" {
+                $script:Settings.AutoLoot = -not $alOn
+            }
+            "3" {
+                $script:Settings.AutoResize = -not $arOn
+                if($script:Settings.AutoResize){
+                    Try-AutoResizeTerminal
+                }
+            }
+            "0" {
+                $loop = $false
+            }
+            default { }
+        }
+    }
+}
+
 # ─── ACHIEVEMENTS MENU ────────────────────────────────────────────
 function Show-AchievementsMenu {
     clr
@@ -10798,6 +11533,10 @@ function Show-MainMenu {
             Write-CL "                          [Debug Mode Active — Save Disabled]                       " "Green"
             Write-Host ""
         }
+        if($script:DutchmanMode){
+            Write-CL "                       [Flying Dutchman Mode — Save Disabled]                       " "Magenta"
+            Write-Host ""
+        }
 
         # ── Player status block (83-char width matching banner/grid) ──
         $hpPct = $p.HP / $p.MaxHP
@@ -10869,6 +11608,16 @@ function Show-MainMenu {
 
         Write-CL "  ╠$hbar╬$hbar╣" "DarkGray"
 
+        # New Game+ row content shifts by readiness. Before 25 clears the
+        # row reads as a progress nudge; once eligible it becomes a clear
+        # call-to-action so the player can't miss it.
+        # NOTE: Descriptions must fit a 40-char column with ~22 chars
+        # reserved for "[N] Label". That leaves ~17 chars for the desc.
+        $ngReady = ($script:DungeonsCleared -ge 25)
+        $ngLabel = if($ngReady){"New Game+ READY!"}else{"New Game+ ($($script:DungeonsCleared)/25)"}
+        $ngDesc  = if($ngReady){"Ascend the Depths"}else{"25 clears needed"}
+        $ngColor = if($ngReady){"Magenta"}else{"DarkMagenta"}
+
         $rows = @(
             @( @{N="[3]";L="Visit the Market";   C="Cyan";       Desc="Buy & sell gear"},
                @{N="[4]";L="View Inventory";     C="Magenta";    Desc="Manage loot & gear"} ),
@@ -10880,6 +11629,8 @@ function Show-MainMenu {
                @{N="[A]";L="Achievements";       C="DarkMagenta";Desc="Review milestones"} ),
             @( @{N="[B]";L="Bestiary";           C="DarkRed";    Desc="Creatures defeated"},
                @{N="[S]";L="Save Game";          C="DarkGreen";  Desc="Export save code"} ),
+            @( @{N="[N]";L=$ngLabel;             C=$ngColor;     Desc=$ngDesc},
+               @{N="[O]";L="Options";            C="Cyan";       Desc="Game settings"} ),
             @( @{N="[Q]";L="Quit";               C="DarkRed";    Desc="Leave the town"},
                @{N=""   ;L="";                   C="DarkGray";   Desc=""} )
         )
@@ -11165,7 +11916,10 @@ function Show-MainMenu {
                                 Write-CL "  'You've enjoyed our finest rooms before...'" "DarkGray"
                                 Write-CL "  'The enchantments no longer affect you, friend.'" "DarkGray"
                                 Write-CL "  (Royal Suite stat boost capped at 3 uses)" "DarkYellow"
-                                Wait-Key
+                                # No Wait-Key here — the outer one at the end
+                                # of case "3" handles the prompt. Two Wait-Keys
+                                # in a row was producing a doubled "press any
+                                # key" prompt for the maxed-out player.
                             }
                             elseif($script:Gold -ge $cost){
                                 $script:Gold -= $cost
@@ -11314,6 +12068,7 @@ function Show-MainMenu {
             "T" { Show-TrainingGrounds }
             "A" { Show-AchievementsMenu }
             "B" { Show-Bestiary }
+            "O" { Show-OptionsMenu }
             "N" {
                 # New Game Plus: gated on lifetime DungeonsCleared >= 25.
                 # Keeps gold, achievements, training, bestiary, talents,
@@ -11451,16 +12206,18 @@ function Show-MainMenu {
             }
 
             "9" {
-                # Debug mode locks out Save so a god-start spawned via
-                # the dev passphrase can't be turned into a save file.
-                if($script:DebugMode){
+                # Debug mode and Flying Dutchman mode both lock out Save.
+                # Either one is a god-start session that can't be turned
+                # into a permanent save file.
+                if($script:DebugMode -or $script:DutchmanMode){
+                    $modeLabel = if($script:DutchmanMode){"Flying Dutchman Mode"}else{"Debug Mode"}
                     clr
                     Write-Host ""
                     Write-CL "  ╔════════════════════════════════════════════════════╗" "DarkRed"
                     Write-CL "  ║          S A V E   D I S A B L E D                 ║" "Red"
                     Write-CL "  ╚════════════════════════════════════════════════════╝" "DarkRed"
                     Write-Host ""
-                    Write-CL "  Save is unavailable in Debug Mode." "Yellow"
+                    Write-CL "  Save is unavailable in $modeLabel." "Yellow"
                     Write-CL "  Start a regular run from the splash menu to save progress." "DarkGray"
                     Write-Host ""
                     Wait-Key
@@ -11507,8 +12264,14 @@ function Show-MainMenu {
                     Write-CL "  (Clipboard copy unavailable — select the text manually.)" "DarkGray"
                 }
                 Write-Host ""
-                Write-CL "  Write down or paste this code. You can use it" "DarkGray"
-                Write-CL "  to continue your game next time you play." "DarkGray"
+                Write-CL "  ┌──── HOW TO SAVE ──────────────────────────────────────┐" "Cyan"
+                Write-CL "  │ 1. Open a Notepad text file on your computer.         │" "White"
+                Write-CL "  │ 2. Paste the save code (Ctrl+V) into the file.        │" "White"
+                Write-CL "  │ 3. Save the file somewhere you'll remember it.        │" "White"
+                Write-CL "  │                                                       │" "Cyan"
+                Write-CL "  │ TO LOAD: from the splash screen pick [2] Load Save    │" "White"
+                Write-CL "  │  Code, then press Ctrl+V to paste your code in.       │" "White"
+                Write-CL "  └───────────────────────────────────────────────────────┘" "Cyan"
                 Write-Host ""
                 Write-CL "  NOTE: Loot was converted to gold. Quests were reset." "DarkYellow"
                 Write-Host ""
@@ -11525,290 +12288,146 @@ function Show-MainMenu {
 # launch menu, returns back to the launch menu when dismissed.
 function Show-Changelog {
     $pages = @(
-        @{Title="v1.4 — DEPTHS REWRITTEN"; Color="Yellow"; Lines=@(
-            "  PROCEDURAL VARIANTS & BESTIARY"
-            "    * Enemies now spawn with random VARIANTS (Veteran, Dire,"
-            "      Cursed, Swift, Toughened, Frenzied) — about 1 in 5"
-            "      enemies has tweaked stats and a prefix on its name."
-            "    * BESTIARY screen [B] in town tracks every enemy variant"
-            "      defeated, with kill counts and dungeon-tier groupings."
-            "    * Run summary appears on victory AND death — damage dealt,"
-            "      damage taken, gold, XP, kills, crits, potions, steps."
+        @{Title="v1.4.1a — HOTFIX"; Color="Cyan"; Lines=@(
+            "  PACIFIST MUTATOR — QUEST XP BONUS RESTORED"
+            "    * Bug: Pacifist's Path was supposed to trade kill XP for"
+            "      tripled quest XP, but the bonus check fired at the"
+            "      Quest Board (in town) AFTER the mutator had been"
+            "      cleared by dungeon end. Result: the 3x bonus never"
+            "      applied — Pacifist was a strict downside."
+            "    * Fix: the 3x bonus now bakes into the quest's stored"
+            "      reward at the moment of completion (in-dungeon, while"
+            "      the mutator is still active). The Quest Board pays"
+            "      out the boosted reward as-is and labels the line"
+            "      with '(Pacifist x3)' so you can see the bonus."
+            "    * Edge case: a quest that was already complete from a"
+            "      previous non-Pacifist run will NOT get the bonus on"
+            "      turn-in — only quests completed during a Pacifist"
+            "      run earn it."
             ""
-            "  TWO-HANDED WEAPONS"
-            "    * Five new 2H weapons: Greatsword, Archmage's Spire,"
-            "      Hunter's Longbow, War Maul, Soulshear — heavy hits,"
-            "      no shield slot. Brawler is excluded by design."
-            "    * Equipping a 2H auto-stows your shield (with confirm);"
-            "      equipping a shield while 2H-wielding stows the weapon."
-            ""
-            "  PETS — THE KENNEL"
-            "    * Visit the Guild Hall and press [P] to open the Kennel."
-            "    * Three pets, each with one passive perk:"
-            "        Hound  (500g) — chests visible on minimap through fog"
-            "        Raven  (650g) — +5% gold from all sources"
-            "        Falcon (600g) — fog-of-war reveal radius 3 -> 5"
-            "    * Release a pet for 50% of its purchase price as refund."
-            ""
-            "  COOKING & INGREDIENTS"
-            "    * Enemies drop INGREDIENTS (Mushroom, Herb, Meat, Bone),"
-            "      12% per kill, guaranteed on bosses. 1 wt each."
-            "    * Visit the Inn and press [C] for the Cooking Pot. Four"
-            "      recipes turn ingredients into run-long buff foods:"
-            "        Hearty Stew     - +5 ATK"
-            "        Bone Broth      - +3 DEF"
-            "        Forager's Plate - +10% gold"
-            "        Hunter's Skewer - +15% XP"
-            "    * Active food buff persists for the dungeon run."
-            ""
-            "  FOUND NOTES"
-            "    * Chests have a 15% chance to drop a NOTE — fragments of"
-            "      previous adventurers' diaries"
-            ""
-            "  DUNGEON MUTATORS"
-            "    * Pick one of 3 random mutators at dungeon entry, or skip:"
-            "        Glass Cannon    - +50% dmg dealt and taken"
-            "        Pacifist's Path - 0 kill XP, 3x quest XP"
-            "        Cursed Loot     - drops at 50% durability, +50% stats"
-            "        Speedrun        - enemies +25% SPD, +50% combat gold"
-            "        Frugal Run      - no potions, only 1 pick, +75% gold"
-            "        Hardcore        - lose 50% gold on death, +30% rewards"
-            "    * Each mutator adds a +20-40% bonus to the gold/XP haul"
-            "      on dungeon clear."
-            ""
-            "  TALENT TREE"
-            "    * Each level grants 1 talent point, spent on the Stats"
-            "      page (press [T]). 9 talents per class in 3 tiers,"
-            "      gated at levels 1, 5, and 10."
-            "    * All 72 talents (8 classes x 9) are fully wired into"
-            "      combat, gear, dungeon flow, and death handling — no"
-            "      visual-only flavor talents."
-            "    * Two new combat menu actions appear when their talent"
-            "      is owned: [L] Lay on Hands (Cleric) and [O] Soul Tap"
-            "      (Warlock)."
-            "    * Knight Last Stand, Cleric Resurrection, and Berserker"
-            "      Final Stand intercept lethal damage once per dungeon."
-            "    * Necromancer Reaper auto-kills enemies below 25% HP."
-            "    * Ranger Multishot triggers a half-damage second strike"
-            "      20% of the time on basic attacks."
-            ""
-            "  HIDDEN BOSS — THE ORPHANED PROCESS"
-            "    * Clear a Daily Dungeon at full HP and zero potions used"
-            "      to summon a secret super-boss. Defeating it grants the"
-            "      'Guild of SysAdmin Favor' permanent buff (+5 to all"
-            "      stats, +25 HP, +15 MP) and a 15% discount at all shops."
-            ""
-            "  NEW GAME PLUS"
-            "    * Clear 25 dungeons to unlock [N] Ascend in the town menu."
-            "    * Ascending: keep gold, achievements, training, bestiary,"
-            "      talents, pet, ingredients, and SysAdmin Favor."
-            "    * Reset: player level, XP, gear, dungeon level, clears."
-            "    * Each NG+ tier scales enemies +20% HP and +20% ATK."
-            "    * 20% chance for boss/mini drops to be ASCENDED gear:"
-            "      +30% to base stats, marked with the Ascended prefix."
-            ""
-            "  UI POLISH"
-            "    * Inventory header now shows lockpick weight inline"
-            "      (e.g. 'Lockpicks: 5 (5wt)') — the redundant lockpicks"
-            "      row inside the potions box was removed."
-            "    * Active mutator, pet, food buff, and NG+ tier are now"
-            "      displayed in the dungeon HUD."
-            ""
-            "  FIXES"
-            "    * Character select now re-prompts on empty/invalid input"
-            "      instead of silently defaulting to Knight."
-            "    * Cooking ingredients have weight (1 each); excess drops"
-            "      are politely declined when carry weight is full."
-            "    * Brawler Iron Chin redesigned to '-30% damage from enemy"
-            "      crits' (the original spec required a player-stun"
-            "      mechanic the engine doesn't support)."
-            "    * Added Hubert."
+            "  BOSS DOOR SPRITE"
+            "    * The dungeon boss-room cell now renders as a heavy"
+            "      iron-banded LOCKED DOOR with a keyhole, instead of"
+            "      a generic 'BOSS!!!' creature face. Reads correctly"
+            "      with the mini-boss-drops-the-key narrative: see the"
+            "      locked door, find the mini-boss, come back and"
+            "      unlock it."
         )}
-        @{Title="NEW FEATURES"; Color="Green"; Lines=@(
-            "  COMBAT & ENEMIES"
-            "    * Enemies can now CRITICAL HIT (4% base, scaling with"
-            "      dungeon depth, +3 mini-boss / +6 boss, capped at 30%)."
-            "    * Enemies have new ability types: damage, self-buffs, and"
-            "      self-heals. Higher-level normal enemies and all bosses"
-            "      gain extra abilities like Iron Skin, Blood Mend, etc."
-            "    * Smart enemy AI throttles ability use (~35% damage abil,"
-            "      ~30% buff chance, heals only when below 30% HP) so"
-            "      combat feels strategic, not spammy."
-            "    * Per-ability COOLDOWNS for the player too. Each ability"
-            "      tracks its own cooldown after use; menu shows remaining"
-            "      turns. No more spamming your strongest spell."
+        @{Title="v1.4.1 — POLISH & PROGRESSION"; Color="Yellow"; Lines=@(
+            "  TIER 4 TALENT CAPSTONES (Lv 15)"
+            "    * Each class gets ONE ULT-tier talent unlocked at Lv 15."
+            "    * Knight Avatar of Light:    -25% damage taken, +15% dealt"
+            "    * Mage Archmage Ascendant:   abilities cost 50% MP, +40% magic"
+            "    * Brawler Iron Avalanche:    +50% damage below 50% HP"
+            "    * Ranger Volley:             Multishot 50% chance, full damage"
+            "    * Cleric Holy Fury:          all healing +50%, Lay on Hands x2"
+            "    * Necromancer Lord of the Dead: Reaper at 40% HP, kills heal 15"
+            "    * Berserker Eternal Rage:    Rampage cap 6 (was 3)"
+            "    * Warlock Bound to Eternity: Soul Drain heals 60%, Soul Tap free"
+            "    * After all 10 talents are owned, level-up no longer grants"
+            "      points — there's nothing left to buy."
             ""
-            "  RENDERING"
-            "    * Frame-buffer rendering for the dungeon view: only the"
-            "      cells that change are repainted, no more full-screen"
-            "      flash on every step. Auto-detects window size and"
-            "      enables when terminal is at least 80x32."
-            "    * Live window-resize detection — resize your terminal"
-            "      mid-dungeon and the buffer adapts."
-            "    * Helpful in-game tip if your window is too small to use"
-            "      buffered mode (suggests maximizing)."
+            "  RANGER BUFF"
+            "    * Base SPD raised from 15 to 16."
+            "    * Rangers wielding any Bow weapon get +1 ATK on top of"
+            "      their normal affinity bonus."
+            "    * Multishot proc rate increased from 20% to 25%."
             ""
-            "  INVENTORY & GEAR"
-            "    * Unified loot screen with arrow-key navigation, Space"
-            "      to toggle, V for item details, A to take-all, Enter"
-            "      to confirm. Gold flows through it too (0 weight)."
-            "    * Drop screen rebuilt with the same UX. Drop weapons,"
-            "      armor, loot, potions, throwables — and lockpicks with"
-            "      a quantity slider (+/-)."
-            "    * Equipped items shown but locked at the top of the drop"
-            "      screen as a reminder."
-            "    * NEW: [E] Equip from Bag in the inventory screen. Stows"
-            "      currently-equipped piece automatically."
-            "    * NEW: [I] Inventory works mid-dungeon (out of combat)."
-            "    * NEW: [J] Quest Log in the dungeon — view all active"
-            "      quests with progress bars without returning to town."
-            "    * Lockpicks now have weight (1 each). Chest bonus picks"
-            "      come as a Lockpick Bundle in the loot screen."
-            "    * Potions and throwables now have weight (1 each) and"
-            "      are droppable through the drop screen."
+            "  NEW GAME PLUS — NOW VISIBLE"
+            "    * The town menu shows [N] New Game+ with progress (X/25)."
+            "    * Once you've cleared 25 dungeons, the row turns magenta"
+            "      and reads NEW GAME+ READY! so it can't be missed."
+            "    * NG+ trigger logic was already correct (DungeonsCleared,"
+            "      not player level) — only the UI was hiding it."
             ""
-            "  QUESTS & PROGRESSION"
-            "    * 6 new quest types: Critical Hits, Lockpicker, Loot"
-            "      Hunter, Survivor (boss room above 50% HP), Bare-Handed"
-            "      Kills, Repair gear at the blacksmith."
-            "    * Active quest cap raised from 3 to 5."
-            "    * Quest Board now offers 5 random quests at a time."
-            "    * 12 new achievements: First Crit, Crit Master, Crit Lord,"
-            "      Locksmith, Master Thief, Heavy Pockets, Iron Fist,"
-            "      Untouched, Stance Shifter, True Scholar, Gear Guru,"
-            "      High Roller, Deepest Dive."
+            "  OPTIONS / SETTINGS [O]"
+            "    * Difficulty: Easy (-25% enemy HP/ATK), Medium (default),"
+            "      Hard (+25%). Applies to all enemies multiplicatively"
+            "      on top of NG+ scaling."
+            "    * Auto-Loot: when ON, the loot screen takes everything"
+            "      that fits in your bag automatically."
+            "    * Auto-Resize: optional terminal resize on game start."
+            "    * Settings travel inside your save code — generate and"
+            "      load a save to carry them across runs."
             ""
-            "  CONSUMABLES & THROWABLES"
-            "    * NEW throwable: Bomb — 75 damage premium throwable (140g)."
-            "    * Acid Flask buffed: 25 -> 40 damage (60g)."
-            "    * Poison Flask buffed: 15 -> 25 damage + Poison (70g)."
-            "    * Extra Strong potion family expanded to 4 variants — all"
-            "      drop from end-of-dungeon clears (rare, never sold):"
-            "        - ES Health Potion: restore 200 HP"
-            "        - ES Mana Potion: restore 150 MP"
-            "        - ES Strength Elixir: ATK +20 in battle"
-            "        - ES Luck Potion: +50% crit for 5 turns"
-            "      Now stored in the regular potion bag (1 weight each)."
-            "      If your bag is full when one drops, it auto-converts"
-            "      to 250-400 gold with a clear in-game message."
-            "    * Repair Kits remain weightless (counter-based)."
-            "    * Daily Dungeon clear-drop rates significantly higher:"
-            "      Repair Kits 25% -> 70%, ES potions 20% -> 65%."
-        )}
-        @{Title="GAMEPLAY IMPROVEMENTS"; Color="Cyan"; Lines=@(
-            "  GEAR ACQUISITION FLOW"
-            "    * No more 20% sell-on-replace refund. Gear stays in your"
-            "      possession when you buy/find a new piece."
-            "    * Buying or finding gear with a slot occupied prompts:"
-            "      'Equip now (old goes to bag)' or 'Stow new in bag'."
-            "    * Old equipped piece moves to your inventory bag with"
-            "      its weight applied. Sell at the Market when you want."
-            "    * Unequip works the same way — moves to bag, no refund."
-            "    * Applies to Market, Wandering Merchant, Flying Dutchman,"
-            "      and all gear-acquisition events."
+            "  MUTATOR REWORK"
+            "    * Reward bonuses now apply ONLY at end-of-dungeon clear"
+            "      (the +20-40% multiplier on the final gold/XP haul)."
+            "      Per-kill bonuses from Speedrun/Frugal/Hardcore removed."
+            "    * Quitting [Q] mid-dungeon while a mutator is active now"
+            "      forfeits ALL run gold, XP, AND loot. Without a mutator,"
+            "      [Q] still uses the older random flee penalty."
+            "    * Frugal Run: now leaves you with 1 Small Health Potion +"
+            "      1 Mana Potion + 1 lockpick at entry (was 0 of everything)."
             ""
-            "  MOVEMENT & CONTROLS"
-            "    * Movement throttle (~7 steps/sec max) prevents keyboard"
-            "      auto-repeat from zooming you across the dungeon."
-            "    * Non-movement keys (P, I, J, Q) bypass the throttle —"
-            "      always instant."
-            "    * Dungeon controls bar split into two lines for clarity."
+            "  DEATH HANDLING"
+            "    * Play Again (Same Character): items lost, gold KEPT,"
+            "      level/XP reset to 1/0/100, stats rebuilt from class"
+            "      template + reapplied training. The XP-to-next bug"
+            "      (level showed 1 but next-level cost stayed high) is fixed."
             ""
-            "  HUD & UI"
-            "    * Combat HUD shows enemy crit % alongside enemy hit %."
-            "    * Inventory display: per-item weight column and total"
-            "      weight footer. Combined Potions+Throwables section."
-            "    * Town Square no longer shows 'Lv1' on Enter Dungeon"
-            "      since dungeons scale to your player level."
-            "    * Quest line removed from in-dungeon HUD — press [J]"
-            "      for the full quest journal instead."
+            "  WANDERING MERCHANT — GEAR COMPARISON"
+            "    * Each offer now shows a comparison vs your current gear:"
+            "      green ▲ for upgrade, red ▼ for downgrade, = for same."
+            "    * Weapons compare ATK + class affinity bonus; armor"
+            "      compares DEF for the same slot."
             ""
-            "  CARRY WEIGHT REWORK"
-            "    * Hard cap at 90 weight, no longer scales with stats."
-            "      Inventory choices stay meaningful from start to end."
-            "    * All [Loot] items receive a +2 weight surcharge."
-            "    * Removed Pack Rat / Hoarder achievements."
-            "    * NEW Heavy Pockets achievement: get over-encumbered"
-            "      while in a dungeon (unlocks once)."
+            "  LORE NOTES — NOW READABLE"
+            "    * 18% of opened chests drop a NOTE (15 entries total)."
+            "    * Inventory now has [V] Read Notes when at least one is"
+            "      in your bag. Notes weigh 0 — pure flavor."
             ""
-            "  ENEMY TUNING"
-            "    * Normal enemies and mini-bosses BUFFED — base HP/ATK/DEF"
-            "      bumped, scaling rate slightly steeper. They actually"
-            "      pose a threat at mid-late dungeon levels now."
-            "    * Bosses TONED DOWN — was overtuned. Base HP 260 -> 210,"
-            "      base ATK 24 -> 20, scaling 0.35 -> 0.28 HP / 0.32 -> 0.24"
-            "      ATK. Less bullet-spongy, less one-shot-prone."
-            "    * NEW: Player-gear contribution at fight start. Each"
-            "      enemy gets a one-time stat bump based on the player's"
-            "      weapon ATK / magic / armor DEF — locked at fight start"
-            "      so swapping gear mid-dungeon doesn't matter. Normal"
-            "      and mini-boss = 30%, boss = 20%."
+            "  COMBAT & SHOP POLISH"
+            "    * Boss base stats +10% (HP 210 -> 231, ATK 20 -> 22)."
+            "    * Two-handed weapons split into a separate section in the"
+            "      shop with a banner divider. 7 new 2H weapons added (12"
+            "      total, 2 per non-Brawler class)."
+            "    * 'Death Scythe' (2H) renamed to 'Soulshear' to avoid"
+            "      visual clash with the existing 1H 'Death's Scythe'."
+            "    * Armor and potion shops sorted by ascending price."
+            "    * Sell Loot screen loops on each sale (was kicking you"
+            "      back to the market root after every transaction)."
+            "    * New [L] Sell All Loot button: liquidates the bag while"
+            "      KEEPING weapons, armor, potions, throwables, notes,"
+            "      and ingredients — sells the rest in one go."
+            "    * Confirmation prompt before selling Dutchman's Blade"
+            "      (it's unique and can't be re-acquired)."
+            "    * Inventory now shows weight on equipped weapon and armor."
+            "    * Loot screen now WARNS instead of blocking when you'd"
+            "      go over the carry cap — confirm with y/n to take"
+            "      anyway and accept the encumbered penalty."
             ""
-            "  CHEST & LOCKPICKING"
-            "    * All chests now have a fixed 5 tumblers regardless"
-            "      of dungeon level. Pure timing challenge, consistent"
-            "      across the game."
-            "    * Single sweet-spot row per pin (timing bar reflects"
-            "      pin proximity precisely)."
+            "  EXTRA STRONG POTIONS"
+            "    * Removed from normal kill drop pool (was a bug)."
+            "    * Bosses now roll a separate 35% chance for an Extra"
+            "      Strong potion drop, in addition to normal loot."
+            "    * End-of-dungeon Extra Strong roll unchanged."
             ""
-            "  SELL VALUES"
-            "    * Weapons and armor in your bag now show proper sell"
-            "      values (50% of shop price), both in the Sell Loot"
-            "      screen and the Inventory display. Were showing 0g."
-        )}
-        @{Title="BUG FIXES & QUALITY OF LIFE"; Color="Yellow"; Lines=@(
-            "  LOOT SCREEN OVERHAUL"
-            "    * Fixed 'take all' button silently failing on multi-item"
-            "      drops (root cause: array type coercion on PowerShell"
-            "      hosts that returned booleans as scalars)."
-            "    * Fixed 'You walk away empty-handed' wording when you"
-            "      explicitly took nothing."
-            "    * Removed redundant [N] none and [S] skip buttons."
+            "  TOWN & UI POLISH"
+            "    * Inn now always shows the menu — [C] Cooking Pot is"
+            "      available even at full HP/MP. Rest options 1-3 give"
+            "      a flavor line if you're already topped up."
+            "    * Royal Suite maxed-out path no longer double-prompts"
+            "      'press any key' (was showing two prompts in a row)."
+            "    * Quest Log renamed to QUEST JOURNAL on the title bar."
+            "    * Save screen now explains step-by-step how to save"
+            "      (open Notepad, paste with Ctrl+V, save the file)"
+            "      and how to load (paste from clipboard at the prompt)."
+            "    * Tutorial page 6 corrected: equipped gear now listed"
+            "      under WEIGHTED ITEMS (was incorrectly weight-free)."
             ""
-            "  RENDERING FIXES"
-            "    * Fixed black space below 3D viewport when minimap was"
-            "      shorter than the view. Switched to a windowed minimap"
-            "      with fog of war that fits within the viewport rows."
-            "    * Fixed screen tearing in small terminals — buffered"
-            "      mode is now strictly gated on 80x32 minimum."
+            "  BUG FIXES"
+            "    * Lockpick screen tearing fixed: returning from the"
+            "      lockpicking minigame now invalidates the dungeon"
+            "      partial-render cache so the next frame is a clean"
+            "      full repaint."
+            "    * Broken-lock final screen now waits for Enter instead"
+            "      of flashing past in 1 second."
+            "    * Blackjack BUST screen now waits for Enter instead of"
+            "      auto-advancing in 1.2 seconds."
+            "    * Notes are now weight 0 (was 1)."
             ""
-            "  CLASS SELECTION FIX"
-            "    * Fixed bug where any number you picked at character"
-            "      creation defaulted to Knight. ConvertTo-SafeInt's"
-            "      `\$Input` parameter conflicted with PowerShell's reserved"
-            "      automatic variable. Renamed to `\$Value` everywhere."
-            ""
-            "  LOCKPICKING REBALANCE"
-            "    * Timing bar now reflects ACTUAL sweet-spot proximity"
-            "      (was previously a meaningless secondary sin wave)."
-            "    * Single sweet-spot row per pin — the timing bar shows"
-            "      exactly when to press, so a tight window is fair."
-            ""
-            "  TUTORIAL"
-            "    * Added pages on Enemy AI, Quests, and updated existing"
-            "      pages to reflect new mechanics. Removed outdated"
-            "      'hold key down' note (movement is now snappy)."
-            "    * Inventory page rewritten for the 90-weight hard cap,"
-            "      ES potion family, and new Bomb throwable."
-            "    * 'Open X chests' quest type removed (redundant with"
-            "      Lockpicker). Quest tutorial says 'QUEST JOURNAL'."
-            ""
-            "  UI ALIGNMENT FIXES"
-            "    * Sell Loot table: column widths now match border"
-            "      characters exactly (was rendering 7 chars short of"
-            "      the bottom border)."
-            "    * Training Grounds description box: borders match"
-            "      content widths now (top/bottom borders no longer"
-            "      vanish in narrower terminals)."
-            ""
-            "  DUNGEON UI FIXES"
-            "    * Abandon dungeon prompt: typing 'n' now properly clears"
-            "      the prompt text from the screen on next render. The"
-            "      buffered renderer was missing the cleanup because the"
-            "      prompt wrote outside the frame buffer."
-            "    * Chest loot: now shows the same 'Loot stowed:' summary"
-            "      screen as enemy drops (was silently returning to the"
-            "      dungeon if you took anything)."
+            "  Have fun, sysadmin."
         )}
     )
 
@@ -11816,7 +12435,7 @@ function Show-Changelog {
         clr
         Write-Host ""
         Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "DarkMagenta"
-        Write-CL "  ║                    C H A N G E L O G   -   v1.3                  ║" "Magenta"
+        Write-CL "  ║                  C H A N G E L O G   -   v1.4.1a                 ║" "Magenta"
         Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "DarkMagenta"
         Write-Host ""
         Write-CL "  >>> $($page.Title)" $page.Color
@@ -11835,6 +12454,12 @@ function Show-Changelog {
 # ─── ENTRY POINT ─────────────────────────────────────────────────
 function Start-Game {
     $script:GameRunning = $true
+    # Settings are now part of the save code, not a separate file.
+    # Try the optional terminal resize using the current in-memory
+    # settings (defaults until a save is loaded). Loading a save will
+    # call Try-AutoResizeTerminal again with the saved value if
+    # AutoResize is on.
+    Try-AutoResizeTerminal
     clr
 
     # Title screen
@@ -11849,7 +12474,7 @@ function Start-Game {
     Write-Host ""
     Write-CL "             O   F     P O W E R S H E L L" "DarkYellow"
     Write-Host ""
-    Write-CL "                       Version 1.4" "DarkGray"
+    Write-CL "                       Version 1.4.1a" "DarkGray"
     Write-Host ""
     Write-CL "         A first-person dungeon crawler" "DarkGray"
     Write-CL "         with turn-based RPG combat" "DarkGray"
@@ -11866,7 +12491,7 @@ function Start-Game {
         Write-Host ""
         Write-CL "  ╔══════════════════════════════════════════════════╗" "DarkYellow"
         Write-CL "  ║               DEPTHS OF POWERSHELL               ║" "Yellow"
-        Write-CL "  ║                   Version 1.4                    ║" "DarkGray"
+        Write-CL "  ║                   Version 1.4.1a                 ║" "DarkGray"
         Write-CL "  ╚══════════════════════════════════════════════════╝" "DarkYellow"
         Write-Host ""
         Write-CL "  ┌─────────────────────────────────────────┐" "DarkGray"
@@ -11892,6 +12517,14 @@ function Start-Game {
             return  # Start-DebugRun jumps straight into the town loop and
                     # eventually returns control to the OS via Start-Game's
                     # normal exit path; nothing more to do at this level.
+        }
+        # ── Hidden Flying Dutchman mode ──
+        # Same pattern as the debug passphrase: not in any UI, no save.
+        # Starts the player as the Flying Dutchman pseudo-class with 4
+        # custom abilities, the Dutchman's Blade equipped, and 9999g.
+        if($startChoice -eq "Dutch26"){
+            Start-FlyingDutchmanRun
+            return
         }
         $menuLoop = $false  # fall through to handling [1] or [2]
     }
@@ -12193,14 +12826,14 @@ function Show-QuestLog {
     clr
     Write-Host ""
     Write-CL "  ╔══════════════════════════════════════════════════════════════════╗" "DarkYellow"
-    Write-CL "  ║                       Q U E S T   L O G                          ║" "Yellow"
+    Write-CL "  ║                   Q U E S T   J O U R N A L                      ║" "Yellow"
     Write-CL "  ╚══════════════════════════════════════════════════════════════════╝" "DarkYellow"
     Write-Host ""
 
     if(-not $script:Quests -or $script:Quests.Count -eq 0){
         Write-CL "  No active quests. Visit the Quest Board in town to accept some." "DarkGray"
         Write-Host ""
-        Wait-Key
+        Wait-Enter
         return
     }
 
@@ -12208,7 +12841,7 @@ function Show-QuestLog {
     if($active.Count -eq 0){
         Write-CL "  All quests turned in! Visit the Quest Board for new ones." "DarkGray"
         Write-Host ""
-        Wait-Key
+        Wait-Enter
         return
     }
 
@@ -12241,7 +12874,96 @@ function Show-QuestLog {
 
     Write-CL "  Turn in completed quests at the Quest Board in town." "DarkGray"
     Write-Host ""
-    Wait-Key
+    Wait-Enter
+}
+
+# ─── NOTE READER ──────────────────────────────────────────────────
+# Lists every Note item currently in the bag, lets the player pick
+# one by number to read in full. Pure flavor — no mechanics, no
+# stat changes, just a way to revisit picked-up lore at any time.
+function Show-NoteReader {
+    $readerLoop = $true
+    while($readerLoop){
+        clr
+        Write-Host ""
+        Write-CL "  ╔════════════════════════════════════════════════════════════╗" "DarkMagenta"
+        Write-CL "  ║                  N O T E S   &   L O R E                   ║" "Magenta"
+        Write-CL "  ╚════════════════════════════════════════════════════════════╝" "DarkMagenta"
+        Write-Host ""
+
+        # Build an indexed list of every Note item in the bag. We hold
+        # references rather than indices because the player can drop
+        # items mid-session and we want to be defensive.
+        $notes = @()
+        foreach($it in $script:Inventory){
+            if($it.Kind -eq "Note"){ $notes += $it }
+        }
+
+        if($notes.Count -eq 0){
+            Write-CL "  You have no notes to read." "DarkGray"
+            Write-Host ""
+            Wait-Enter
+            return
+        }
+
+        for($i = 0; $i -lt $notes.Count; $i++){
+            $n = $notes[$i]
+            Write-C "  [$($i+1)] " "DarkGray"
+            Write-CL $n.Name "Magenta"
+        }
+        Write-Host ""
+        Write-CL "  [0] Back" "DarkGray"
+        Write-Host ""
+        Write-C "  Read which note? > " "Yellow"
+        $pick = Read-Host
+        if($pick -eq "0" -or [string]::IsNullOrWhiteSpace($pick)){
+            $readerLoop = $false
+            continue
+        }
+        $idx = 0
+        if(-not [int]::TryParse($pick, [ref]$idx)){ continue }
+        if($idx -lt 1 -or $idx -gt $notes.Count){ continue }
+
+        # Display the note. Word-wrap the body text at ~62 chars per
+        # line so it fits the screen without breaking words awkwardly.
+        $note = $notes[$idx - 1]
+        clr
+        Write-Host ""
+        Write-CL "  ╔════════════════════════════════════════════════════════════╗" "DarkMagenta"
+        $title = $note.Name
+        if($title.Length -gt 56){ $title = $title.Substring(0, 56) }
+        $titleLine = "  ║  " + $title.PadRight(56) + "  ║"
+        Write-CL $titleLine "Magenta"
+        Write-CL "  ╚════════════════════════════════════════════════════════════╝" "DarkMagenta"
+        Write-Host ""
+
+        $body = if($note.Body){[string]$note.Body}else{"(this note is blank)"}
+        # Wrap body at ~62 chars without breaking mid-word. Newlines
+        # in the source text are preserved as paragraph breaks.
+        $wrapWidth = 62
+        foreach($paragraph in ($body -split "`n")){
+            if($paragraph.Trim().Length -eq 0){
+                Write-Host ""
+                continue
+            }
+            $words = $paragraph.Trim() -split '\s+'
+            $line = ""
+            foreach($w in $words){
+                if(($line.Length + $w.Length + 1) -le $wrapWidth){
+                    if($line.Length -gt 0){ $line += " " }
+                    $line += $w
+                } else {
+                    Write-CL ("  " + $line) "Gray"
+                    $line = $w
+                }
+            }
+            if($line.Length -gt 0){
+                Write-CL ("  " + $line) "Gray"
+            }
+        }
+        Write-Host ""
+        Wait-Enter
+    }
 }
 
 function Show-InventoryScreen {
@@ -12555,6 +13277,20 @@ function Show-InventoryScreen {
         if($dPad -lt 0){$dPad = 0}
         Write-C "  │" "DarkGray"; Write-C " [D]" "DarkRed"; Write-C " Drop Items (destroy)" "White"
         Write-CL ("$(' ' * $dPad) │") "DarkGray"
+        # Show [V] Read Notes only when the bag has at least one Note
+        # item — keeps the menu uncluttered for players who haven't
+        # picked any up yet.
+        $hasNotes = $false
+        foreach($invIt in $script:Inventory){
+            if($invIt.Kind -eq "Note"){ $hasNotes = $true; break }
+        }
+        if($hasNotes){
+            $vRow = " [V] Read Notes"
+            $vPad = 42 - $vRow.Length
+            if($vPad -lt 0){$vPad = 0}
+            Write-C "  │" "DarkGray"; Write-C " [V]" "Magenta"; Write-C " Read Notes" "White"
+            Write-CL ("$(' ' * $vPad) │") "DarkGray"
+        }
         $row2 = " [0] Back"
         $pad2 = 42 - $row2.Length
         if($pad2 -lt 0){$pad2 = 0}
@@ -12567,6 +13303,13 @@ function Show-InventoryScreen {
         switch($invCh.ToUpper()){
             "D" {
                 Show-DropScreen
+            }
+            "V" {
+                # Note reader: list every Note item in the bag, let
+                # the player pick one to read in full. Notes are pure
+                # flavor (no mechanics), so this is just a long-form
+                # display screen with [Press Enter] to dismiss.
+                Show-NoteReader
             }
             "K" {
                 if($script:RepairKits -le 0){
@@ -12933,16 +13676,23 @@ function Show-Tutorial {
             "    Glass Cannon    — +50% damage dealt and taken"
             "    Pacifist's Path — 0 XP from kills, 3x quest XP"
             "    Cursed Loot     — gear drops at 50% durability, +50% stats"
-            "    Speedrun        — enemies +25% SPD, +50% combat gold"
-            "    Frugal Run      — no potions, only 1 lockpick, +75% gold"
-            "    Hardcore        — lose 50% gold on death, +30% all rewards"
+            "    Speedrun        — enemies +25% SPD"
+            "    Frugal Run      — 1 HP pot, 1 MP pot, 1 lockpick (rest stashed)"
+            "    Hardcore        — lose 50% gold on death"
             ""
             "  Each mutator adds a +20-40% bonus to the gold/XP haul on"
-            "  dungeon clear. Mutators clear when you exit the dungeon."
+            "  dungeon CLEAR (boss defeated + reach the exit). Bonuses"
+            "  do NOT apply per-kill — only at the end of a successful"
+            "  run. Mutators clear automatically on dungeon end."
+            ""
+            "  ! WARNING: With a mutator active, abandoning the dungeon"
+            "  via [Q] forfeits ALL loot, gold, and XP earned this run."
+            "  Mutator runs are commit-or-die. Without a mutator, [Q]"
+            "  has the usual flee penalty (random loot/gold loss)."
             ""
             "  TIP: Frugal Run stashes your potions and most lockpicks at"
-            "  the door (you keep ONE pick for emergencies) and returns"
-            "  everything when the dungeon ends — clear or die."
+            "  the door (you keep one HP pot, one MP pot, and one pick)"
+            "  and returns everything when the dungeon ends — clear or die."
         )}
         @{Title="10. PETS & COOKING"; Lines=@(
             "  THE KENNEL (Guild Hall, [P]):"
@@ -12967,18 +13717,22 @@ function Show-Tutorial {
             "  Every level grants 1 TALENT POINT. Spend points at the"
             "  Stats page (press [T] from the stats screen)."
             ""
-            "  Each class has 9 talents in 3 tiers:"
+            "  Each class has 10 talents across 4 tiers:"
             "    Tier 1 — unlocks at Lv 1   (entry-level passive boosts)"
             "    Tier 2 — unlocks at Lv 5   (combat triggers and modifiers)"
-            "    Tier 3 — unlocks at Lv 10  (class-defining ultimates)"
+            "    Tier 3 — unlocks at Lv 10  (class-defining specialties)"
+            "    Tier 4 — unlocks at Lv 15  (ULT capstone, one per class)"
+            ""
+            "  When you've purchased all 10 talents for your class, no"
+            "  more points are granted on level-up — there's nothing"
+            "  left to buy. Save the surplus levels for raw stat gain."
             ""
             "  EXAMPLES — vary by class:"
             "    Knight Crusader:    +25% damage to bosses"
-            "    Knight Last Stand:  survive lethal damage at 1 HP (1/run)"
-            "    Mage Mana Shield:   -20% damage taken when MP > 50%"
-            "    Ranger Multishot:   20% chance for a second arrow"
-            "    Cleric Resurrection: revive at 50% HP on death (1/run)"
-            "    Warlock Soul Drain: abilities heal 30% of damage dealt"
+            "    Knight Avatar (T4): -25% damage taken, +15% damage dealt"
+            "    Ranger Multishot:   25% chance for a second arrow"
+            "    Ranger Volley (T4): Multishot 50% chance, full damage"
+            "    Cleric Holy Fury (T4): all healing +50%, Lay on Hands x2"
             ""
             "  NEW COMBAT ACTIONS unlocked by talents:"
             "    [L] Lay on Hands — Cleric T3, full heal once per dungeon"
@@ -13024,6 +13778,33 @@ function Show-Tutorial {
             "     starts fresh. Your best-ever streak is preserved though."
             ""
             "  Good luck, adventurer. The Depths await."
+        )}
+        @{Title="14. OPTIONS, NOTES & QUALITY-OF-LIFE"; Lines=@(
+            "  OPTIONS (town menu, [O]):"
+            "   * Difficulty: Easy / Medium / Hard. Easy makes enemies"
+            "     -25% HP/ATK; Hard +25%. Medium is the default."
+            "   * Auto-Loot: when ON, the loot screen auto-takes every"
+            "     item that fits within your carry weight. OFF leaves"
+            "     you to mark items manually with SPACE."
+            "   * Auto-Resize: tries to resize your terminal to ~100x40"
+            "     on game start. Some terminals refuse this; that's fine."
+            "   Settings are saved as part of your save code — generate a"
+            "   save from town to keep them, then load it next session."
+            ""
+            "  NOTES & LORE:"
+            "   * 18% of opened chests drop a NOTE — a journal scrap from"
+            "     a previous adventurer. Pure flavor, weight 0."
+            "   * From the inventory, press [V] to read your notes any time."
+            ""
+            "  WANDERING MERCHANT:"
+            "   * Random encounter offering one item at 60% off. The screen"
+            "     now shows a comparison vs your current gear: green ▲ for"
+            "     a clear upgrade, red ▼ for a downgrade, = for the same."
+            ""
+            "  DUTCHMAN'S BLADE WARNING:"
+            "   * If you try to sell the Dutchman's Blade in the Sell Loot"
+            "     screen, you'll get a confirmation prompt — it's unique"
+            "     and can't be re-acquired in a normal run."
         )}
     )
 
