@@ -13493,7 +13493,7 @@ function Show-Tutorial {
             "    W — walk forward         S — step back"
             "    A — turn left            D — turn right"
             "    P — use a healing potion I — open inventory"
-            "    J — view quest log       Q — quit the dungeon"
+            "    J — view quest journal   Q — quit the dungeon"
             "    (arrow keys also work for movement)"
             ""
             "  Movement is gently throttled to about 7 steps per second so"
@@ -13596,7 +13596,7 @@ function Show-Tutorial {
             "  level, so inventory choices stay meaningful from start to end."
             ""
             "  WEIGHT-FREE ITEMS:"
-            "    * Gold and Repair Kits"
+            "    * Gold, Lore Notes, and Repair Kits"
             ""
             "  WEIGHTED ITEMS (count toward your cap):"
             "    * Equipped weapon and armor — every piece you wear adds"
@@ -13777,7 +13777,6 @@ function Show-Tutorial {
             "   * Your CURRENT dungeon streak does NOT persist — each load"
             "     starts fresh. Your best-ever streak is preserved though."
             ""
-            "  Good luck, adventurer. The Depths await."
         )}
         @{Title="14. OPTIONS, NOTES & QUALITY-OF-LIFE"; Lines=@(
             "  OPTIONS (town menu, [O]):"
@@ -13805,6 +13804,8 @@ function Show-Tutorial {
             "   * If you try to sell the Dutchman's Blade in the Sell Loot"
             "     screen, you'll get a confirmation prompt — it's unique"
             "     and can't be re-acquired in a normal run."
+            ""
+            "  Good luck, adventurer. The Depths await."
         )}
     )
 
