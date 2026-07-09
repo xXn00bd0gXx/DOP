@@ -1,2 +1,139 @@
-1.5 - 
-Fishing 
+Before you begin implementing anything, read through this entire document carefully. Do not make assumptions or guess about my intentions. If any feature, mechanic, or requirement is unclear, ambiguous, or could be interpreted in more than one way, stop and ask me clarifying questions first. I would much rather answer questions than have you build something incorrectly.
+
+Additionally, before shipping or finalizing any code, you must thoroughly review it for bugs, logic errors, edge cases, and regressions. Do not consider a task complete until you have actively searched for and addressed potential problems in the code.
+
+Category 1: Deeper Combat & Character Progression
+Focus: making moment-to-moment gameplay more strategic and rewarding.
+
+1. Multi-Enemy Combat
+
+Idea: Some dungeon rooms should contain 2–3 enemies instead of only 1v1 encounters, increasing challenge and making strategic targeting important.
+Impact: Enables new ability types — Area-of-Effect (AoE) spells for the Mage/Warlock (e.g., "Chain Lightning," "Firestorm") and cleaving attacks for the Knight/Berserker.
+2. Item Sets & Enchanting
+
+Idea: Introduce powerful gear "sets." Equipping 2, 3, or all 5 pieces of a named set (e.g., "The Archmage's Regalia") grants unique, scaling bonuses stronger than individual items. Add an "Enchanter" NPC to town who, for a high price, can add a random perk to a perk-less item or add a "socket" for a gem.
+Impact: Creates a "treasure hunt" metagame, encouraging players to hunt specific gear across multiple runs to complete their ultimate build.
+3. Enemy Synergies & Roles
+
+Idea: Make enemies work together. Add "support" enemies like a "Goblin Shaman" (heals allies) or a "Skeleton Commander" (grants a defense buff to allies).
+Impact: Transforms combat from a damage race into a tactical puzzle about target prioritization.
+Category 2: Endgame & Replayability
+Focus: giving players reasons to return after "beating" the game.
+
+1. Endless Dungeon Mode
+
+Idea: After the first final-boss kill, unlock "Endless Depths" mode — uncapped dungeon levels with enemies that scale infinitely. Include a leaderboard tracking the deepest floor reached.
+Impact: Provides a true endgame for players who want to push builds to the limit.
+2. Faction Reputation System
+
+Idea: Introduce 2–3 factions (e.g., "The SysAdmin's Guild," "The Rogue Processes," "The Data Miners"). Quests, choices in random encounters, and sparing certain enemies raise or lower reputation.
+Impact: High reputation unlocks unique vendors, gear, quests, or faction companions. Negative reputation triggers dungeon ambushes by faction assassins — adding consequence to player actions.
+3. Persistent Town Upgrades
+
+Idea: Let players spend large sums of gold and rare materials (found deep in dungeons or on bosses) to permanently upgrade town facilities. E.g., upgrading the Blacksmith lowers repair costs; upgrading the Inn provides better resting buffs.
+Impact: Creates a satisfying, visible long-term gold sink and makes the town feel like a home base being built over time.
+Category 3: World & Immersion
+Focus: making the world feel alive and the journey more personal.
+
+1. "Nemesis" System
+
+Idea: Create a unique, named enemy who escapes after its first defeat, then reappears in later dungeons — stronger, with taunting dialogue referencing past encounters.
+Impact: Creates a personal rivalry and recurring antagonist. Defeating the Nemesis permanently yields a unique reward.
+2. Complex, Multi-Stage Quests
+
+⚠️ Important: Town Board quests must be kept separate from Main/Side quests.
+Idea: Go beyond simple "kill X / collect Y" quests with quest chains. Example: 1) Find a mysterious map in a chest → 2) Take it to the Guild Hall to be deciphered → 3) The map leads to a specific room in a future dungeon where a guardian must be defeated to claim a unique item.
+Impact: Makes questing feel like an adventure rather than a checklist.
+3. Environmental Hazards & Boons
+
+Idea: Give some rooms special properties. A "Flooded Room" slows everyone inside; a "Magically-Charged Room" amplifies all magic damage; an "Altar" offers a temporary blessing.
+Impact: Adds tactical consideration to navigation and makes rooms feel distinct.
+Category 4: Themed Zones & Environmental Storytelling
+Currently each floor is mechanically similar. Give floors identities that tell the story of a system falling into chaos as the player descends.
+
+Break the dungeon into thematic zones (every 5–10 levels) with unique descriptions, an environmental quirk, and zone-specific enemy variants:
+
+Levels 1–5 — The Server Halls (Current): Clean, cold stone. The "upper level" of the system.
+Levels 6–10 — The Flooded Data-Center: Rooms ankle-deep in glowing, murky coolant; air hums with failing pumps; a blue-ish tint to the 3D view. Enemies: "Corroded Golems," "Short-Circuited Skeletons."
+Levels 11–15 — The Overgrown Archives: Biological corruption; thick pulsating cables like vines; air thick with spores. Enemies: fungal/parasitic.
+Levels 16+ — The Core Meltdown: Final zone. Oppressively hot, glowing cracks in the floor, constant low hum. Introduce minor "ambient heat" damage that ticks every few steps.
+Impact: Creates a powerful sense of progression — the player journeys through distinct, decaying layers of a colossal, forgotten machine.
+
+Category 5: Interactive Objects & Cryptic Lore
+Zork-style interactivity — let players interact with non-essential objects that dispense lore, hints, or flavor.
+
+Flickering Terminal: Screen displays a cryptic error: Process 'Lich King' has no parent. Interacting provides lore about the final boss.
+Forgotten Bookshelf: Rotting tomes; one legible title: "On the Ethics of Soul-Binding Processes." Reading it hints at an enemy's weakness.
+Strange Effigy: Made of discarded RAM sticks and tangled wires, pointing toward the west wall — a clue to a hidden secret.
+Impact: Rewards attentive players and encourages exploration beyond combat and loot.
+
+Category 6: The "SysAdmin" Voice (Lean Into the Theme)
+Double down on the "PowerShell as a fantasy world" theme in every piece of text for a witty, memorable personality.
+
+Enemy Intros: Instead of "A Goblin appears!" → "A rogue 'goblin' process forks itself into your reality. It looks angry and poorly optimized."
+Item Descriptions: A health potion → "A flask of 'health.dll'. Seems stable." (Restores lost data points / HP.) A sword → "A 'Blade' object, sharpened for process termination."
+Death Message: Instead of "You have died" → "FATAL EXCEPTION: Your process has been terminated with exit code 0 (💀). Core dump saved to the ether."
+Impact: Gives the game a consistent, humorous voice that sets it apart.
+
+Category 7: Narrative Breadcrumb Trail
+Connect the existing "Notes" into a single tragic story.
+
+Idea: Make all "Note" items pages from the journal of a single previous adventurer, found out of order (e.g., Page 3, then Page 1, then Page 8). The journal details their descent, discoveries, and growing realization of the true nature of the "Lich King."
+Impact: Provides a compelling narrative hook. Finding all pages could lead to discovering that adventurer's "ghost" or a unique item they left behind.
+Category 8: The "Corruption" System — A World That Fights Back
+A global "Corruption" meter (0%–100%) that rises and falls with player actions.
+
+Increasing Corruption: Defeating major bosses, using powerful "cursed" items, or failing certain quests.
+Decreasing Corruption: Completing "Purification" quests, using rare "stabilizer" items, or defeating the hidden "Orphaned Process" boss.
+Effects of High Corruption: More elite/"mutated" enemies; more dangerous random encounters (Merchant may be replaced by a Thief); altered town/dungeon descriptions ("The air in the town square feels heavy, glitching at the edges of your vision.").
+Effects of Low Corruption: More stable dungeon; "blessed" altars granting boons; better shop prices.
+Why it matters: Creates a feedback loop and a strategic dilemma — "Do I use this incredibly powerful cursed sword, knowing it will make the world more hostile?"
+
+Category 9: The World Map & True Exploration
+Expand from Town + Dungeon into a full world.
+
+Idea: The main option becomes "Venture Out," taking the player to a text-based World Map (a grid of travelable locations). The Town Square is just the starting point.
+Locations: The Whispering Woods, The Frostfang Mountains, The Ruined City of Sys-V, The Coastal Port of Terminus.
+Travel: Moving takes in-game time (e.g., "The journey to the Frostfang Mountains takes 3 days.") and can trigger road encounters (ambushes, merchants, quest-givers).
+Content: Each major location has its own "town" (even a small camp), unique NPCs, and themed dungeons (e.g., Frostfang icy caves with frost trolls; Ruined City automated defense golems).
+Category 10: Deep Guild Questlines with Real Consequences
+Make the Guild Hall more than a place to hire help. Let players formally join a Guild, each with a HQ, unique cast, and a full multi-stage questline.
+
+The SysAdmins' Guild (Lawful): Focused on "purifying" the Depths — recovering lost data artifacts and sealing anomalies. Final reward: master-forged "Firewall" armor.
+The Data-Thieves' Collective (Chaotic Neutral): Operates from the shadows — espionage, stealing schematics, discreetly eliminating rival adventurers. Reward: stealth/lockpicking gear.
+The Cabal of Forgotten Code (Dark): Warlocks and Necromancers who see corruption as a feature, not a bug — harnessing dark power and communicating with rogue processes.
+Category 11: Skill-Based Progression — "Learn by Doing"
+Keep the main Player Level (HP/MP and Talent Points) but add a separate Skill System.
+
+Skills: Swords, Bows, Destruction Magic, Restoration Magic, Heavy Armor, Light Armor, Lockpicking, Blacksmithing, Alchemy.
+Progression: Actions grant XP in the relevant skill (each sword hit → Sword XP; each potion brewed → Alchemy XP). Skill levels give small passive bonuses (e.g., +0.5% damage per Sword level, +1% potion effectiveness per Alchemy level).
+Unlocks: Skill milestones (e.g., Blacksmithing Level 50) unlock crafting of unique, powerful gear unavailable in shops.
+Category 12: Radiant & Systemic World Events
+Large-scale temporary events across the whole world, on a timer or triggered by player milestones.
+
+"The Goblin Horde": For 3 in-game days, world-map encounters become goblin ambushes and early dungeon floors swarm with them. A special Quest Board bounty appears to "Slay the Goblin Warchief."
+"The Blighted Plague": Plague hits the main town — the Inn closes, potion prices skyrocket. A new quest appears to gather cure ingredients.
+"The Blood Moon": For one night, all undead enemies are 50% stronger but drop double XP and have a higher rare-drop chance.
+Category 13: True Quest / Story
+1. Main Story Quest
+
+Plan and create a full main story quest, tracked in the save code.
+It should be engaging and funny, featuring varied quest types (fetching items for an NPC, freeing someone, defeating scripted bosses).
+Include cutscenes with ASCII art.
+2. Town Side Quests
+
+Create a side quest unique to each town that unlocks something special to that town, or a special item — e.g., the Skeleton Key that unlocks every lock perfectly.
+
+Category 14:
+1. Add a fishing mini-game available in some towns that have a pond.
+
+Bug Fixes (Required)
+Full-screen option doesn't work.
+Poison potion damage ticks when the player attempts to flee combat, allowing players to cheese every fight. (Flee should not trigger poison ticks.)
+Talent-tree "survive a lethal blow" skills trigger more than once per dungeon — they should be limited to once per dungeon as intended.
+
+
+Final Reminders to the AI
+Ask, don't guess. If anything above is unclear or you're unsure how it should interact with existing systems, ask me before implementing. If you think a change or addition is bad or ruins the scope of the game tell me.
+Hunt for bugs. Thoroughly review all code for bugs, edge cases, and regressions before considering any feature shipped.
+If you'd like, suggest a recommended implementation order for these features and ask me to confirm before starting.
