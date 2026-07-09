@@ -134,6 +134,6 @@ Talent-tree "survive a lethal blow" skills trigger more than once per dungeon â€
 
 
 Final Reminders to the AI
-Ask, don't guess. If anything above is unclear or you're unsure how it should interact with existing systems, ask me before implementing. If you think a change or addition is bad or ruins the scope of the game tell me.
+Ask, don't guess. If anything above is unclear or you're unsure how it should interact with existing systems, ask me before implementing. If you think a change or addition is bad or ruins the scope of the game tell me. Identify changes that will need to be made to existing gameplay features to support changes (EX: With the quest system, it changes the gameplay loop so the qualifer for new game plus would need to be changed since the player does more than endlessly clear dungeons)
 Hunt for bugs. Thoroughly review all code for bugs, edge cases, and regressions before considering any feature shipped.
 If you'd like, suggest a recommended implementation order for these features and ask me to confirm before starting.
