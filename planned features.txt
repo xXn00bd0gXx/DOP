@@ -138,50 +138,111 @@ Ask, don't guess. If anything above is unclear or you're unsure how it should in
 Hunt for bugs. Thoroughly review all code for bugs, edge cases, and regressions before considering any feature shipped.
 If you'd like, suggest a recommended implementation order for these features and ask me to confirm before starting.
 
-🔴 High Severity (Exploits & Soft-Locks)
+🔴 High Severity (Exploits, Call-Stack Leaks & Soft-Locks)
 
-1. Frugal Mutator Inventory Overflow
+1. Frugal Mutator Potion Bag Overflow
 
 Location: Reset-MutatorOnEnd
-Issue: When the "Frugal Run" mutator is active, the game stashes the player's potions at the dungeon entrance and restores them upon exiting. However, the restoration loop blindly adds the stashed items back to the $script:Potions array without checking the 10-potion maximum capacity.
-Exploit: If a player enters a Frugal Run with 10 potions, finds/buys new potions during the run, and clears the dungeon, the stashed potions are appended to the newly found ones. This allows the player to permanently bypass the 10-potion inventory limit and carry an infinite number of potions.
+
+Issue: When the "Frugal Run" mutator is active, the game stashes the player's potions at the dungeon entrance and restores them upon exiting. However, the restoration loop blindly adds the stashed items back to the $script:Potions array without verifying the 10-potion maximum capacity.
+
+Exploit: If a player enters a Frugal Run with 10 potions, finds or buys new potions during the run, and successfully clears the dungeon, the stashed potions are appended directly to the newly found ones. This allows the player to bypass the 10-potion inventory limit indefinitely.
+
+Fix: Check $script:Potions.Count during restoration, or temporarily expand/handle the pouch capacity cleanly.
 
 2. Extra Strong Potion Cap Bypass
 
 Location: Start-Combat (Boss Loot Phase) and Enter-Dungeon (Dungeon Clear)
+
 Issue: When a boss drops an Extra Strong Potion, the script checks if the player has enough Carry Weight ($curWt + 1 -le $maxWt), but entirely forgets to check the Potion Bag Cap ($script:Potions.Count -lt 10).
+
 Exploit: Just like the Frugal Mutator bug, this allows players to exceed the 10-potion hard cap if they have available carry weight.
 
-3. Permanent Stat Skewing on Dutchman Penalty
+Fix: Check $script:Potions.Count -lt 10 before adding the item, converting it to gold if the bag is full.
 
-Location: Start-RandomEncounter (Flying Dutchman logic)
-Issue: If a player loses the Dutchman's coin toss, they lose 2 levels. The script attempts to roll back their stats proportionally using hardcoded flat values (e.g., subtracting 10 MaxHP, 5 MaxMP, 2 ATK per level).
-Bug: Class stats do not grow at these flat rates. For example, a Mage gains 0 base MaxHP per level (relying on talents for HP), while a Brawler gains 8. If a Mage loses the coin toss, the game subtracts 20 MaxHP, permanently crippling the character's base stats beyond their intended class template.
+3. The continue Control-Flow Call-Stack Leak
+
+Location: Enter-Dungeon (Death choice processing)
+
+Issue: Inside Enter-Dungeon, when the player dies, they are prompted to choose a restart method. Under Option "2" (Play Again - Same Character), the code executes continue to restart the game loop. However, by the time the player selects this option, the dungeon while loop has already terminated.
+
+Bug: In PowerShell, using continue inside a switch statement that is not nested within an active loop inside the same function will propagate up the call-stack. It searches for an active loop in the parent caller, which in this case is Show-MainMenu. It forces the main menu to jump to its next iteration, bypassing any clean-up code, resetting variables incorrectly, and potentially causing unexpected script termination or state corruption depending on the PowerShell host version.
+
+Fix: Replace the dangling continue with a clean state reset and a return statement, letting the main menu handle the flow properly.
 
 🟡 Medium Severity (Gameplay & Combat Logic)
 
 4. Brawler "Berserk" Talent is Static
 
 Location: Start-Combat & Get-PlayerCrit
+
 Issue: The Brawler's Tier 3 talent (Berserk) grants +40% critical hit chance when below 25% HP. However, the combat loop only evaluates $playerCritChance once at the very beginning of the encounter.
+
 Bug: If a Brawler drops below 25% HP during a fight, they do not get the +40% crit buff. Conversely, if they start the fight below 25% HP and immediately heal to full, they retain the massive +40% crit buff for the rest of the encounter.
+
+Fix: Move $playerCritChance = Get-PlayerCrit $p.SPD $script:LuckBonus inside the active combat round loop so it evaluates dynamically on every action.
 
 5. Pacifist Mutator Ignores Town Quests
 
 Location: Update-QuestProgress
+
 Issue: The "Pacifist's Path" mutator is supposed to grant 3x XP for completed quests. The multiplier is applied at the exact moment Update-QuestProgress fires, checking if Has-Mutator "Pacifist" is true.
+
 Bug: The "Repair gear at the blacksmith" quest can only be completed in Town. Because mutators are completely wiped by Reset-MutatorOnEnd before the player returns to town, Blacksmith quests will never receive the 3x Pacifist XP bonus.
+
+Fix: Store a transient flag or check if the quest was actively progressed during a mutator run, or wait to wipe the mutator until the player leaves town or enters a new dungeon.
+
+6. The Bestiary Backslash Splitting Bug
+
+Location: Show-Bestiary & Start-Combat
+
+Issue: Bestiary entries are tracked with keys formatted with a backslash and tilde separator, e.g., "Goblin\~Frenzied". When displaying the Bestiary, the script splits the key: $parts = $e.Key -split '\~'.
+
+Bug: In PowerShell, the -split operator parses its right-hand operand as a Regular Expression. In regex, \ is the escape character, meaning '\~' is interpreted as an escaped tilde (~). This causes PowerShell to split only on the tilde, leaving the trailing backslash attached to the first part. The resulting $type becomes "Goblin\", displaying visually glitched names like "Frenzied Goblin\" or "Boss\ Lich King" in the Bestiary.
+
+Fix: Use double-backslashes to escape the literal backslash in regex: $parts = $e.Key -split '\\~' or use the string split method directly: $parts = $e.Key.Split('\~').
+
+7. "Treasure" Quest Template Omission
+
+Location: Get-RandomQuests
+
+Issue: The script contains detailed gold and XP reward calculations for a quest of type "Treasure". However, "Treasure" is completely missing from the $templates array.
+
+Bug: Because the template is missing, a "Treasure" quest can never be generated.
+
+Fix: Restore the "Treasure" quest to the $templates array so players can actively receive bounties for finding dungeon chests:
+
+@{Type="Treasure";   DescTemplate="Find and open {0} treasure chests"; TMin=1; TMax=3}
+
+
+8. Dutchman Penalty - Flat vs Scaled Stats
+
+Location: Start-RandomEncounter (Flying Dutchman logic)
+
+Issue: If a player loses the Dutchman's coin toss, they lose 2 levels. The script attempts to roll back their stats proportionally using hardcoded flat values (e.g., subtracting 10 MaxHP, 5 MaxMP, 2 ATK per level).
+
+Bug: While level-up bonuses in this game are currently flat across all classes, modifying these parameters using static values creates coupling that will break if custom class templates are ever introduced.
+
+Fix: Rebuild the player stats programmatically based on their level and class template rather than hardcoding subtraction deltas.
 
 🟢 Low Severity (UI & Edge Cases)
 
-6. Blackjack "Double Down" Bust Notification
+9. Blackjack "Double Down" Bust Notification
 
 Location: Start-Blackjack
+
 Issue: If a player chooses to Double Down, the script deals one card, flags $doubled = $true, and immediately sets $playerStanding = $true to end their turn.
+
 Bug: Because the turn ends immediately without looping back to the top of the while(-not $playerStanding) loop, the immediate Write-CL "  BUST!" UI prompt is skipped if the double-down card pushes them over 21. The game still correctly deducts their gold and logs the loss in the final results summary, but the player misses the real-time visual feedback of busting.
 
-7. Boss "Inferno" Telegraph Override
+Fix: Add a quick boundary check immediately after the Double Down card is drawn to display the BUST visual if the score exceeds 21.
+
+10. Boss "Inferno" Telegraph Override
 
 Location: Start-Combat (Boss telegraph execution)
+
 Issue: When a boss telegraphs an attack, the next turn forces a hardcoded hashtable: $forcedBossAbility = @{Name="Inferno";Power=25;Type="Magic"}.
-Bug: This ignores the boss's actual ability list. Even if you theoretically fought a boss that doesn't have the "Inferno" ability, the telegraph will spawn this hardcoded Inferno attack out of thin air.
+
+Bug: This ignores the boss's actual ability list. Even if you fought a custom boss that doesn't have the "Inferno" ability, the telegraph will spawn this hardcoded Inferno attack out of thin air.
+
+Fix: Modify the telegraph execution to pull the highest-power magic or physical ability directly from the boss's active $e.Abilities list.
