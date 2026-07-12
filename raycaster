@@ -1,155 +1,253 @@
-# Standalone 3D DDA Raycaster Tech Demo with Wall Textures & Sprites
-# Save this as raycaster.ps1 and run in standard PowerShell console.
+# ==================================================================
+#   DEPTHS OF POWERSHELL: stand-alone 3D DDA RAYCASTER TECH DEMO
+#   Optimized for PowerShell 5.1 | Pure Native ANSI Engine
+# ==================================================================
 
-# Set output encoding to UTF8
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$Host.UI.RawUI.WindowTitle = "PowerShell 3D DDA Raycaster Demo - Textured Edition"
-
-# Clear host and hide cursor
-Clear-Host
-$cursorVisible = $true
-try { $cursorVisible = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch {}
-
-# --- VIEWPORT WINDOW INITIALIZATION ---
-# Programmatically configure console window size to prevent scrolling jitter
+# Safe check to see if we have a valid console handle
+$hasConsole = $false
 try {
-    if ($env:OS -eq "Windows_NT") {
-        $winWidth = 85
-        $winHeight = 32
-        if ([Console]::BufferWidth -lt $winWidth) { [Console]::BufferWidth = $winWidth }
-        if ([Console]::BufferHeight -lt $winHeight) { [Console]::BufferHeight = $winHeight }
-        [Console]::SetWindowSize($winWidth, $winHeight)
-    }
+    if ([Console]::WindowHeight -gt 0) { $hasConsole = $true }
 } catch {}
 
-# --- MAP DEFINITION ---
-# 1 = Wall, 0 = Empty space
-$map = @(
-    @(1,1,1,1,1,1,1,1,1,1),
-    @(1,0,0,0,0,0,0,0,0,1),
-    @(1,0,1,1,0,1,1,0,0,1),
-    @(1,0,1,0,0,0,1,0,0,1),
-    @(1,0,0,0,0,0,0,0,0,1),
-    @(1,0,1,0,0,0,1,1,0,1),
-    @(1,0,1,1,0,1,1,0,0,1),
-    @(1,0,0,0,0,0,0,0,0,1),
-    @(1,0,0,0,0,0,0,0,0,1),
-    @(1,1,1,1,1,1,1,1,1,1)
+# Ensure standard UTF-8 console output and set window title safely
+if ($hasConsole) {
+    $oldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    } catch {}
+    try {
+        $Host.UI.RawUI.WindowTitle = "Depths of PowerShell - 3D Raycaster Tech Demo"
+    } catch {}
+    $ErrorActionPreference = $oldEAP
+}
+
+# Hide the console cursor to prevent flickering safely
+$initialCursorState = $true
+if ($hasConsole) {
+    try {
+        $initialCursorState = [Console]::CursorVisible
+        [Console]::CursorVisible = $false
+    } catch {}
+}
+
+# --- VIEWPORT WINDOW CONFIGURATION ---
+# Sets a larger window size to support the increased resolution viewport
+if ($hasConsole) {
+    try {
+        if ($env:OS -eq "Windows_NT") {
+            $winWidth = 105
+            $winHeight = 38
+            if ([Console]::BufferWidth -lt $winWidth) { [Console]::BufferWidth = $winWidth }
+            if ([Console]::BufferHeight -lt $winHeight) { [Console]::BufferHeight = $winHeight }
+            [Console]::SetWindowSize($winWidth, $winHeight)
+        }
+    } catch {}
+}
+
+# --- Map Definition (12x12 Grid) ---
+# 1 = Wall, 2 = Sliding Door, 0 = Open floor
+$mapWidth = 12
+$mapHeight = 12
+
+$flatMap = @(
+    1,1,1,1,1,1,1,1,1,1,1,1,
+    1,0,0,0,0,2,0,0,0,0,0,1,  # Position (5, 1) is a Sliding Door
+    1,0,1,1,0,1,0,1,1,1,0,1,
+    1,0,1,0,0,0,0,0,0,1,0,1,
+    1,0,1,0,1,1,1,1,0,1,0,1,
+    1,0,0,0,1,0,0,1,2,0,0,1,  # Position (8, 5) is a Sliding Door
+    1,0,1,0,1,0,0,1,0,1,0,1,
+    1,0,1,0,1,1,0,1,0,1,0,1,
+    1,0,1,0,0,0,0,0,0,1,0,1,
+    1,0,1,1,1,2,1,1,1,1,0,1,  # Position (5, 9) is a Sliding Door
+    1,0,0,0,0,0,0,0,0,0,0,1,  
+    1,1,1,1,1,1,1,1,1,1,1,1
 )
-$mapHeight = $map.Count
-$mapWidth = $map[0].Count
+
+# --- DOOR ANIMATION STATES ---
+$doorStates = @{
+    "5,1" = @{ State="Closed"; Ratio=0.0 }
+    "8,5" = @{ State="Closed"; Ratio=0.0 }
+    "5,9" = @{ State="Closed"; Ratio=0.0 }
+}
 
 # --- SPRITES DEFINITION ---
-# Procedural 12x12 textures: 0 = transparent, other values = 8-bit ANSI colors
-$enemyTex = @(
-    @(0,0,0,0,124,124,124,124,0,0,0,0),          # Hood / Hat (Dark Red: 124)
-    @(0,0,0,124,124,124,124,124,124,0,0,0),
-    @(0,0,124,124,40,124,124,40,124,124,0,0),       # Green skin (40)
-    @(0,0,124,40,160,40,40,160,40,124,0,0),     # Glowing Eyes (160)
-    @(0,0,124,40,40,224,224,40,40,124,124,0),   # Fangs (Light Yellow: 224)
-    @(0,124,124,40,40,224,224,40,40,124,124,0),
-    @(0,0,0,124,124,196,196,124,124,0,0,0),       # Bright Red collar (196)
-    @(0,0,124,124,196,196,196,196,124,124,0,0),   # Clothes / Robe
-    @(0,124,124,40,196,196,196,196,40,124,124,0), # Hands
-    @(0,124,0,0,196,196,196,196,0,0,124,0),     # Boots / Cloak
-    @(0,0,0,0,196,0,0,196,0,0,0,0),
-    @(0,0,0,0,237,0,0,237,0,0,0,0)               # Shadows (Darkest Gray: 237)
+# 12x12 procedural grids: 0 = transparent, other numbers = 8-bit ANSI colors
+
+# Skeleton Sprite (Corridor Hazard)
+$skeletonTex = @(
+    @(0,0,0,255,255,255,255,0,0,0,0,0),         # Skull (White)
+    @(0,0,255,232,255,255,232,255,0,0,0,0),      # Eye sockets (Black)
+    @(0,0,0,255,255,255,255,0,0,0,0,0),         # Jaw
+    @(0,0,0,0,255,255,0,0,0,0,0,0),             # Spine
+    @(0,0,255,255,255,255,255,255,0,0,0,0),      # Collarbone / Shoulders
+    @(0,255,0,255,232,255,232,255,0,255,0,0),    # Ribs
+    @(0,255,0,255,255,255,255,255,0,255,0,0),    # Ribs 2
+    @(0,0,0,0,255,255,0,0,160,160,0,0),         # Spine/Hip + Sword hilt (Red)
+    @(0,0,0,255,232,232,255,0,244,244,0,0),      # Hips + Sword blade (Steel)
+    @(0,0,255,0,0,0,0,255,0,244,0,0),           # Legs + Blade tip
+    @(0,255,0,0,0,0,0,0,255,0,0,0),             # Feet
+    @(234,234,234,0,0,0,0,0,234,234,234,0)      # Floor Shadow
 )
 
+# Wraith Sprite
+$wraithTex = @(
+    @(0,0,0,0,93,93,93,93,0,0,0,0),             # Dark Purple Hood
+    @(0,0,0,93,93,93,93,93,93,0,0,0),
+    @(0,0,93,232,232,232,232,232,93,93,0,0),     # Empty face
+    @(0,0,93,226,232,232,226,232,93,93,0,0),     # Glowing Yellow Eyes
+    @(0,93,93,93,232,232,93,93,93,93,0,0),       # Cloak folds
+    @(0,93,129,93,93,93,93,129,93,93,0,0),       # Ethereal wisps (Light Blue)
+    @(0,0,93,129,129,129,129,93,93,0,0),
+    @(0,0,0,93,93,129,129,93,0,0,0,0),
+    @(0,0,0,0,129,129,129,0,0,0,0,0),            # Wispy tail
+    @(0,0,0,0,0,129,0,0,0,0,0,0),
+    @(0,0,0,0,0,129,0,0,0,0,0,0),
+    @(0,0,0,0,0,0,0,0,0,0,0,0)
+)
+
+# Lost Adventurer (Rescue Target NPC)
+$adventurerTex = @(
+    @(0,0,0,246,246,246,246,0,0,0,0,0),         # Iron Helmet
+    @(0,0,246,246,246,246,246,246,0,0,0,0),
+    @(0,0,246,180,180,180,180,246,0,0,0,0),      # Peach skin face
+    @(0,0,246,232,180,180,232,246,0,0,0,0),      # Eyes
+    @(0,0,0,246,246,246,246,0,0,0,0,0),         # Beard
+    @(0,0,33,33,33,33,33,33,0,0,0,0),           # Blue Tunic
+    @(0,33,33,220,220,33,33,220,220,33,33,0),   # Waving arms (Gold wristguards)
+    @(33,0,33,33,33,33,33,33,0,33,33,0),        # Waving hands
+    @(0,0,0,130,130,130,130,0,0,0,0,0),         # Leather Belt
+    @(0,0,0,240,240,240,240,0,0,0,0,0),         # Chainmail leggings
+    @(0,0,130,130,0,0,130,130,0,0,0,0),         # Boots
+    @(234,234,234,0,0,0,0,0,234,234,234,0)      # Shadow
+)
+
+# Dungeon Treasure Chest
 $chestTex = @(
-    @(0,0,0,94,94,94,94,94,94,0,0,0),            # Top Wood Lid (Dark Brown: 94)
-    @(0,0,94,130,130,220,220,130,130,94,0,0),    # Wood panel body (Orange Brown: 130)
+    @(0,0,0,94,94,94,94,94,94,0,0,0),            # Wood Lid (Dark Wood)
+    @(0,0,94,130,130,220,220,130,130,94,0,0),    # Panel body (Chest wood)
     @(0,94,130,130,130,220,220,130,130,130,94,0),
     @(94,130,130,130,130,220,220,130,130,130,130,94),
-    @(94,94,94,94,94,94,94,94,94,94,94,94),      # Horizontal metal trim
-    @(130,130,130,130,235,235,235,235,130,130,130,130), # Lock outline (Black-gray: 235)
-    @(130,130,130,130,235,220,220,235,130,130,130,130), # Gold Keyhole (220)
-    @(130,220,130,130,235,235,235,235,130,130,220,130), # Gold Corner reinforcements
+    @(94,94,94,94,94,94,94,94,94,94,94,94),      # Horizontal trim
+    @(130,130,130,130,235,235,235,235,130,130,130,130), # Wood body
+    @(130,130,130,130,235,220,220,235,130,130,130,130), # Gold lock
+    @(130,220,130,130,235,235,235,235,130,130,220,130), # Braces
     @(94,220,94,94,94,94,94,94,94,94,220,94),
     @(94,220,130,130,130,130,130,130,130,130,220,94),
     @(94,94,94,94,94,94,94,94,94,94,94,94),
-    @(0,234,234,234,234,234,234,234,234,234,234,0)   # Floor Shadow
+    @(0,234,234,234,234,234,234,234,234,234,234,0)   # Shadow
 )
 
-# World objects (X, Y coordinate matching map grid)
+# World objects (X, Y coordinates placed logically in rooms and alcoves)
 $sprites = @(
-    @{X = 3.5; Y = 3.5; Texture = "Enemy"; Dist = 0.0},
-    @{X = 8.5; Y = 1.5; Texture = "Chest"; Dist = 0.0},
-    @{X = 4.5; Y = 8.5; Texture = "Enemy"; Dist = 0.0}
+    @{X = 4.5; Y = 3.5; Texture = "Skeleton"; Dist = 0.0},
+    @{X = 10.5; Y = 1.5; Texture = "Adventurer"; Dist = 0.0}, 
+    @{X = 5.5; Y = 10.5; Texture = "Wraith"; Dist = 0.0},
+    @{X = 8.5; Y = 8.5; Texture = "Chest"; Dist = 0.0}
 )
 
 # --- PLAYER STATE ---
-$px = 1.5; $py = 1.5   # Player position (float)
-$pa = 0.0              # Player angle (radians)
-$fov = [math]::PI / 3  # 60 degrees Field of View
+$px = 1.5; $py = 1.5     # Position floats (Starts in the top-left room)
+$pa = 0.0                # Angle (radians)
+$fov = [math]::PI / 3    # 60-degree Field of View
+$hp = 100; $maxHp = 100  # Health pool
+$mp = 40; $maxMp = 50    # Mana pool
 
-# --- SCREEN CONFIG (Comfortably fits standard 30-line tall consoles without scrolling) ---
-$screenWidth = 80
-$screenHeight = 24     # Decreased to 24 characters to safely avoid scrolling jitter
+# --- SCREEN CONFIGURATION (Upgraded Viewport) ---
+$screenWidth = 100       # Upgraded, wider screen column count for high fidelity
+$screenHeight = 26       # Upgraded height size (52 virtual character rows)
+$virtualHeight = $screenHeight * 2
+$horizon = [int]($virtualHeight / 2)
 
-# --- RENDER BUFFER ---
-$buffer = New-Object System.Text.StringBuilder(12288)
+# --- OPTIMIZATION: CEILING & FLOOR PROJECTION LOOKUP TABLES ---
+# Pre-calculating vertical projection distances removes division from inner loops
+$ceilDistTable = New-Object "double[]" $horizon
+for ($y = 0; $y -lt $horizon; $y++) {
+    if ($horizon - $y -ne 0) {
+        $ceilDistTable[$y] = $virtualHeight / (2.0 * ($horizon - $y))
+    } else {
+        $ceilDistTable[$y] = 999.0
+    }
+}
+
+$floorDistTable = New-Object "double[]" $virtualHeight
+for ($y = $horizon; $y -lt $virtualHeight; $y++) {
+    if ($y - $horizon -ne 0) {
+        $floorDistTable[$y] = $virtualHeight / (2.0 * ($y - $horizon))
+    } else {
+        $floorDistTable[$y] = 999.0
+    }
+}
+
+# --- OPTIMIZATION: TRIGONOMETRIC LOOKUP TABLE ---
+# Fully pre-computes ray angles and projection ratios to maximize frame performance
+$angleOffsets = New-Object "double[]" $screenWidth
+$cosOffsets   = New-Object "double[]" $screenWidth
+$sinOffsets   = New-Object "double[]" $screenWidth
+
+for ($col = 0; $col -lt $screenWidth; $col++) {
+    $angleOffset = ($col / $screenWidth - 0.5) * $fov
+    $angleOffsets[$col] = $angleOffset
+    $cosOffsets[$col]   = [math]::Cos($angleOffset)
+    $sinOffsets[$col]   = [math]::Sin($angleOffset)
+}
+
+# --- SCREEN REDIRECTION CHECKS ---
+$canUseConsole = $false
+try {
+    if (-not [Console]::IsInputRedirected) {
+        $canUseConsole = $true
+    }
+} catch {}
+
+# --- RENDERING BUFFER & PRE-ALLOCATED ARRAYS ---
+$buffer = New-Object System.Text.StringBuilder(65536)
 $esc = [char]0x1b
+$fgFrame = New-Object "string[]" ($screenWidth * $screenHeight)
+$bgFrame = New-Object "string[]" ($screenWidth * $screenHeight)
+$zBuffer = New-Object "double[]" $screenWidth
 
-# --- HELPER FUNCTIONS ---
-function Get-MapCell($x, $y) {
-    $ix = [int][math]::Floor($x)
-    $iy = [int][math]::Floor($y)
-    if ($ix -lt 0 -or $ix -ge $mapWidth -or $iy -lt 0 -or $iy -ge $mapHeight) { return 1 }
-    return $map[$iy][$ix]
+# Pre-allocated shading arrays with a gentle, realistic fade-out to show wood textures at distance
+$beamShades = @(
+    130,130,130,130,130,130,95,95,95,95,52,52,52,52,52,238,238,236,236,235,235,234,234,233,233,232,232,232,232,232,232,232,232,232,232,232,232,232,232,232
+)
+
+# Pre-populate buffers to prevent null reference checks during frame construction
+for ($i = 0; $i -lt $fgFrame.Length; $i++) {
+    $fgFrame[$i] = "232"
+    $bgFrame[$i] = "232"
 }
 
-# Real-time depth shaded colors based on distance to player
-function Get-ShadedColor($color, $dist) {
-    $cVal = [int]$color
-    if ($dist -lt 2.0) { return $color }
-
-    # Stone Greys (240..250)
-    if ($cVal -ge 240 -and $cVal -le 250) {
-        $reduction = [int]($dist * 1.5)
-        $newColor = $cVal - $reduction
-        if ($newColor -lt 232) { return "232" }
-        return [string]$newColor
-    }
-    # Brick Red (124 / 196 / 88)
-    if ($cVal -eq 124 -or $cVal -eq 196 -or $cVal -eq 88) {
-        if ($dist -lt 4.0) { return "88" }
-        if ($dist -lt 7.0) { return "52" }
-        return "233"
-    }
-    # Gold Tones (220 / 172)
-    if ($cVal -eq 220 -or $cVal -eq 172) {
-        if ($dist -lt 4.0) { return "172" }
-        if ($dist -lt 7.0) { return "130" }
-        return "233"
-    }
-    # Brown Wood Tones (94 / 130 / 52)
-    if ($cVal -eq 94 -or $cVal -eq 130 -or $cVal -eq 52) {
-        if ($dist -lt 4.0) { return "94" }
-        if ($dist -lt 7.0) { return "52" }
-        return "233"
-    }
-    # Green Moss (34 / 28 / 22)
-    if ($cVal -eq 34 -or $cVal -eq 28 -or $cVal -eq 22) {
-        if ($dist -lt 4.0) { return "28" }
-        if ($dist -lt 7.0) { return "22" }
-        return "233"
-    }
-    # Dark shadow/crevice
-    if ($cVal -eq 235 -or $cVal -eq 237) {
-        if ($dist -lt 6.0) { return "233" }
-        return "232"
-    }
-
-    return $color
-}
-
-# Clean exits
+# Clean exits restoring cursor visibility safely
 function Exit-Demo {
-    try { [Console]::CursorVisible = $cursorVisible } catch {}
+    if ($hasConsole) {
+        try { [Console]::CursorVisible = $initialCursorState } catch {}
+    }
     Clear-Host
     Write-Host "Demo Terminated. Thanks for exploring the depths!" -ForegroundColor Green
-    Exit
+    exit
+}
+
+# Dynamic sliding-door and collision handler
+function Test-Walkable {
+    param([int]$tx, [int]$ty)
+    if ($tx -lt 0 -or $tx -ge $mapWidth -or $ty -lt 0 -or $ty -ge $mapHeight) {
+        return $false
+    }
+    $cell = $flatMap[$ty * $mapWidth + $tx]
+    if ($cell -eq 0) {
+        return $true
+    }
+    if ($cell -eq 2) {
+        $doorKey = "$tx,$ty"
+        if ($doorStates.ContainsKey($doorKey)) {
+            if ($doorStates[$doorKey].Ratio -ge 0.8) {
+                return $true # Door is open
+            }
+        }
+    }
+    return $false
 }
 
 # --- MAIN ENGINE LOOP ---
@@ -158,36 +256,159 @@ $clock = [System.Diagnostics.Stopwatch]::StartNew()
 $lastTime = $clock.ElapsedMilliseconds
 
 while ($running) {
-    # 1. TIMING & FPS CALCULATION
+    # 1. TIMING & ENGINE REGULATION
     $currentTime = $clock.ElapsedMilliseconds
     $elapsed = $currentTime - $lastTime
-    
-    # Target exactly 10 FPS (100ms per frame)
+
+    # Target exactly 10 FPS (100ms per frame) for steady, smooth execution
     if ($elapsed -lt 100) {
-        Start-Sleep -Milliseconds 10
+        Start-Sleep -Milliseconds 5
         continue
     }
     $lastTime = $currentTime
     $fps = [int](1000 / $elapsed)
 
-    # 2. KEYBOARD INPUT (Real-time, Non-blocking, Drained Buffer)
-    if ([Console]::KeyAvailable) {
-        $key = [Console]::ReadKey($true).Key
-        $moveStep = 0.16
-        $rotStep = 0.08  # Smoother turning rate
+    # Calculate real-time flickering factor for dungeon torches
+    $flicker = 1.0 + [math]::Sin($currentTime / 180.0) * 0.08 + ( (Get-Random -Min 0 -Max 100) / 1000.0 - 0.05 )
 
-        switch ($key) {
+    # Tick animated doors open or closed
+    foreach ($key in $doorStates.Keys) {
+        $door = $doorStates[$key]
+        if ($door.State -eq "Opening") {
+            $door.Ratio += 0.2
+            if ($door.Ratio -ge 1.0) {
+                $door.Ratio = 1.0
+                $door.State = "Open"
+            }
+        } elseif ($door.State -eq "Closing") {
+            # ANTI-STUCK PROTECTOR: Force door back open if player is standing on it!
+            $coords = $key -split ","
+            $doorX = [int]$coords[0]
+            $doorY = [int]$coords[1]
+            $pDistToDoorCenter = [math]::Sqrt(($doorX + 0.5 - $px)*($doorX + 0.5 - $px) + ($doorY + 0.5 - $py)*($doorY + 0.5 - $py))
+            if ($pDistToDoorCenter -lt 0.7) {
+                $door.State = "Opening"
+            } else {
+                $door.Ratio -= 0.2
+                if ($door.Ratio -le 0.0) {
+                    $door.Ratio = 0.0
+                    $door.State = "Closed"
+                }
+            }
+        }
+    }
+
+    # Detect if player is near any interactive sliding door (within smaller 1.1 units radius)
+    $nearDoor = $false
+    $nearDoorX = 0
+    $nearDoorY = 0
+    for ($dy = -1; $dy -le 1; $dy++) {
+        for ($dx = -1; $dx -le 1; $dx++) {
+            $tx = [int][math]::Floor($px) + $dx
+            $ty = [int][math]::Floor($py) + $dy
+            if ($tx -ge 0 -and $tx -lt $mapWidth -and $ty -ge 0 -and $ty -lt $mapHeight) {
+                if ($flatMap[$ty * $mapWidth + $tx] -eq 2) {
+                    $distToDoor = [math]::Sqrt(($tx + 0.5 - $px)*($tx + 0.5 - $px) + ($ty + 0.5 - $py)*($ty + 0.5 - $py))
+                    if ($distToDoor -lt 1.1) { # Reduced interaction radius
+                        $nearDoor = $true
+                        $nearDoorX = $tx
+                        $nearDoorY = $ty
+                    }
+                }
+            }
+        }
+    }
+
+    # 2. KEYBOARD INPUT (Non-blocking, Redirection-Safe)
+    $keyAvailable = $false
+    if ($canUseConsole) {
+        try {
+            if ([Console]::KeyAvailable) { $keyAvailable = $true }
+        } catch {
+            $canUseConsole = $false
+        }
+    }
+    if (-not $keyAvailable) {
+        try {
+            if ($Host.UI.RawUI.KeyAvailable) { $keyAvailable = $true }
+        } catch {}
+    }
+
+    if ($keyAvailable) {
+        $keyChar = ""
+        if ($canUseConsole) {
+            try {
+                $keyChar = [Console]::ReadKey($true).Key.ToString()
+            } catch {}
+        } else {
+            try {
+                $rawKey = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").VirtualKeyCode
+                $keyChar = switch($rawKey) {
+                    38 { "W" }
+                    40 { "S" }
+                    37 { "A" }
+                    39 { "D" }
+                    27 { "Escape" }
+                    default { [char]$rawKey }
+                }
+            } catch {}
+        }
+
+        # Optimized movement: Slowed down by 20% from original spec to increase accuracy and precision
+        $moveStep = 0.2133 
+        $rotStep  = 0.1257  # Snappy, increased by 15% from 0.1093
+
+        switch ($keyChar) {
             "W" {
                 $nx = $px + [math]::Cos($pa) * $moveStep
                 $ny = $py + [math]::Sin($pa) * $moveStep
-                if ((Get-MapCell $nx $py) -eq 0) { $px = $nx }
-                if ((Get-MapCell $px $ny) -eq 0) { $py = $ny }
+
+                # Sliding collision detection with standard 0.25 player radius
+                $radius = 0.25
+                $offsetEndX = $radius
+                if ($nx -le $px) { $offsetEndX = -$radius }
+                $offsetEndY = $radius
+                if ($ny -le $py) { $offsetEndY = -$radius }
+
+                $checkX = $nx + $offsetEndX
+                $checkY = $ny + $offsetEndY
+
+                $intCheckX = [int][math]::Floor($checkX)
+                $intPy = [int][math]::Floor($py)
+                $intCheckY = [int][math]::Floor($checkY)
+                $intPx = [int][math]::Floor($px)
+
+                if (Test-Walkable -tx $intCheckX -ty $intPy) {
+                    $px = $nx
+                }
+                if (Test-Walkable -tx $intPx -ty $intCheckY) {
+                    $py = $ny
+                }
             }
             "S" {
                 $nx = $px - [math]::Cos($pa) * $moveStep
                 $ny = $py - [math]::Sin($pa) * $moveStep
-                if ((Get-MapCell $nx $py) -eq 0) { $px = $nx }
-                if ((Get-MapCell $px $ny) -eq 0) { $py = $ny }
+
+                $radius = 0.25
+                $offsetEndX = -$radius
+                if ($nx -le $px) { $offsetEndX = $radius }
+                $offsetEndY = -$radius
+                if ($ny -le $py) { $offsetEndY = $radius }
+
+                $checkX = $nx + $offsetEndX
+                $checkY = $ny + $offsetEndY
+
+                $intCheckX = [int][math]::Floor($checkX)
+                $intPy = [int][math]::Floor($py)
+                $intCheckY = [int][math]::Floor($checkY)
+                $intPx = [int][math]::Floor($px)
+
+                if (Test-Walkable -tx $intCheckX -ty $intPy) {
+                    $px = $nx
+                }
+                if (Test-Walkable -tx $intPx -ty $intCheckY) {
+                    $py = $ny
+                }
             }
             "A" {
                 $pa -= $rotStep
@@ -197,61 +418,92 @@ while ($running) {
                 $pa += $rotStep
                 if ($pa -gt [math]::PI * 2) { $pa -= [math]::PI * 2 }
             }
+            "E" {
+                if ($nearDoor) {
+                    $doorKey = "$nearDoorX,$nearDoorY"
+                    if ($doorStates.ContainsKey($doorKey)) {
+                        $dState = $doorStates[$doorKey]
+                        if ($dState.State -eq "Closed" -or $dState.State -eq "Closing") {
+                            $dState.State = "Opening"
+                        } else {
+                            $dState.State = "Closing"
+                        }
+                    }
+                }
+            }
             "Escape" {
                 $running = $false
             }
         }
 
-        # DRAIN REMAINDER OF BUFFER: Prevents character continuing to spin/glide!
-        while ([Console]::KeyAvailable) {
-            [Console]::ReadKey($true) | Out-Null
+        # DRAIN INPUT BUFFER: Prevents sliding or runaway camera spins
+        if ($canUseConsole) {
+            while ($true) {
+                $avail = $false
+                try { if ([Console]::KeyAvailable) { $avail = $true } } catch {}
+                if (-not $avail) { break }
+                try { [Console]::ReadKey($true) | Out-Null } catch {}
+            }
+        } else {
+            while ($true) {
+                $avail = $false
+                try { if ($Host.UI.RawUI.KeyAvailable) { $avail = $true } } catch {}
+                if (-not $avail) { break }
+                try { [void]$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") } catch {}
+            }
         }
     }
 
-    # 3. BUILD FRAME BUFFER
+    # 3. GAME ENVIRONMENT CONTROLLERS
+    # Re-calculate sprite depths
+    foreach ($s in $sprites) {
+        $s.Dist = [math]::Sqrt(($s.X - $px) * ($s.X - $px) + ($s.Y - $py) * ($s.Y - $py))
+    }
+
+    # Skeleton proximity damage on crypt floor
+    $skelDist = $sprites[0].Dist
+    if ($skelDist -lt 1.3 -and $hp -gt 0) {
+        $hp = [math]::Max($hp - 4, 0)
+    } elseif ($hp -lt $maxHp -and (Get-Random -Max 10) -lt 1) {
+        $hp = [math]::Min($hp + 1, $maxHp)
+    }
+
+    # 4. ENGINE RENDERING (Double-Buffered Frame Builder)
     $buffer.Clear() | Out-Null
-    
-    # Stable double-buffering home position: teleport cursor back to top-left via .NET
-    # This prevents scrolling artifacts completely when viewport + HUD matches window size
-    try {
-        [Console]::SetCursorPosition(0, 0)
-    } catch {
+
+    # Re-position cursor safely
+    if ($hasConsole) {
+        try {
+            [Console]::SetCursorPosition(0, 0)
+        } catch {
+            [void]$buffer.Append("$esc[H")
+        }
+    } else {
         [void]$buffer.Append("$esc[H")
     }
 
-    # Double vertical resolution grid
-    # Height of character grid is $screenHeight, but using half-blocks, 
-    # we represent $screenHeight * 2 virtual vertical rows.
-    $virtualHeight = $screenHeight * 2
+    $sinPA = [math]::Sin($pa)
+    $cosPA = [math]::Cos($pa)
 
-    # Frame state (color matrices for half-blocks)
-    # Foreground = Top half, Background = Bottom half of character
-    $fgFrame = New-Object "string[]" ($screenWidth * $screenHeight)
-    $bgFrame = New-Object "string[]" ($screenWidth * $screenHeight)
-
-    # Set up Z-Buffer array to track vertical ray depth for sprite occlusion
-    $zBuffer = New-Object "double[]" $screenWidth
-
-    # --- RAYCASTING WALLS WITH PROCEDURAL CLEAN STONE BRICK TEXTURING ---
+    # --- DDA WALL CASTING LOOP ---
     for ($col = 0; $col -lt $screenWidth; $col++) {
-        # Calculate ray angle across FOV
-        $rayAngle = ($pa - $fov / 2) + ($col / $screenWidth) * $fov
+        $cosOff = $cosOffsets[$col]
+        $sinOff = $sinOffsets[$col]
 
-        # DDA Setup
-        $sinA = [math]::Sin($rayAngle)
-        $cosA = [math]::Cos($rayAngle)
+        $sinA = $sinPA * $cosOff + $cosPA * $sinOff
+        $cosA = $cosPA * $cosOff - $sinPA * $sinOff
 
-        # Delta distances
-        $deltaDistX = if ($cosA -eq 0) { 1e30 } else { [math]::Abs(1 / $cosA) }
-        $deltaDistY = if ($sinA -eq 0) { 1e30 } else { [math]::Abs(1 / $sinA) }
+        $deltaDistX = 1e30
+        if ($cosA -ne 0) { $deltaDistX = [math]::Abs(1 / $cosA) }
 
-        # Initial ray step directions and side distances
+        $deltaDistY = 1e30
+        if ($sinA -ne 0) { $deltaDistY = [math]::Abs(1 / $sinA) }
+
         $mapX = [int][math]::Floor($px)
         $mapY = [int][math]::Floor($py)
 
         $sideDistX = 0.0
         $sideDistY = 0.0
-
         $stepX = 0
         $stepY = 0
 
@@ -271,11 +523,11 @@ while ($running) {
             $sideDistY = (($mapY + 1.0) - $py) * $deltaDistY
         }
 
-        # Perform DDA
         $hit = $false
-        $side = 0 # 0 for X-axis hit, 1 for Y-axis hit
-        $maxDepth = 16.0
+        $side = 0 
+        $maxDepth = 24.0 
         $dist = 0.0
+        $hitCellType = 0 # 1=Wall, 2=Door
 
         while (-not $hit) {
             if ($sideDistX -lt $sideDistY) {
@@ -288,247 +540,421 @@ while ($running) {
                 $side = 1
             }
 
-            # Out of bounds check
             if ($mapX -lt 0 -or $mapX -ge $mapWidth -or $mapY -lt 0 -or $mapY -ge $mapHeight) {
                 $dist = $maxDepth
                 break
             }
 
-            # Wall hit
-            if ($map[$mapY][$mapX] -eq 1) {
-                $hit = $true
-                # Calculate distance projected on camera direction (prevents fisheye)
-                if ($side -eq 0) {
-                    $dist = $sideDistX - $deltaDistX
+            $cellVal = $flatMap[$mapY * $mapWidth + $mapX]
+            if ($cellVal -eq 1 -or $cellVal -eq 2) {
+                if ($cellVal -eq 2) {
+                    # --- HORIZONTAL SLIDING DOOR MECHANISM ---
+                    $doorKey = "$mapX,$mapY"
+                    $ratio = 0.0
+                    if ($doorStates.ContainsKey($doorKey)) {
+                        $ratio = $doorStates[$doorKey].Ratio
+                    }
+
+                    if ($ratio -lt 1.0) {
+                        # Determine intersection offset along the door panel
+                        if ($side -eq 0) {
+                            $wallX = $py + ($sideDistX - $deltaDistX) * $sinA
+                        } else {
+                            $wallX = $px + ($sideDistY - $deltaDistY) * $cosA
+                        }
+                        $wallX = $wallX % 1.0
+
+                        # If the ray hits the closed part of the sliding door
+                        if ($wallX -ge $ratio) {
+                            $hit = $true
+                            $hitCellType = 2
+                            if ($side -eq 0) { $dist = $sideDistX - $deltaDistX } else { $dist = $sideDistY - $deltaDistY }
+                        }
+                    }
                 } else {
-                    $dist = $sideDistY - $deltaDistY
+                    # Solid Wall Hit
+                    $hit = $true
+                    $hitCellType = 1
+                    if ($side -eq 0) { $dist = $sideDistX - $deltaDistX } else { $dist = $sideDistY - $deltaDistY }
                 }
             }
         }
 
-        # Correct distance for fisheye
-        $correctAngle = $rayAngle - $pa
-        while ($correctAngle -lt -[math]::PI) { $correctAngle += [math]::PI * 2 }
-        while ($correctAngle -gt [math]::PI) { $correctAngle -= [math]::PI * 2 }
-        $dist *= [math]::Cos($correctAngle)
+        # Fish-eye angle offset subtraction
+        $dist *= $cosOff
         if ($dist -lt 0.1) { $dist = 0.1 }
 
-        # Save depth in Z-Buffer for occlusion calculations
         $zBuffer[$col] = $dist
 
-        # Project wall height
+        # Compute wall coordinate projections
         $wallHeight = [int]($virtualHeight / $dist)
-        $wallStart = [int](($virtualHeight - $wallHeight) / 2)
-        $wallEnd = $wallStart + $wallHeight
+        $wallStart  = [int](($virtualHeight - $wallHeight) / 2)
+        $wallEnd    = $wallStart + $wallHeight
 
-        # Clamp values
         if ($wallStart -lt 0) { $wallStart = 0 }
         if ($wallEnd -ge $virtualHeight) { $wallEnd = $virtualHeight - 1 }
 
-        # Calculate exact fractional coordinate where wall was hit
-        if ($side -eq 0) {
-            $wallX = $py + $dist * $sinA
-        } else {
-            $wallX = $px + $dist * $cosA
-        }
-        $wallX -= [math]::Floor($wallX)
+        if ($side -eq 0) { $wallX = $py + $dist * $sinA } else { $wallX = $px + $dist * $cosA }
+        $wallX = $wallX % 1.0
 
-        # Map to horizontal texture coordinate on a 16px wide texture grid
-        $texX = [int]($wallX * 16)
+        $texX = [int]($wallX * 32)
         if ($texX -lt 0) { $texX = 0 }
-        if ($texX -gt 15) { $texX = 15 }
+        if ($texX -gt 31) { $texX = 31 }
 
-        # Populate vertical column slice in our virtual row grid
+        $hasTorch = (($mapX + $mapY) % 2 -eq 0 -and $hitCellType -eq 1)
+
+        $isBottomHalf = $false
+        $frameIdx = $col
+
+        # Render slice column
         for ($y = 0; $y -lt $virtualHeight; $y++) {
-            # Find which character row and sub-block half this virtual row maps to
-            $charRow = [math]::Floor($y / 2)
-            $isBottomHalf = (($y % 2) -eq 1)
-            $frameIdx = $charRow * $screenWidth + $col
+            $pixelColor = 232
 
-            # Default colors: sky is pitch black (232), floor is dark stone (233)
-            $pixelColor = if ($y -lt [math]::Floor($virtualHeight / 2)) { "232" } else { "233" }
-
-            # Draw textured walls
             if ($y -ge $wallStart -and $y -le $wallEnd) {
-                # Determine vertical texture coordinate on a 16px high texture grid
                 $wallHeightVal = ($wallEnd - $wallStart)
                 if ($wallHeightVal -le 0) { $wallHeightVal = 1 }
                 $texY = [int]((($y - $wallStart) / $wallHeightVal) * 16)
                 if ($texY -lt 0) { $texY = 0 }
                 if ($texY -gt 15) { $texY = 15 }
 
-                # CLEAN OFFSET RUNNING BOND STONE BRICK TEXTURE
-                # Horizontal mortar lines are at texY 0 and 8.
-                # Vertical mortar lines offset on alternating row tiers:
-                # - Top tier (0..7): vertical joints at texX 0.
-                # - Bottom tier (8..15): vertical joints at texX 8.
-                $isMortar = ($texY % 8 -eq 0) -or (($texY -lt 8) -and ($texX -eq 0)) -or (($texY -ge 8) -and ($texX -eq 8))
-
-                if ($side -eq 0) {
-                    # RED BRICK OR GRAY MORTAR (X-Hit: running N-S)
-                    if ($isMortar) {
-                        $pixelColor = "235" # Dark mortar grooves
-                    } else {
-                        # Standard grey brick with highlight edges and subtle shading
-                        if ($texX -eq 1 -or $texY -eq 1 -or $texY -eq 9) {
-                            $pixelColor = "250" # Top-left light reflection highlight
-                        } elseif (($texX * $texY) % 7 -eq 0) {
-                            $pixelColor = "240" # Shaded stone variation
+                if ($hitCellType -eq 2) {
+                    # --- STONE FLANKED WOODEN PLANK DOOR TEXTURE ---
+                    # Columns 0-7 (Left 25%) and Columns 24-31 (Right 25%) are solid stone bricks.
+                    # Columns 8-23 (Middle 50%) is the actual wooden door.
+                    if ($texX -lt 8 -or $texX -ge 24) {
+                        # Solid stone flank
+                        $brickRow = [math]::Floor($texY / 8)
+                        $isMortarY = ($texY % 8 -eq 0)
+                        $isMortarX = ($brickRow % 2 -eq 0 -and ($texX -eq 0 -or $texX -eq 16)) -or ($brickRow % 2 -eq 1 -and ($texX -eq 8 -or $texX -eq 24))
+                        $isMortar = $isMortarY -or $isMortarX
+                        if ($isMortar) {
+                            $pixelColor = 235 # Dark mortar
                         } else {
-                            $pixelColor = "244" # Standard stone grey
+                            $pixelColor = 244 # Slate grey stone
+                        }
+                    } else {
+                        # Wooden door panel
+                        if ($texY -le 1 -or $texY -ge 14) {
+                            $pixelColor = 237 # Iron strap plates
+                        } elseif ($texX -eq 8 -or $texX -eq 16 -or $texX -eq 23) {
+                            $pixelColor = 233 # Plank gaps
+                        } elseif ($texX -ge 14 -and $texX -le 17 -and $texY -ge 7 -and $texY -le 9) {
+                            # Gold door pull handle in center of panel
+                            if ($texY -eq 8 -and $texX -ge 15 -and $texX -le 16) {
+                                $pixelColor = 233 # Handle core hole
+                            } else {
+                                $pixelColor = 220 # Gold ring
+                            }
+                        } else {
+                            $pixelColor = 130 # Oak timber wood paneling
                         }
                     }
                 } else {
-                    # MOSSY BRICK OR MOSSY JOINTS (Y-Hit: running E-W)
-                    if ($isMortar) {
-                        $pixelColor = "28"  # Green moss growing in mortar cracks!
-                    } else {
-                        # Moss patches on stone
-                        if (($texX + $texY) % 5 -eq 0) {
-                            $pixelColor = "34" # Green moss patches on stone face
-                        } elseif ($texX -eq 1 -or $texY -eq 1 -or $texY -eq 9) {
-                            $pixelColor = "246" # Standard highlight
+                    # --- STANDARD STONE BRICK WALLS ---
+                    $brickRow = [math]::Floor($texY / 8)
+                    $isMortarY = ($texY % 8 -eq 0)
+                    $isMortarX = ($brickRow % 2 -eq 0 -and ($texX -eq 0 -or $texX -eq 16)) -or ($brickRow % 2 -eq 1 -and ($texX -eq 8 -or $texX -eq 24))
+                    $isMortar = $isMortarY -or $isMortarX
+
+                    if ($hasTorch -and $texX -ge 14 -and $texX -le 17 -and $texY -ge 3 -and $texY -le 7) {
+                        # --- FLICKERING TORCHES ---
+                        if ($texY -eq 3) {
+                            $frame = [math]::Floor($currentTime / 150) % 3
+                            if ($frame -eq 0) { $pixelColor = 226 }
+                            elseif ($frame -eq 1) { $pixelColor = 208 }
+                            else { $pixelColor = 196 }
+                        } elseif ($texY -eq 4) {
+                            $pixelColor = 202
                         } else {
-                            $pixelColor = "242" # Darker stone base
+                            $pixelColor = 238
+                        }
+                    } else {
+                        if ($side -eq 0) {
+                            if ($isMortar) { $pixelColor = 235 }
+                            else {
+                                if ($texX -eq 1 -or $texY -eq 1 -or $texY -eq 9) { $pixelColor = 250 }
+                                elseif (($texX * $texY) % 7 -eq 0) { $pixelColor = 240 }
+                                else { $pixelColor = 244 }
+                            }
+                        } else {
+                            if ($isMortar) { $pixelColor = 235 }
+                            else {
+                                if (($texX + $texY) % 5 -eq 0) { $pixelColor = 238 }
+                                elseif ($texX -eq 1 -or $texY -eq 1 -or $texY -eq 9) { $pixelColor = 246 }
+                                else { $pixelColor = 242 }
+                            }
                         }
                     }
                 }
 
-                # Apply distance-based depth shading
-                $pixelColor = Get-ShadedColor $pixelColor $dist
+                # --- DYNAMIC WALL ILLUMINATION ---
+                $lightGlow = 0
+                if ($hasTorch) {
+                    $verticalDist = [math]::Abs($y - $horizon) / $horizon
+                    $lightGlow = [int](5.0 * (1.0 - $verticalDist) * $flicker / [math]::Sqrt($dist))
+                }
+
+                $shade = [int]$dist
+                if ($hitCellType -eq 2) {
+                    $shade = [int]($dist * 1.3)
+                }
+                $shade = [int]($shade - $lightGlow)
+                if ($shade -lt 0) { $shade = 0 }
+
+                # Apply fast wall shading subtraction inline
+                if ($pixelColor -ge 232) {
+                    $shadedVal = $pixelColor - $shade
+                    if ($shadedVal -lt 232) { $pixelColor = 232 } else { $pixelColor = $shadedVal }
+                }
+            }
+            # --- CEILING (Arena Style horizontal timber beams & black void) ---
+            elseif ($y -lt $horizon) {
+                $ceilDist = $ceilDistTable[$y]
+                $realCeilDist = $ceilDist / $cosOff
+                $ceilX = $px + $realCeilDist * $cosA
+                $ceilY = $py + $realCeilDist * $sinA
+
+                # Horizontal wood support beams only (thinner 0.04 thickness)
+                $ceilYFrac = $ceilY % 1.5
+
+                if ($ceilYFrac -lt 0.04) {
+                    $pixelColor = 130 # Warm support wood
+                } else {
+                    $pixelColor = 232 # Deep dark void
+                }
+
+                $cShade = [int]($ceilDist * 1.2)
+                if ($hasTorch) {
+                    $cGlow = [int](3.0 * $flicker / ($realCeilDist + 0.5))
+                    $cShade = [int]($cShade - $cGlow)
+                }
+                if ($cShade -lt 0) { $cShade = 0 }
+
+                $maxShadeIdx = $beamShades.Length - 1
+                if ($cShade -gt $maxShadeIdx) { $cShade = $maxShadeIdx }
+
+                if ($pixelColor -eq 130) {
+                    $pixelColor = $beamShades[$cShade]
+                } else {
+                    $pixelColor = 232
+                }
+            }
+            # --- FLOOR (Detailed Stone Paving & Grout) ---
+            else {
+                $floorDist = $floorDistTable[$y]
+                $realFloorDist = $floorDist / $cosOff
+                $floorX = $px + $realFloorDist * $cosA
+                $floorY = $py + $realFloorDist * $sinA
+
+                $floorXFrac = $floorX % 1.0
+                $floorYFrac = $floorY % 1.0
+
+                $isGrout = ($floorXFrac -lt 0.06 -or $floorXFrac -gt 0.94) -or ($floorYFrac -lt 0.06 -or $floorYFrac -gt 0.94)
+
+                if ($isGrout) {
+                    $pixelColor = 232
+                } else {
+                    $tileX = [int][math]::Floor($floorX)
+                    $tileY = [int][math]::Floor($floorY)
+                    if (($tileX + $tileY) % 2 -eq 0) { 
+                        $pixelColor = 237 # Slate Grey
+                    } else {
+                        $pixelColor = 234 # Dark Slate
+                    }
+                }
+
+                $fShade = [int]($floorDist * 1.4)
+                if ($hasTorch) {
+                    $fGlow = [int](3.0 * $flicker / ($realFloorDist + 0.5))
+                    $fShade = [int]($fShade - $fGlow)
+                }
+                if ($fShade -lt 0) { $fShade = 0 }
+
+                $shadedVal = $pixelColor - $fShade
+                if ($shadedVal -lt 232) { $pixelColor = 232 } else { $pixelColor = $shadedVal }
             }
 
-            # Map the virtual pixel into the half-block matrices
-            if ($isBottomHalf) {
-                $bgFrame[$frameIdx] = $pixelColor
-            } else {
-                $fgFrame[$frameIdx] = $pixelColor
+            # Safety bounds check prevents IndexOutOfRangeException
+            if ($isBottomHalf) { 
+                if ($frameIdx -ge 0 -and $frameIdx -lt $bgFrame.Length) {
+                    $bgFrame[$frameIdx] = [string]$pixelColor 
+                }
+                $frameIdx += $screenWidth
+            } else { 
+                if ($frameIdx -ge 0 -and $frameIdx -lt $fgFrame.Length) {
+                    $fgFrame[$frameIdx] = [string]$pixelColor 
+                }
             }
+
+            $isBottomHalf = -not $isBottomHalf
         }
     }
 
-    # --- RENDER SPRITES USING PAINTER'S ALGORITHM, FLOOR ANCHORING, & PROPER SCALING ---
-    # Update sprite distances relative to player's current coordinate
-    foreach ($s in $sprites) {
-        $s.Dist = [math]::Sqrt(($s.X - $px) * ($s.X - $px) + ($s.Y - $py) * ($s.Y - $py))
+    # --- OPTIMIZED SPRITE RENDERER (Fast Manual Insertion Sort) ---
+    for ($i = 1; $i -lt $sprites.Count; $i++) {
+        $key = $sprites[$i]
+        $j = $i - 1
+        while ($j -ge 0 -and $sprites[$j].Dist -lt $key.Dist) {
+            $sprites[$j + 1] = $sprites[$j]
+            $j = $j - 1
+        }
+        $sprites[$j + 1] = $key
     }
 
-    # Sort sprites by distance descending (render furthest first)
-    $sortedSprites = @($sprites | Sort-Object Dist -Descending)
-
-    foreach ($s in $sortedSprites) {
+    foreach ($s in $sprites) {
         $spriteX = $s.X - $px
         $spriteY = $s.Y - $py
 
-        # Translate sprite angle relative to player FOV
         $spriteAngle = [math]::Atan2($spriteY, $spriteX) - $pa
         while ($spriteAngle -lt -[math]::PI) { $spriteAngle += [math]::PI * 2 }
         while ($spriteAngle -gt [math]::PI) { $spriteAngle -= [math]::PI * 2 }
 
         $sDist = $s.Dist
-        if ($sDist -lt 0.25) { continue } # Clip objects that are too close
-
-        # Skip rendering if completely behind player viewpoint
+        if ($sDist -lt 0.25) { continue }
         if ([math]::Cos($spriteAngle) -lt 0) { continue }
 
-        # Projected screen center column coordinate
         $spriteScreenX = [int](($screenWidth / 2) * (1 + $spriteAngle / ($fov / 2)))
 
-        # PROPER INDIVIDUAL SCALING: Chest (0.4 scale) vs. Enemy (0.75 scale)
-        $scaleX = if ($s.Texture -eq "Chest") { 0.45 } else { 0.75 }
-        $scaleY = if ($s.Texture -eq "Chest") { 0.45 } else { 0.75 }
+        $scaleX = 0.75
+        if ($s.Texture -eq "Chest") { $scaleX = 0.45 }
+        $scaleY = 0.75
+        if ($s.Texture -eq "Chest") { $scaleY = 0.45 }
 
         $spriteSizeX = [int]($screenWidth / $sDist * $scaleX)
         $spriteSizeY = [int]($virtualHeight / $sDist * $scaleY)
         if ($spriteSizeX -le 0 -or $spriteSizeY -le 0) { continue }
 
-        # FLOOR ANCHORING MATHEMATICS:
-        # Align bottom of sprite perfectly with wall bottoms instead of letting them float!
-        # Horizon is at virtualHeight / 2. Projected floor bottom at this distance is:
         $floorY = [int]($virtualHeight / 2 + ($virtualHeight / (2 * $sDist)))
-
         $drawEndY = $floorY
         $drawStartY = $floorY - $spriteSizeY
 
-        # Clamp vertical boundaries safely
         if ($drawStartY -lt 0) { $drawStartY = 0 }
         if ($drawEndY -ge $virtualHeight) { $drawEndY = $virtualHeight - 1 }
 
-        # Horizontal column boundaries
         $drawStartX = [int]($spriteScreenX - $spriteSizeX / 2)
-        $drawEndX = [int]($spriteScreenX + $spriteSizeX / 2)
+        $drawEndX   = [int]($spriteScreenX + $spriteSizeX / 2)
+
         if ($drawStartX -lt 0) { $drawStartX = 0 }
         if ($drawEndX -ge $screenWidth) { $drawEndX = $screenWidth - 1 }
 
-        $tex = if ($s.Texture -eq "Enemy") { $enemyTex } else { $chestTex }
-        $texSize = 12 # Native matrix width/height is 12x12
+        $tex = switch ($s.Texture) {
+            "Skeleton"   { $skeletonTex }
+            "Wraith"     { $wraithTex }
+            "Adventurer" { $adventurerTex }
+            default      { $chestTex }
+        }
+        $texSize = 12
+        $sShade = [int]($sDist * 1.5)
 
-        # Draw vertical projection stripes
         for ($stripe = $drawStartX; $stripe -le $drawEndX; $stripe++) {
-            # Check Z-Buffer (only draw if not occluded by a closer wall)
             if ($sDist -lt $zBuffer[$stripe]) {
-                # Calculate horizontal texture mapping
-                $spriteWidthVal = ($drawEndX - $drawStartX)
-                if ($spriteWidthVal -le 0) { $spriteWidthVal = 1 }
-                $texX = [int]((($stripe - $drawStartX) / $spriteWidthVal) * $texSize)
+                $widthVal = ($drawEndX - $drawStartX)
+                if ($widthVal -le 0) { $widthVal = 1 }
+                $texX = [int]((($stripe - $drawStartX) / $widthVal) * $texSize)
                 if ($texX -lt 0) { $texX = 0 }
                 if ($texX -ge $texSize) { $texX = $texSize - 1 }
 
+                $startY = $drawStartY
+                $startCharRow = $startY -shr 1
+                $startIsBottomHalf = (($startY -band 1) -ne 0)
+                $frameIdx = $startCharRow * $screenWidth + $stripe
+
+                $isBottomHalf = $startIsBottomHalf
+
                 for ($y = $drawStartY; $y -le $drawEndY; $y++) {
-                    $spriteHeightVal = ($drawEndY - $drawStartY)
-                    if ($spriteHeightVal -le 0) { $spriteHeightVal = 1 }
-                    $texY = [int]((($y - $drawStartY) / $spriteHeightVal) * $texSize)
+                    $heightVal = ($drawEndY - $drawStartY)
+                    if ($heightVal -le 0) { $heightVal = 1 }
+                    $texY = [int]((($y - $drawStartY) / $heightVal) * $texSize)
                     if ($texY -lt 0) { $texY = 0 }
                     if ($texY -ge $texSize) { $texY = $texSize - 1 }
 
                     $color = $tex[$texY][$texX]
-                    if ($color -eq 0) { continue } # Suppress transparent pixels
+                    if ($color -ne 0) {
+                        # Apply fast inline sprite shading
+                        if ($color -ge 232) {
+                            $shadedVal = $color - $sShade
+                            if ($shadedVal -lt 232) { $color = 232 } else { $color = $shadedVal }
+                        }
 
-                    # Apply distance depth shading to sprite colors
-                    $color = Get-ShadedColor $color $sDist
-
-                    $charRow = [math]::Floor($y / 2)
-                    $isBottomHalf = (($y % 2) -eq 1)
-                    $frameIdx = $charRow * $screenWidth + $stripe
+                        # Safety bounds check prevents out-of-bounds array faults
+                        if ($isBottomHalf) { 
+                            if ($frameIdx -ge 0 -and $frameIdx -lt $bgFrame.Length) {
+                                $bgFrame[$frameIdx] = [string]$color 
+                            }
+                        } else { 
+                            if ($frameIdx -ge 0 -and $frameIdx -lt $fgFrame.Length) {
+                                $fgFrame[$frameIdx] = [string]$color 
+                            }
+                        }
+                    }
 
                     if ($isBottomHalf) {
-                        $bgFrame[$frameIdx] = $color
-                    } else {
-                        $fgFrame[$frameIdx] = $color
+                        $frameIdx += $screenWidth
                     }
+                    $isBottomHalf = -not $isBottomHalf
                 }
             }
         }
     }
 
-    # 4. PARSE TO BUFFER WITH ANSI COLOR OPTIMIZATION
+    # 5. STRING ASSEMBLY & FLUSH (With Run-Length Color Compression)
     $lastFg = ""
     $lastBg = ""
     for ($charRow = 0; $charRow -lt $screenHeight; $charRow++) {
+        $lineBuffer = New-Object System.Text.StringBuilder(1024)
         for ($col = 0; $col -lt $screenWidth; $col++) {
             $frameIdx = $charRow * $screenWidth + $col
             $fg = $fgFrame[$frameIdx]
             $bg = $bgFrame[$frameIdx]
 
-            # Only append color switch sequence if state changes
+            # Only append escape codes when a color actually changes (reduces write overhead by ~80%)
             if ($fg -ne $lastFg -or $bg -ne $lastBg) {
                 $lastFg = $fg
                 $lastBg = $bg
-                [void]$buffer.Append("$esc[38;5;${fg};48;5;${bg}m")
+                [void]$lineBuffer.Append("$esc[38;5;${fg};48;5;${bg}m")
             }
-            [void]$buffer.Append([char]0x2580) # Half block character
+            [void]$lineBuffer.Append([char]::Parse("▀")) # Safer Unicode character parse
         }
         $lastFg = ""
         $lastBg = ""
-        [void]$buffer.Append("$esc[0m`n")
+        [void]$buffer.Append($lineBuffer.ToString()).Append("$esc[0m`n")
     }
 
-    # 5. RENDER HUD
-    [void]$buffer.Append("$esc[1;33m POSITION: X=$([math]::Round($px, 2)), Y=$([math]::Round($py, 2))  ANGLE: $([math]::Round($pa, 2)) rad`n")
-    [void]$buffer.Append(" RENDER ENGINE: DDA Raycaster (Textured)  FPS: $fps  VIEWPORT: $($screenWidth)x$($screenHeight)`n")
-    [void]$buffer.Append(" CONTROLS: [W/S] Forward/Back  [A/D] Rotate  [ESC] Exit demo`n$esc[0m")
+    # 6. RENDER SOLID COLORS HEALTH & MANA PROGRESS BARS
+    # HP Bar Construction (Transitioning Green -> Yellow -> Red)
+    $hpPct = $hp / $maxHp
+    $hpBars = [int][math]::Max([int]($hpPct * 15), 0)
+    if ($hpBars -gt 15) { $hpBars = 15 }
+    $hpColor = "38;5;46;48;5;46" # Solid Green (Both FG & BG to render filled block)
+    if ($hpPct -le 0.5) {
+        if ($hpPct -le 0.25) { $hpColor = "38;5;196;48;5;196" } # Solid Red
+        else { $hpColor = "38;5;226;48;5;226" } # Solid Yellow
+    }
+    # Direct string replication prevents math operation casting issues on Char
+    $hpActiveStr = New-Object string ([char]'█', $hpBars)
+    $hpInactiveStr = New-Object string ([char]'█', (15 - $hpBars))
+    $hpBarStr = "$esc[${hpColor}m${hpActiveStr}$esc[38;5;236;48;5;236m${hpInactiveStr}$esc[0m"
 
-    # Flush full buffer to standard output in a single fast write!
+    # MP Bar Construction (Solid Cyan)
+    $mpPct = $mp / $maxMp
+    $mpBars = [int][math]::Max([int]($mpPct * 15), 0)
+    if ($mpBars -gt 15) { $mpBars = 15 }
+    $mpActiveStr = New-Object string ([char]'█', $mpBars)
+    $mpInactiveStr = New-Object string ([char]'█', (15 - $mpBars))
+    $mpBarStr = "$esc[38;5;51;48;5;51m${mpActiveStr}$esc[38;5;236;48;5;236m${mpInactiveStr}$esc[0m"
+
+    [void]$buffer.Append(" POSITION: X=$([math]::Round($px, 2)), Y=$([math]::Round($py, 2))  LEVEL: Stone Crypts (Lv 0)$esc[K`n")
+    [void]$buffer.Append(" PLAYER STATUS: HP [$hpBarStr] $hp/$maxHp  |  MP [$mpBarStr] $mp/$maxMp$esc[K`n")
+    [void]$buffer.Append(" RENDER ENGINE: DDA Raycaster (Optimized)  FPS: $fps  DRAW DIST: $maxDepth units$esc[K`n")
+    if ($skelDist -lt 1.3) {
+        [void]$buffer.Append(" $esc[1;31m[DANGER] SKELETON IS ATTACKING YOU! STEP BACK [S]!$esc[0m$esc[K`n")
+    } elseif ($nearDoor) {
+        [void]$buffer.Append(" $esc[1;33m[INTERACT] NEAR STONE & WOOD DOOR. PRESS [E] TO OPEN/CLOSE DOOR!$esc[0m$esc[K`n")
+    } else {
+        [void]$buffer.Append(" CONTROLS: [W/S] Move  [A/D] Rotate  [E] Use Door  [ESC] Exit$esc[K`n")
+    }
+    [void]$buffer.Append("$esc[0m")
+
     [Console]::Write($buffer.ToString())
 }
 
