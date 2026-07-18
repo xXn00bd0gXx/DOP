@@ -63,3 +63,31 @@ On top of that, the calendar itself turns hostile: **radiant world events** like
 **One file. One terminal. A whole world.** Your save is a code you can paste anywhere PowerShell runs.
 
 *See you in the Depths. The tickets aren't going to close themselves.* 🔦
+
+
+BUGS:
+Broken loot screen (broken art seems caused by small screen, include in warning about screen being too small that art work my be broken). Update screen may be too small warning with one for classic render and raycast render. Ray cast render bug for screen jumping has been fixed, and it doesn't default to classic render anymore so the 'smooth render' isn't a thing anymore. Instead a generic warning about broken art and visual glitches warning for raycast mode, and the orginal small screen warning for classic render but unqiue headers for both classic and raycast.
+retune multi enemy combat, lower base chance, increased with courruption as is but not as steep of an increase, high courropution is the only way to get 4 enemy
+What is the something else that starts wandering to replace the wandering trader mentioned when courruption gets too high? Is this actually in the game?
+Wandering trader on the road, speech text turns blue because of the 'Buy? (y/n). Also noting that shows if you actually bought the item after typing y, "he shrugs and walks on, whistling". Also needs to check if you have a full inv like the wandering merchant in the dungeon
+Entered blood moon event but main menu says goblin horde?
+exit dungeon still on proximity not interact only
+some skills not leveling (maybe because of 2 handed weapons?)armor doesn't seem to level as well
+How does the player find and kill the gobin boss?
+
+
+NEW:
+Options always available in dungeon [O]
+Quit screen more flare, should have a similar art style to the small window warning screens but with red for quiting, should also warn about the quiting penelty.
+Fishing mini game improved art, current is very low detail and can be larger.
+Light armour matching set grants speed buff, heavy grants def buff
+improve world map art, currently very low detail.
+music (main menu, battle, opening chest/interacting with idols/lore, bard music, inn tune, shop tune), option to disable music in options saved in save code. If possible while in a netsec safe enviroment.
+Make sure tutorial and change log don't sound like their written by AI, don't say things like "pure flavor" or "seasoning not the meal" that is from our devolpment chat and isn't something I would tell the player.
+fake loading bar before intial splash screen (thick blue bar that is acutally animated with LOADING and rotating /)
+fake dungeon generation visual when entering dungeon after all text screens (ex: after the dungeon mod screen, lore screen, and small window warning screen then show dungeon generation loading visual before entering dungeon) only a couple seconds and doesn't spoil the dungeon layout. Think mincraft world generation visual.
+make sure you can't sell quest items and they have no weight, quest items need to be tracked and saved
+current level and xp should be shown on hud
+a has boss key message should be shown somewhere on the hud in dungeon
+the visual change to the dungeons based on the phase the player is in (such as the blue tinted walls) is cool, but put an option in the options menu to disable the visuals from the different dungeon themes and just have the normal stone texture, you can also put a note that this option is available on the lore screen when entering the dungeon
+add 5 new side quest
