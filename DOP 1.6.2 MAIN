@@ -12105,18 +12105,20 @@ function Init-RayEngine {
     # the old procedural brick EXACTLY; 1-3 layer cracks / chipped
     # bricks / a damp patch on top. Chosen per wall TILE by a cheap
     # coordinate hash, so per pixel it is one array read.
+    # v1.6.2 clarity pass: 64x32 texture maps (was 32x16) — same
+    # one-array-read-per-pixel cost, four times the detail up close.
     $wallMaps = New-Object "object[]" 4
     for($v=0; $v -lt 4; $v++){
-        $wm = New-Object "int[]" 512
-        for($ty=0; $ty -lt 16; $ty++){
-            $brickRow = $ty -shr 3
-            for($tx=0; $tx -lt 32; $tx++){
+        $wm = New-Object "int[]" 2048
+        for($ty=0; $ty -lt 32; $ty++){
+            $brickRow = $ty -shr 4
+            for($tx=0; $tx -lt 64; $tx++){
                 $wt = 0
-                $isM = (($ty -band 7) -eq 0) -or (($brickRow % 2 -eq 0 -and ($tx -eq 0 -or $tx -eq 16)) -or ($brickRow % 2 -eq 1 -and ($tx -eq 8 -or $tx -eq 24)))
+                $isM = (($ty -band 15) -eq 0) -or (($brickRow % 2 -eq 0 -and ($tx -eq 0 -or $tx -eq 32)) -or ($brickRow % 2 -eq 1 -and ($tx -eq 16 -or $tx -eq 48)))
                 if($isM){ $wt = 1 }
-                elseif($tx -eq 1 -or $ty -eq 1 -or $ty -eq 9){ $wt = 2 }
-                elseif((($tx * $ty) % 7) -eq 0){ $wt = 3 }
-                $wm[($ty -shl 5) + $tx] = $wt
+                elseif($tx -eq 2 -or $ty -eq 2 -or $ty -eq 18){ $wt = 2 }
+                elseif((($tx * $ty) % 13) -eq 0 -and $tx -gt 0 -and $ty -gt 0){ $wt = 3 }
+                $wm[($ty -shl 6) + $tx] = $wt
             }
         }
         $wallMaps[$v] = $wm
@@ -12124,20 +12126,20 @@ function Init-RayEngine {
     # Variant 1: a jagged crack down the right half.
     $wm = $wallMaps[1]
     foreach($cc in @(@(22,2),@(21,3),@(21,4),@(20,5),@(19,6),@(19,7),@(20,8),@(20,10),@(21,11),@(21,12),@(22,13))){
-        $wm[($cc[1] -shl 5) + $cc[0]] = 3
+        foreach($dy in 0,1){ foreach($dx in 0,1){ $wm[((($cc[1]*2+$dy)) -shl 6) + ($cc[0]*2+$dx)] = 3 } }
     }
     # Variant 2: chipped bricks — dark pits with lit edges.
     $wm = $wallMaps[2]
     foreach($cc in @(@(5,3),@(6,3),@(5,4),@(26,11),@(27,11),@(12,12),@(13,13))){
-        $wm[($cc[1] -shl 5) + $cc[0]] = 3
+        foreach($dy in 0,1){ foreach($dx in 0,1){ $wm[((($cc[1]*2+$dy)) -shl 6) + ($cc[0]*2+$dx)] = 3 } }
     }
     foreach($cc in @(@(4,3),@(25,11),@(11,12))){
-        $wm[($cc[1] -shl 5) + $cc[0]] = 2
+        foreach($dy in 0,1){ foreach($dx in 0,1){ $wm[((($cc[1]*2+$dy)) -shl 6) + ($cc[0]*2+$dx)] = 2 } }
     }
     # Variant 3: damp / mossy patch low on the wall.
     $wm = $wallMaps[3]
     foreach($cc in @(@(9,12),@(10,12),@(11,12),@(8,13),@(9,13),@(10,13),@(11,13),@(12,13),@(9,14),@(10,14),@(11,14),@(12,14),@(13,14),@(10,15),@(11,15),@(12,15))){
-        $wm[($cc[1] -shl 5) + $cc[0]] = 3
+        foreach($dy in 0,1){ foreach($dx in 0,1){ $wm[((($cc[1]*2+$dy)) -shl 6) + ($cc[0]*2+$dx)] = 3 } }
     }
     # Torch glow row factors: the old per-pixel 1-|y-horizon|/horizon.
     $glowRow = New-Object "double[]" $vh
@@ -12157,6 +12159,29 @@ function Init-RayEngine {
     $floorD = New-Object "double[]" $vh
     for($y=$horizon+1; $y -lt $vh; $y++){ $floorD[$y] = $floorT[$y-1] - $floorT[$y] }
     if($vh -gt ($horizon+1)){ $floorD[$horizon] = $floorD[$horizon+1] }
+    # v1.6.2: truecolor upgrade path — probed, never forced. Where
+    # the terminal advertises 24-bit SGR, the 256-index ladders are
+    # translated to exact RGB at emission (one LUT read per color
+    # CHANGE, and changes are run-length limited). Legacy conhost
+    # keeps the plain 256-color path untouched.
+    $script:UseTrueColor = $false
+    try {
+        if($env:WT_SESSION -or ([string]$env:COLORTERM -match '24bit|truecolor')){ $script:UseTrueColor = $true }
+    } catch {}
+    $tcLut = @{}
+    if($script:UseTrueColor){
+        $std = @('0;0;0','128;0;0','0;128;0','128;128;0','0;0;128','128;0;128','0;128;128','192;192;192','128;128;128','255;0;0','0;255;0','255;255;0','0;0;255','255;0;255','0;255;255','255;255;255')
+        for($ci=0; $ci -lt 16; $ci++){ $tcLut[[string]$ci] = $std[$ci] }
+        $lvl = @(0,95,135,175,215,255)
+        for($ci=16; $ci -lt 232; $ci++){
+            $cq = $ci - 16
+            $tcLut[[string]$ci] = "$($lvl[[int][math]::Floor($cq/36)]);$($lvl[[int][math]::Floor($cq/6) % 6]);$($lvl[$cq % 6])"
+        }
+        for($ci=232; $ci -lt 256; $ci++){
+            $gv = 8 + 10 * ($ci - 232)
+            $tcLut[[string]$ci] = "$gv;$gv;$gv"
+        }
+    }
     $angOff = New-Object "double[]" $sw
     $cosOff = New-Object "double[]" $sw
     $sinOff = New-Object "double[]" $sw
@@ -12167,7 +12192,7 @@ function Init-RayEngine {
         $sinOff[$col] = [math]::Sin($a)
     }
     $script:RayEngine = @{
-        SW=$sw; SH=$sh; VH=$vh; Horizon=$horizon; Fov=$fov
+        SW=$sw; SH=$sh; VH=$vh; Horizon=$horizon; Fov=$fov; TcLut=$tcLut
         CeilT=$ceilT; CeilD=$ceilD; FloorT=$floorT; AngOff=$angOff; CosOff=$cosOff; SinOff=$sinOff
         WallMaps=$wallMaps; GlowRow=$glowRow
         CeilSh=$ceilSh; FloorSh=$floorSh; FloorD=$floorD
@@ -12204,6 +12229,7 @@ function Invoke-RaycastLeg {
     $ladFB = $pal.FloorB;   $nFB = $ladFB.Count
     $ladBe = $pal.Beam;     $nBe = $ladBe.Count
     $sw = $eng.SW; $sh = $eng.SH; $vh = $eng.VH; $horizon = $eng.Horizon
+    $tcLut = $eng.TcLut
     $fgF = $eng.Fg; $bgF = $eng.Bg; $zB = $eng.Z
     $buffer = $eng.Buf
     $esc = [char]0x1b
@@ -12644,15 +12670,18 @@ function Invoke-RaycastLeg {
             if($dist -lt 0.1){ $dist = 0.1 }
             $zB[$col] = $dist
             $wallHeight = [int]($vh / $dist)
-            $wallStart = [int](($vh - $wallHeight) / 2)
+            # v1.6.2: head-bob — walls dip one half-pixel as position
+            # streams by. Stateless (derived from px/py), walls only.
+            $bobPix = ([int](($px + $py) * 4)) -band 1
+            $wallStart = [int](($vh - $wallHeight) / 2) + $bobPix
             $wallEnd = $wallStart + $wallHeight
             if($wallStart -lt 0){ $wallStart = 0 }
             if($wallEnd -ge $vh){ $wallEnd = $vh - 1 }
             if($side -eq 0){ $wallX = $py + $dist * $sinA } else { $wallX = $px + $dist * $cosA }
             $wallX = $wallX % 1.0
-            $texX = [int]($wallX * 32)
+            $texX = [int]($wallX * 64)
             if($texX -lt 0){ $texX = 0 }
-            if($texX -gt 31){ $texX = 31 }
+            if($texX -gt 63){ $texX = 63 }
             $hasTorch = ((($mX + $mY) % 2 -eq 0) -and $hitType -eq 1)
             $bossTorch = ($hasTorch -and $mX -ge $btX0 -and $mX -le $btX1 -and $mY -ge $btY0 -and $mY -le $btY1)
             # ── v1.6.2: per-COLUMN hoists (everything here used to be
@@ -12664,7 +12693,7 @@ function Invoke-RaycastLeg {
             # purpose: y in [0,vh) makes frameIdx provably in-bounds.
             $whv = ($wallEnd - $wallStart)
             if($whv -le 0){ $whv = 1 }
-            $texYF = 16.0 / $whv
+            $texYF = 32.0 / $whv
             $sdv = $dist
             if($hitType -eq 2){ $sdv = $dist * 1.3 }
             $shadeBase = [int]$sdv
@@ -12731,14 +12760,14 @@ function Invoke-RaycastLeg {
             # ── WALL: rows wallStart..wallEnd ──
             for($y=$wallStart; $y -le $wallEnd; $y++){
                 $texY = [int](($y - $wallStart) * $texYF)
-                if($texY -gt 15){ $texY = 15 }
+                if($texY -gt 31){ $texY = 31 }
                 if($hitType -eq 2){
                     if($texX -lt 8 -or $texX -ge 24){
                         # Stone flanks reuse the wall pattern map:
                         # mortar cell -> mortar ladder, anything else
                         # -> brick (matches the old two-tone flank).
                         $si = $shadeBase
-                        if($wtm[($texY -shl 5) + $texX] -eq 1){
+                        if($wtm[($texY -shl 6) + $texX] -eq 1){
                             if($si -ge $nMo){ $si = $nMo - 1 }
                             $pixelColor = $ladMo[$si]
                         } else {
@@ -12783,7 +12812,7 @@ function Invoke-RaycastLeg {
                     }
                     # Side-1 walls read darker: same ladders, +2 shade.
                     if($side -eq 1){ $si = $si + 2 }
-                    $wt = $wtm[($texY -shl 5) + $texX]
+                    $wt = $wtm[($texY -shl 6) + $texX]
                     if($wt -eq 0){
                         if($si -ge $nBk){ $si = $nBk - 1 }
                         $pixelColor = $ladBk[$si]
@@ -12937,7 +12966,11 @@ function Invoke-RaycastLeg {
                 if($fg -ne $lastFg -or $bg -ne $lastBg){
                     $lastFg = $fg
                     $lastBg = $bg
-                    [void]$lineBuffer.Append("$esc[38;5;${fg};48;5;${bg}m")
+                    if($script:UseTrueColor){
+                        [void]$lineBuffer.Append("$esc[38;2;$($tcLut[[string]$fg]);48;2;$($tcLut[[string]$bg])m")
+                    } else {
+                        [void]$lineBuffer.Append("$esc[38;5;${fg};48;5;${bg}m")
+                    }
                 }
                 [void]$lineBuffer.Append([char]0x2580)
             }
@@ -20507,7 +20540,11 @@ function Show-Changelog {
             "      finish their first."
             "    * 3D clarity pass: 118 rays wide (was 100) and a"
             "      gentler distance falloff — deep corridors keep"
-            "      their shape instead of crushing to black."
+            "      their shape instead of crushing to black. Wall"
+            "      textures are 64x32 (4x the detail up close), a"
+            "      subtle head-bob rides your stride, and terminals"
+            "      that speak 24-bit color get exact-RGB shading"
+            "      automatically."
         )}
         @{Title="v1.5.0 — THE PROVINCE SWEEP"; Color="Magenta"; Lines=@(
             "  CITY SIDE QUESTS"
